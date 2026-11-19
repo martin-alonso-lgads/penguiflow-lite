@@ -1,133 +1,185 @@
 # OAuth via HITL Pause/Resume
 
-This reference covers the ToolNode side of the OAuth flow. The planner-side pause/resume mechanics are in [[penguiflow-hitl-pause-resume]].
+This reference covers the ToolNode side of per-user OAuth (`AuthType.OAUTH2_USER`). The planner-side pause/resume mechanics are in [[penguiflow-hitl-pause-resume]].
 
 ## End-to-end flow
 
 ```
-ReactPlanner.run(...)
-  -> tool call
-  -> ToolNode.call(...)
-  -> OAuthManager.get_token(user_id, provider) returns None
-  -> ToolNode pauses planner:
-       reason="external_event"
-       payload={
-         "pause_type": "oauth",
-         "provider": <toolnode name>,
-         "auth_url": "...",
-         "state": "...",
-         "scopes": [...],
-         "display_name": "...",
-       }
-  -> planner returns PlannerPause(resume_token, payload)
-  -> host app opens auth_url for user
-  -> user completes OAuth
-  -> callback handler stores token in OAuthManager.token_store under (user_id, provider)
-  -> host app calls planner.resume(resume_token, ...)
-  -> planner re-invokes the tool
-  -> OAuthManager.get_token now returns the token
-  -> ToolNode adds Authorization header and the call succeeds
+planner.run(query, tool_context={"user_id": "acme:u-123", "trace_id": "t-1", ...})
+  -> tool call -> ToolNode.call(name, args, ctx)
+  -> OAuthManager.get_token("acme:u-123", "<config name>") returns None
+  -> OAuthManager.get_auth_request(provider="<config name>", user_id=..., trace_id="t-1")
+  -> ctx.pause("external_event", {"pause_type": "oauth", "provider": ..., "display_name": ...,
+                                  "auth_url": ..., "scopes": [...], "state": ...})
+  -> planner returns PlannerPause(reason="external_event", payload=..., resume_token=...)
+  -> host stores resume_token under trace_id and sends the user to payload["auth_url"]
+  -> provider redirects to redirect_uri?code=...&state=...
+  -> host callback: user_id, trace_id = await manager.handle_callback(code, state)  (stores the token)
+  -> host calls planner.resume(resume_token, user_input="oauth_completed", ...)
+  -> the run continues; the next call of the tool finds the token
 ```
 
 ## Required setup
 
-### 1. ToolNode config
+### 1. Providers and token store
+
 ```python
-ExternalToolConfig(
-    name="github",
-    transport=TransportType.MCP,
-    connection="...",
-    auth_type=AuthType.OAUTH2_USER,
+import os
+
+from penguiflow.tools import InMemoryTokenStore, OAuthManager, OAuthProviderConfig
+
+manager = OAuthManager(
+    providers={
+        "github": OAuthProviderConfig(       # key = ExternalToolConfig.name
+            name="github",
+            display_name="GitHub",
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            client_id=os.environ["GH_CLIENT_ID"],
+            client_secret=os.environ["GH_CLIENT_SECRET"],
+            redirect_uri="https://app.example.com/oauth/callback",
+            scopes=["repo"],
+        ),
+    },
+    token_store=InMemoryTokenStore(),        # the default; use a durable, shared store in production
 )
 ```
 
-### 2. `tool_context` keys
+ToolNode looks providers up by its config `name`, so the `providers` key must match it; an unknown provider raises `ValueError` when a token is needed. `OAuthProviderConfig` values are used as given (no `${VAR}` substitution), so read secrets yourself.
+
+A token store implements the `TokenStore` protocol, keyed by `(user_id, provider)`:
+
+```python
+class DurableTokenStore:
+    async def store(self, user_id: str, provider: str, token: str, expires_at: float | None) -> None:
+        ...
+
+    async def get(self, user_id: str, provider: str) -> str | None:
+        ...  # return None when absent or expired
+
+    async def delete(self, user_id: str, provider: str) -> None:
+        ...
+```
+
+`expires_at` is a Unix timestamp computed from the provider's `expires_in`, or `None`. Refresh tokens are not stored or used.
+
+### 2. ToolNode config and connection
+
+```python
+from penguiflow import ModelRegistry
+from penguiflow.tools import AuthType, ExternalToolConfig, OAuthManager, ToolNode, TransportType
+
+
+def build_github_node(manager: OAuthManager, registry: ModelRegistry) -> ToolNode:
+    config = ExternalToolConfig(
+        name="github",
+        transport=TransportType.MCP,
+        connection="https://mcp.example.com/github",
+        auth_type=AuthType.OAUTH2_USER,
+    )
+    return ToolNode(config=config, registry=registry, auth_manager=manager)
+```
+
+- `connect()` needs a `ToolContext` for `OAUTH2_USER`: `await node.connect(ctx)`, with `ctx.tool_context["user_id"]` set. A bare `connect()` raises `ToolAuthError`, and so does a `call()` that has to reconnect (it reconnects without a context), so connect before the planner uses the tools.
+- If that user has no token, `connect(ctx)` calls `ctx.pause(...)` with the payload below, and raises `ToolAuthError` if there is still no token afterwards.
+- Without `auth_manager`, any auth attempt raises `ToolAuthError`.
+
+**Per call.** `call()` looks up the calling user's token and pauses the run when it is missing. UTCP/HTTP sources send it as `Authorization: Bearer <token>` on that call. MCP sources send headers only when connecting, so an MCP connection keeps using the token of the user it was connected with. For per-user MCP access, use one ToolNode per user (each with its own `connect(ctx)`).
+
+### 3. `tool_context` keys
 On every `planner.run(...)` and `planner.resume(...)`:
-- `tool_context["user_id"]` — **required**. Identifies the user owning the token.
-- `tool_context["trace_id"]` — optional but strongly recommended for correlation in logs.
+- `tool_context["user_id"]`: **required**. Identifies the user owning the token; missing raises `ToolAuthError("user_id required in tool_context for OAuth")`.
+- `tool_context["trace_id"]`: optional. Stored with the pending request and returned by `handle_callback`, so the callback can find the paused run.
 
-In multi-tenant systems, encode tenant in `user_id` (`acme:user-123`) or include `tenant_id` in `tool_context` and key the token store by composite.
-
-### 3. `OAuthManager`
-Configured with:
-- Provider entries: `client_id`, `client_secret`, `auth_url`, `token_url`, `scopes`.
-- A `token_store` that implements `get_token(user_id, provider)` and `set_token(user_id, provider, token)`.
+In multi-tenant systems, make `user_id` tenant-scoped (`acme:user-123`); the token store only sees `user_id` and the provider.
 
 ### 4. Callback handler (in your host app)
-Receives the OAuth redirect at your registered callback URL, validates `state`, exchanges the auth code for a token, stores it under `(user_id, provider)`, and (optionally) signals the planner to resume.
+PenguiFlow ships the token exchange (`OAuthManager.handle_callback`), not the HTTP endpoint. Your endpoint receives the provider redirect, then:
 
-PenguiFlow does **not** ship the callback handler — your host app owns it.
+```python
+from penguiflow.planner import PlannerFinish, PlannerPause, ReactPlanner
+from penguiflow.tools import OAuthManager
+
+
+async def oauth_callback(
+    code: str,
+    state: str,
+    *,
+    manager: OAuthManager,
+    planner: ReactPlanner,
+    paused: dict[str, str],  # trace_id -> resume_token, saved when the run paused
+) -> PlannerFinish | PlannerPause:
+    user_id, trace_id = await manager.handle_callback(code, state)
+    return await planner.resume(
+        paused.pop(trace_id),
+        user_input="oauth_completed",
+        tool_context={"user_id": user_id, "trace_id": trace_id},  # replaces the stored tool_context
+    )
+```
+
+`handle_callback(code, state)`:
+- consumes the pending `state` (each one works once), and rejects unknown states and states older than 10 minutes with `ValueError`;
+- POSTs the code to `token_url` (needs `aiohttp`, from `penguiflow-lite[planner]`), and raises `ValueError` when the provider answers with an `error`;
+- stores the access token in `token_store` and returns `(user_id, trace_id)`.
+
+Pending states live in that `OAuthManager` instance's memory. The callback must reach the same process (and manager) that created the auth request.
+
+`planner.resume(..., tool_context=...)` replaces the run's stored `tool_context`, so pass everything the run needs (session id, tenant, ...), or omit it to reuse the stored one.
 
 ### 5. Durable planner pause state
-For multi-worker deployments, the planner pause state must persist. Configure a `StateStore` implementing:
-- `save_planner_state(resume_token, state)`
-- `load_planner_state(resume_token)` with consume-on-load semantics (TTL recommended).
+For multi-worker deployments, the planner pause must survive restarts. Give the planner a `StateStore` implementing:
+- `save_planner_state(token, payload)`;
+- `load_planner_state(token)`; resume tokens are one-time (TTL recommended).
 
-Without this, a worker restart between pause and resume drops the pending state.
+Without it, a worker restart between pause and resume drops the pending run.
 
 ## Pause payload schema
 
 ```python
 {
     "pause_type": "oauth",
-    "provider": "<toolnode name>",     # e.g. "github"
-    "auth_url": "https://...",          # where the user must go
-    "state": "<random>",                # OAuth state param (treat as secret)
-    "scopes": ["repo", "user"],
-    "display_name": "GitHub (read-only)",
+    "provider": "github",                # ExternalToolConfig.name
+    "display_name": "GitHub",            # OAuthProviderConfig.display_name
+    "auth_url": "https://github.com/login/oauth/authorize?client_id=...&redirect_uri=...&scope=repo&state=...&response_type=code",
+    "scopes": ["repo"],
+    "state": "<random>",                 # OAuth state param (treat as secret)
 }
 ```
 
-Additional fields may be present (provider-dependent). The host UI uses this payload to render the "Connect your GitHub account" CTA.
-
-## Resume flow
-
-```python
-while isinstance(result, PlannerPause):
-    # 1. UI shows result.payload["auth_url"] to the user.
-    # 2. User completes OAuth in browser.
-    # 3. Callback handler stores the token.
-    # 4. Host app calls resume:
-    result = await planner.resume(
-        result.resume_token,
-        user_input="oauth_completed",
-        tool_context={**original_ctx, "oauth_ready": True},
-    )
-```
-
-`oauth_ready` in `tool_context` is a convention the example flow uses to bypass the pause path on re-invocation. In production, the token check in `OAuthManager.get_token` handles this naturally — once the token is in the store, the next call succeeds.
+The pause reason is `"external_event"`. The host UI uses this payload to render the "Connect your GitHub account" prompt. The `auth_url` query values are not URL-encoded, so keep `redirect_uri` and scope names URL-safe.
 
 ## Operational defaults
 
-- **Durable token store** — DB or Redis. Tokens outlive process restarts and span workers.
-- **HTTPS-only callbacks** — OAuth callback URLs must use HTTPS in production.
-- **Validate `state`** — every callback. Reject mismatched `state` to prevent CSRF.
-- **Short pause TTL** — pending states should expire (default ~10 min). Re-prompting is safer than letting stale states accumulate.
-- **Tenant-scoped `user_id`** — composite key in TokenStore (`tenant:user_id`) to avoid cross-tenant token reuse.
-- **No tokens in `llm_context`** — ever.
+- **Durable, shared token store**: DB or Redis. Tokens outlive process restarts and span workers.
+- **Sticky callbacks**: route the OAuth callback to the process that issued the auth request, or replace `OAuthManager` with your own manager that keeps pending states in shared storage.
+- **HTTPS-only callbacks** in production.
+- **Short pending window**: states expire after 10 minutes; re-prompting is safer than long-lived states.
+- **Tenant-scoped `user_id`** (`tenant:user_id`) to avoid cross-tenant token reuse.
+- **No tokens in `llm_context`**, ever.
 
 ## Failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Planner raises `ToolAuthError: user_id required` | `tool_context` missing `user_id` | Set it on every `run(...)` / `resume(...)` |
-| Pause fires but resume `KeyError` | Pause state was in-memory and worker restarted | Implement `save_planner_state`/`load_planner_state` durably |
-| OAuth completed but tool still pauses | Callback didn't store token, or stored under wrong key | Verify callback uses the same `(user_id, provider)` keying |
-| User re-auths every request | TokenStore isn't durable or shared across workers | Move to Redis/DB-backed store |
-| `state` rejected | Pending state expired (default ~10 min) or mismatched | Build a custom auth manager with longer TTL, or retry auth |
-| Cross-tenant token leak | TokenStore keyed by `user_id` only | Use `tenant:user_id` composite |
-| Tokens visible in prompts | Stored in `llm_context` | Move to `auth_config` / `OAuthManager.token_store`; audit prompt logs |
+| `ToolAuthError: ... requires HITL OAuth but no ToolContext provided` | `connect()` without a context, or a `call()` that had to reconnect | `await node.connect(ctx)` before the run |
+| `ToolAuthError: user_id required in tool_context for OAuth` | `tool_context` missing `user_id` | Set it on every `run(...)` / `resume(...)` |
+| `ValueError: Unknown OAuth provider` | `providers` key differs from the config `name` | Key providers by the ToolNode name |
+| `ValueError: Invalid or expired OAuth state` | Callback hit another process, the state was already used, or it is older than 10 minutes | Sticky callbacks; restart the auth flow |
+| Pause fires but resume raises `KeyError` | Pause state was in memory and the worker restarted | Implement `save_planner_state`/`load_planner_state` durably |
+| OAuth completed but the tool still pauses | Token stored under another `(user_id, provider)`, or the store isn't shared | Use the same keys; share the store |
+| MCP calls act as the wrong user | MCP sends headers only at connect | One ToolNode per user, or a UTCP/HTTP source |
+| Tokens visible in prompts | Stored in `llm_context` | Keep them in the token store; audit prompt logs |
 
 ## Observability
 
 Track:
 - Pause count by provider (`pause_type="oauth"`).
 - Time-to-resume p50/p95/p99.
-- OAuth callback success/failure rates (state invalid, expired, provider errors).
-- TokenStore hit rate (how often `get_token` returns non-null without prompting).
+- Callback success and failure (invalid or expired state, provider errors).
+- Token store hit rate (how often `get` returns a token without prompting).
 
-If `pause_type="oauth"` rate is high during sessions where the user already authenticated, the TokenStore is likely not durable or the key is wrong.
+A high `pause_type="oauth"` rate for users who already authenticated means the token store is not durable or the key is wrong.
 
-## Test double
+## Testing
 
-For tests that need to exercise the pause shape without a real OAuth flow, the planner accepts a manual `oauth_ready` toggle (see the runnable example in the canonical docs). Use it in integration tests to assert the pause payload shape and resume contract.
+Use an `OAuthManager` with an `InMemoryTokenStore`. Leave it empty to assert the pause payload and the resume contract; pre-store a token (`await store.store("u-1", "github", "token", None)`) to exercise the authenticated path without a provider.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from .models import StateUpdate, UpdateType
@@ -75,8 +75,23 @@ def _step_complete(event: PlannerEvent) -> _Projection:
     }
 
 
+def _chunk_channel(extra: dict[str, Any]) -> str:
+    """Return a stream chunk's channel, defaulting to ``thinking``.
+
+    LLM chunks carry the channel at the top level of ``extra``. Tool
+    chunks emitted through ``ToolContext.emit_chunk`` carry it under
+    ``extra["meta"]["channel"]``.
+    """
+    channel = extra.get("channel")
+    if not channel:
+        meta = extra.get("meta")
+        if isinstance(meta, Mapping):
+            channel = meta.get("channel")
+    return str(channel) if channel else "thinking"
+
+
 def _stream_chunk(extra: dict[str, Any]) -> _Projection:
-    channel = extra.get("channel") or "thinking"
+    channel = _chunk_channel(extra)
     update_type = (
         UpdateType.RESULT
         if channel in {"answer", "revision"}

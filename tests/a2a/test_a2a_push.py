@@ -228,6 +228,69 @@ async def test_push_delivery_receives_status_and_artifacts() -> None:
         await service.stop()
 
 
+class FailingPushSender(FakePushSender):
+    """Push sender that rejects every delivery, like an unsafe webhook."""
+
+    async def send(
+        self, config: PushNotificationConfig, event: StreamResponse
+    ) -> None:
+        """Record ``event``, then refuse to deliver it."""
+        await super().send(config, event)
+        msg = "Webhook URL is not allowed"
+        raise ValueError(msg)
+
+
+@pytest.mark.asyncio
+async def test_push_delivery_failure_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed push delivery is logged without the webhook URL or token."""
+    sender = FailingPushSender()
+    service = A2AService(
+        echo_planner(),
+        agent_card=_agent_card(push_notifications=True),
+        config=A2AConfig(),
+        push_sender=sender,
+    )
+    await service.start()
+    try:
+        request = SendMessageRequest(
+            message=Message(
+                message_id="msg-1",
+                role=Role.USER,
+                parts=[Part(text="hello")],
+            ),
+            configuration=SendMessageConfiguration(
+                blocking=True,
+                push_notification_config=PushNotificationConfig(
+                    id="cfg-1",
+                    url="http://127.0.0.1/webhook",
+                    token="secret-token",
+                ),
+            ),
+        )
+        with caplog.at_level("WARNING", logger="penguiflow_a2a"):
+            await service.send_message(
+                request, tenant=None, requested_extensions=[]
+            )
+    finally:
+        await service.stop()
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "a2a_push_delivery_failed"
+    ]
+    assert sender.events
+    assert failures
+    assert all(record.__dict__["config_id"] == "cfg-1" for record in failures)
+    assert all(
+        record.__dict__["error_type"] == "ValueError" for record in failures
+    )
+    assert "secret-token" not in caplog.text
+    assert "127.0.0.1" not in caplog.text
+
+
 def test_webhook_url_ssrf_checks() -> None:
     """Webhook URL ssrf checks."""
     assert not is_safe_webhook_url("http://localhost:8000")

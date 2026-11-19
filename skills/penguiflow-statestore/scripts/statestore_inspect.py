@@ -6,11 +6,13 @@ backends and for frontend teams needing to understand which capabilities are
 required for specific UI features.
 
 Run with a Python >=3.11 environment where `penguiflow` is importable.
+`<skills-dir>` is the folder the skill is installed in (`skills` in the
+PenguiFlow repo).
 
 In the PenguiFlow repo, prefer:
 
-    uv run python
-    ~/.codex/skills/penguiflow-statestore/scripts/statestore_inspect.py
+    uv run python \
+        <skills-dir>/penguiflow-statestore/scripts/statestore_inspect.py
 """
 
 from __future__ import annotations
@@ -137,6 +139,11 @@ def _capability_report(
 
     optional_groups: dict[str, list[str]] = {
         "planner_state": ["save_planner_state", "load_planner_state"],
+        "conversation_bindings": [
+            "find_binding",
+            "list_bindings",
+            "mark_binding_terminal",
+        ],
         "memory_state": ["save_memory_state", "load_memory_state"],
         "tasks": ["save_task", "list_tasks", "save_update", "list_updates"],
         "steering": ["save_steering", "list_steering"],
@@ -196,6 +203,7 @@ def _capability_report(
 _PROTOCOL_NAMES = (
     "StateStore",
     "SupportsPlannerState",
+    "SupportsConversationBindings",
     "SupportsMemoryState",
     "SupportsTasks",
     "SupportsSteering",

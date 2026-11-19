@@ -15,17 +15,28 @@ ALWAYS_VISIBLE_TOOLS = {
     "skill_search",
     "skill_get",
     "skill_list",
-    # common
-    "finish",
 }
 
 RICH_OUTPUT_TOOLS = {
+    # always registered when rich output is enabled
     "render_component",
     "describe_component",
     "list_artifacts",
     "ui_form",
     "ui_confirm",
     "ui_select_option",
+    # typed tools, registered per component in RichOutputConfig.allowlist
+    "render_chart_echarts",  # "echarts"
+    "build_chart_echarts",
+    "render_report",  # "report"
+    "render_table",  # "datagrid"
+    "build_table",
+    "render_grid",  # "grid"
+    "build_grid",
+    "render_tabs",  # "tabs"
+    "build_tabs",
+    "render_accordion",  # "accordion"
+    "build_accordion",
 }
 
 ALWAYS_VISIBLE_PATTERNS = [
@@ -38,14 +49,13 @@ ALWAYS_VISIBLE_PATTERNS = [
     "skill_list",
     # tasks (keep visible if background tasks are enabled in your host app)
     "tasks.*",
-    # common
-    "finish",
 ]
 ```
 
 Notes:
 - `ToolSearchConfig.always_loaded_patterns` uses glob patterns (via `fnmatch`).
 - Only add rich output tools to the always-visible set if rich output is enabled.
+- There is no `finish` tool: the planner ends a run with the `final_response` opcode, which isn't in the catalog and can't be hidden. (The default `always_loaded_patterns` still lists `"finish"`; it is harmless.)
 
 ## Native LLM: minimal configuration
 
@@ -54,7 +64,8 @@ from penguiflow.planner.react import ReactPlanner
 
 planner = ReactPlanner(
     llm={"model": "openai/gpt-4o", "api_key": "...", "base_url": None},
-    use_native_llm=True,
+    catalog=...,  # your tools (or nodes= plus registry=)
+    use_native_llm=True,  # default False (LiteLLM client)
     temperature=0.0,
     json_schema_mode=True,
 )
@@ -80,6 +91,7 @@ Recommended defaults:
 ```py
 planner = ReactPlanner(
     llm="openai/gpt-4o",
+    catalog=...,
     use_native_llm=True,
     use_native_reasoning=True,
     reasoning_effort="medium",
@@ -108,8 +120,8 @@ result = await planner.run(
     "…",
     tool_context={
         "session_id": session_id,   # required for session-scoped tool activation
-        "tenant_id": tenant_id,     # recommended for multi-tenant visibility + skills scoping
-        "project_id": project_id,   # recommended (optional)
+        "tenant_id": tenant_id,     # memory keys, your visibility policy, runtime skill providers
+        "project_id": project_id,   # optional; read by runtime skill providers
     },
 )
 ```
@@ -123,6 +135,7 @@ from penguiflow.planner.models import ObservationGuardrailConfig
 
 planner = ReactPlanner(
     llm="openai/gpt-4o",
+    catalog=...,
     use_native_llm=True,
     # LLM transport-level limits
     llm_timeout_s=60.0,
@@ -204,7 +217,7 @@ result = await planner.run("…", tool_context=tool_context, tool_visibility=too
 
 ## Memory hooks (ShortTermMemoryConfig)
 
-If you enable short-term memory, pass **tenant/user/session identifiers** in `tool_context` (or pass an explicit `memory_key`).
+If you enable short-term memory, pass **tenant/user/session identifiers** in `tool_context` (or pass an explicit `memory_key`). A derived key needs only `session_id`: a missing `tenant_id` becomes `"default"` and a missing `user_id` `"anonymous"`, so always send all three in multi-tenant apps. Details in [[penguiflow-memory]].
 
 ```py
 from penguiflow.planner.memory import MemoryIsolation, ShortTermMemoryConfig
@@ -215,7 +228,7 @@ short_term_memory = ShortTermMemoryConfig(
         tenant_key="tenant_id",
         user_key="user_id",
         session_key="session_id",
-        require_explicit_key=True,  # default: safe-by-default (memory is disabled if no key)
+        require_explicit_key=True,  # default: no memory without a memory_key or a session_id
     ),
     summarizer_model="openai/gpt-4o-mini",  # optional; uses planner LLM if omitted
     # Optional hooks (best-effort, must be awaitable):
@@ -250,7 +263,7 @@ result = await planner.run(
 Use `llm_context_hooks` when you need to inject **external/persistent memory** (profiles, preferences, entitlements, prior summaries) into `llm_context` **once before the first LLM call**.
 
 Important behavior:
-- Hooks run on `planner.run(...)` (pre-flight) and are best-effort; failures should not block the run.
+- Hooks run on `planner.run(...)` only (pre-flight, not on `resume()`) and are best-effort: a failing hook is logged (`llm_context_hook_failed` event) and skipped.
 - Hooks run **after** short-term memory context is applied, so your hook should usually **merge**, not replace.
 - Do not put secrets in `llm_context` (it is LLM-visible). Keep secrets in `tool_context`.
 
@@ -291,6 +304,7 @@ from penguiflow.planner.react import ReactPlanner
 
 planner = ReactPlanner(
     llm="openai/gpt-4o",
+    catalog=...,
     use_native_llm=True,
     llm_context_hooks=[ExternalMemoryHook()],
 )
@@ -319,6 +333,7 @@ from penguiflow.planner.react import ReactPlanner
 
 planner = ReactPlanner(
     llm="openai/gpt-4o",
+    catalog=...,
     use_native_llm=True,
     guardrail_gateway=guardrail_gateway,
     guardrail_conversation_history_turns=1,
@@ -330,7 +345,15 @@ planner = ReactPlanner(
 Steering lets your host app inject operator messages/cancellation while a run is in progress.
 
 ```py
-result = await planner.run("…", steering=steering_inbox, tool_context=tool_context)
+from penguiflow.steering import SteeringCancelled, SteeringInbox
+
+steering_inbox = SteeringInbox()
+try:
+    result = await planner.run(
+        "…", steering=steering_inbox, tool_context=tool_context
+    )
+except SteeringCancelled:
+    ...  # the run was cancelled through the inbox
 ```
 
 To push steering events:
@@ -349,8 +372,8 @@ await steering_inbox.push(
 ```
 
 Common patterns:
-- `INJECT_CONTEXT`: add operator notes/corrections without restarting the run.
-- `CANCEL`: stop the foreground run (and, if configured, cascade cancellation to background tasks).
+- `INJECT_CONTEXT`: add operator notes/corrections without restarting the run (`payload={"text": ...}`).
+- `CANCEL`: `planner.run()` raises `SteeringCancelled` at the next check (between steps, or while a tool runs). In a `StreamingSession`, cancelling a task also cancels its child tasks unless they were spawned with `propagate_on_cancel="isolate"`.
 
 ## HITL (pause/resume) patterns
 
@@ -361,20 +384,24 @@ Minimum host responsibilities:
 - Call `planner.resume(token, user_input=...)` when you have input.
 
 ```py
+from penguiflow.planner import PlannerPause
+
 outcome = await planner.run("…", tool_context=tool_context)
-if outcome.__class__.__name__ == "PlannerPause":
+if isinstance(outcome, PlannerPause):
     # Persist outcome.resume_token + outcome.payload in your app
     ...
 
 # Later:
-outcome2 = await planner.resume(outcome.resume_token, user_input="approved", tool_context=tool_context)
+outcome2 = await planner.resume(
+    outcome.resume_token, user_input="approved", tool_context=tool_context
+)
 ```
 
 Durable HITL (recommended):
 - Pass `state_store=...` into `ReactPlanner(...)`.
-- Your `state_store` should implement:
-  - `save_planner_state(token: str, payload: dict) -> None | awaitable`
-  - `load_planner_state(token: str) -> dict | awaitable`
+- Your `state_store` should implement `SupportsPlannerState`:
+  - `async save_planner_state(token: str, payload: dict) -> None`
+  - `async load_planner_state(token: str) -> dict | None`
 
 ## Skills: enable and load packs
 
@@ -389,18 +416,19 @@ skills = SkillsConfig(
     skill_packs=[
         SkillPackConfig(
             name="product",
-            path="skills/packs/product",  # file or directory (pack loader decides)
+            path="packs/product",  # file or directory of *.skill.* files
             # format="md" | "yaml" | "json" | "jsonl"  (optional)
-            scope_mode="project",
         ),
     ],
 )
+
+planner = ReactPlanner(llm="openai/gpt-4o", catalog=..., skills=skills)
 ```
 
 Operational notes:
-- Skills are loaded at planner init when `SkillsConfig.enabled=True`.
-- Pass `tenant_id` / `project_id` in `tool_context` to make scoping predictable.
-- If you hide tools via allowlists/visibility policies, skills content is automatically redacted to avoid referencing disallowed tools.
+- Skills are loaded at planner init when `SkillsConfig.enabled=True`, and the relevant ones are added to the system prompt at the start of each run.
+- Pack skills are global: every tenant and project sees them, whatever `scope_mode` says. Put tenant-specific skills in a runtime provider (`skills_provider=`) that filters on `tool_context["tenant_id"]`; see [[penguiflow-runtime-skills-pack]].
+- If a `ToolVisibilityPolicy` hides tools for a request, skills that require them are filtered out and skill text naming them is redacted. Tools removed by `ToolPolicy` aren't known to the planner at all, so their names aren't redacted; gate those skills with `required_tool_names`.
 
 ## Rich output: enable tools + prompt catalog
 
@@ -420,8 +448,8 @@ rich_nodes = attach_rich_output_nodes(registry, config=rich_output)
 ```
 
 If you enable rich output, also:
-- Add `RICH_OUTPUT_TOOLS` to `ALWAYS_VISIBLE_TOOLS` / `ALWAYS_VISIBLE_PATTERNS`.
-- Include `rich_nodes` in the planner tool catalog.
+- Add `RICH_OUTPUT_TOOLS` (the ones your `allowlist` registers) to `ALWAYS_VISIBLE_TOOLS` / `ALWAYS_VISIBLE_PATTERNS`.
+- Include `rich_nodes` in the planner tool catalog (`nodes=` with the same `registry=`).
 
 ## Background tasks: enable + expose tasks.* tools (host app responsibility)
 
@@ -431,11 +459,16 @@ ReactPlanner can emit background-task opcodes (`task.subagent` / `task.tool`). Y
 from penguiflow.planner.models import BackgroundTasksConfig
 
 background_tasks = BackgroundTasksConfig(
-    enabled=True,
-    max_concurrent_tasks=5,
-    task_timeout_s=3600,
+    enabled=True,  # adds background-task guidance to the system prompt
+    allow_tool_background=False,  # True: tools with extra["background"] run as tasks
+)
+
+planner = ReactPlanner(
+    llm="openai/gpt-4o", catalog=..., background_tasks=background_tasks
 )
 ```
+
+`BackgroundTasksConfig` uses `extra="forbid"`: it has only `enabled`, `include_prompt_guidance`, `allow_tool_background`, `default_group_merge_strategy`, `default_group_report`, `auto_seal_groups_on_foreground_yield`, `retain_turn_timeout_s`, `background_continuation_max_hops` and `background_continuation_cooldown_s`, and any other field raises `ValidationError`. The planner reads the first three; sessions read the rest from the config passed to `StreamingSession.configure_background_tasks(...)` or `InProcessTaskService(background_config=...)`.
 
 `tasks.*` tools expect the foreground `tool_context` to include a task service under `"task_service"`:
 
@@ -447,22 +480,24 @@ tool_context = {
 ```
 
 Operator-oriented defaults to consider:
-- `spawn_requires_confirmation=True` for high-risk environments.
-- `max_concurrent_tasks` and `max_tasks_per_session` to prevent runaway cost.
-- `context_depth="summary"` for privacy/cost, unless tasks require full context.
-- `propagate_on_cancel="cascade"` to avoid orphaned work.
+- Task limits live in `SessionLimits`, passed to `SessionManager(limits=...)` (defaults: 8 tasks per session, 4 in the background, 3 running at once, 900 s per task).
+- Per-task options are `tasks.spawn` arguments: `context_depth="summary"` (or `"none"`) for privacy/cost unless tasks need full context, and `propagate_on_cancel="cascade"` (the default) to avoid orphaned work.
+- Proactive report-back is set up with `setup_proactive_reporting()` or `StreamingSession.configure_proactive_reporting()`.
 
 ```py
-background_tasks = BackgroundTasksConfig(
-    enabled=True,
-    spawn_requires_confirmation=True,
-    max_concurrent_tasks=5,
-    max_tasks_per_session=50,
-    task_timeout_s=3600,
-    context_depth="summary",
-    propagate_on_cancel="cascade",
+from penguiflow import SessionLimits, SessionManager
+
+manager = SessionManager(
+    limits=SessionLimits(
+        max_tasks_per_session=50,
+        max_background_tasks=10,
+        max_concurrent_tasks=5,
+        max_task_runtime_s=3600,
+    ),
 )
 ```
+
+See [[penguiflow-background-tasks]] for the task service, `tasks.*` arguments and merge strategies.
 
 To expose the default `tasks.*` tool set in your catalog, you can include prebuilt specs:
 
@@ -511,13 +546,13 @@ def build_planner(*, llm_api_key: str) -> ReactPlanner:
         "skill_get",
         "skill_list",
         "tasks.*",
-        "finish",
-        "render_component",
+        # rich output (the default allowlist registers all of these; the
+        # globs also match your own tools with these prefixes)
+        "render_*",
+        "build_*",
         "describe_component",
         "list_artifacts",
-        "ui_form",
-        "ui_confirm",
-        "ui_select_option",
+        "ui_*",
     ]
     tool_search = ToolSearchConfig(
         enabled=True,
@@ -530,7 +565,7 @@ def build_planner(*, llm_api_key: str) -> ReactPlanner:
         enabled=True,
         redact_pii=True,
         skill_packs=[
-            SkillPackConfig(name="default", path="skills/packs/default", scope_mode="project"),
+            SkillPackConfig(name="default", path="packs/default"),
         ],
     )
 

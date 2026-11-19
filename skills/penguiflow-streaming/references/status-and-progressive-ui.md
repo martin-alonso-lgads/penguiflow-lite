@@ -6,33 +6,40 @@ Most production streaming UIs need three logical channels, and the planner alrea
 
 | Channel | Planner source |
 |---|---|
-| **Status** ("searching…", "calling tool foo") | `step_start`, `tool_call_start` / `tool_call_end` events (`extra["tool_name"]`) |
+| **Status** ("searching…", "calling tool foo") | `step_start`, `tool_call_start` (tool about to run) and `tool_call_result` (tool done) events (`extra["tool_name"]`); `tool_call_end` fires right after `tool_call_start`, before the tool runs |
 | **Content** (answer tokens) | `llm_stream_chunk` with `extra["channel"] == "answer"`, and tool `stream_chunk`s with `meta={"channel": "answer"}` |
-| **Final** (canonical result) | the `PlannerFinish` returned by `planner.run()` (also a `finish` event) |
+| **Final** (canonical result) | the `PlannerFinish` returned by `planner.run()` (also a `finish` event), or a `PlannerPause` when the run waits for input |
 
 Map them to your wire format in the bridge (see `sse-and-websocket.md`):
 
 ```python
+from penguiflow.planner import PlannerEvent
+
+
 def classify(event: PlannerEvent) -> tuple[str, str] | None:
     extra = event.extra
     if event.event_type == "llm_stream_chunk":
-        return ("content" if extra.get("channel") == "answer" else "thinking", extra.get("text", ""))
-    if event.event_type == "stream_chunk":
+        channel = extra.get("channel")
+    elif event.event_type == "stream_chunk":
         channel = (extra.get("meta") or {}).get("channel", "thinking")
-        return ("content" if channel == "answer" else "thinking", extra.get("text", ""))
-    if event.event_type == "tool_call_start":
+    elif event.event_type == "tool_call_start":
         return ("status", f"calling {extra.get('tool_name')}…")
-    return None
+    elif event.event_type == "tool_call_result":
+        return ("status", f"{extra.get('tool_name')} done")
+    else:
+        return None
+    kind = "content" if channel == "answer" else "thinking"
+    return (kind, extra.get("text", ""))
 ```
 
-With sessions, the same split comes from `StateUpdate.update_type`: `RESULT` (content and final), `THINKING`, `TOOL_CALL`, `PROGRESS`, `STATUS_CHANGE`.
+With sessions, the same split comes from `StateUpdate.update_type`: `RESULT` (content and final; tool chunks sent with `meta={"channel": "answer"}` included), `THINKING`, `TOOL_CALL`, `PROGRESS`, `STATUS_CHANGE` (including `PAUSED`).
 
 ## Time-to-first-chunk (TTFC) tuning
 
 User-perceived latency is dominated by TTFC, not total response time.
 
 ### Emit status early
-Send a status frame as soon as the request is accepted — before `planner.run()` makes its first LLM call — and on every `tool_call_start`.
+Send a status frame as soon as the request is accepted — before `planner.run()` makes its first LLM call — and on every `tool_call_start` and `tool_call_result`.
 
 ### Stream from slow tools
 A tool taking more than ~500 ms should stream progress with `ctx.emit_chunk(...)` (channel `"thinking"` for progress, `"answer"` for user-facing text) so the UI never looks frozen.
@@ -54,18 +61,30 @@ The planner's `event_callback` is synchronous and must not block, so backpressur
 If the producer is much faster than the network, coalesce small deltas before writing:
 
 ```python
-buffer: list[str] = []
+import asyncio
+from collections.abc import AsyncIterator
 
-def flush() -> str:
-    text = "".join(buffer)
-    buffer.clear()
-    return text
+from penguiflow.planner import PlannerEvent
 
-# in the drain loop
-buffer.append(text)
-if sum(map(len, buffer)) >= 32:
-    yield sse("chunk", flush())
+
+async def coalesced_chunks(
+    queue: asyncio.Queue[PlannerEvent | None], min_chars: int = 32
+) -> AsyncIterator[str]:
+    buffer: list[str] = []
+    while (event := await queue.get()) is not None:
+        if event.event_type != "llm_stream_chunk":
+            continue
+        if event.extra.get("channel") != "answer":
+            continue
+        buffer.append(event.extra.get("text", ""))
+        if sum(map(len, buffer)) >= min_chars or event.extra.get("done"):
+            yield "".join(buffer)
+            buffer.clear()
+    if buffer:
+        yield "".join(buffer)
 ```
+
+Wrap each yielded string in your `sse("chunk", ...)` frame.
 
 Trade-off: TTFC suffers slightly; throughput improves.
 
@@ -95,11 +114,12 @@ See [[penguiflow-hitl-pause-resume]] for steering and pause semantics.
 ## Error handling mid-stream
 
 If the run fails mid-stream, the client may already have partial content.
-- `planner.run()` raises (e.g. LLM unavailable): catch it in the bridge and send a terminal `error` frame, then close.
+- `planner.run()` raises (e.g. LLM unavailable, or `SteeringCancelled` after a cancel): catch it in the bridge and send a terminal `error` frame, then close.
+- The run pauses: `planner.run()` returns a `PlannerPause`. Send a terminal frame with its `reason` and `resume_token`, and resume later with `planner.resume(token, user_input=...)`. With sessions, stop the stream after the `CHECKPOINT` that follows the `PAUSED` status change (it carries the `resume_token`).
 - The planner finishes without an answer: `PlannerFinish.reason` is `"no_path"` or `"budget_exhausted"` — send it in the `final` frame so the UI can show a graceful failure instead of the partial text.
 - Sessions publish an `ERROR` update and a `STATUS_CHANGE` with `status == "FAILED"`.
 
-Always end the stream with exactly one terminal frame (`final` or `error`); clients otherwise hang or reconnect forever.
+Always end the stream with exactly one terminal frame (`final`, `paused` or `error`); clients otherwise hang or reconnect forever.
 
 ## Observability for streams
 
@@ -115,7 +135,7 @@ Measure in the bridge (it sees every frame the user sees), not inside tools. See
 ## Anti-patterns
 
 - **One frame per token over WAN** — coalesce.
-- **Terminal frame only sometimes** — clients hang. Send it on success, failure and cancel.
+- **Terminal frame only sometimes** — clients hang. Send it on success, pause, failure and cancel.
 - **One planner instance + one callback for all users** — tokens leak across requests. Use a planner per request or sessions.
 - **Blocking work in `event_callback`** — stalls the planner loop. Enqueue only.
 - **Appending across `action_seq` changes** — duplicated answers after repairs. Reset on a new `action_seq`.

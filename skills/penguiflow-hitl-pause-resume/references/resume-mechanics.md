@@ -1,42 +1,41 @@
 # Resume Mechanics
 
-## `planner.resume(resume_token, ...)`
+## `planner.resume(token, user_input=None, *, tool_context=None, memory_key=None, steering=None, tool_visibility=None)`
 
 ```python
 result = await planner.resume(
     pause.resume_token,
     user_input="approved",
-    tool_context={"session_id": "...", "approvals": {"write_line": True}},
-    memory_key=optional_memory_key,
+    tool_context={"session_id": "s1", "tenant_id": "acme", "user_id": "u1", "approvals": {"write_line": True}},
 )
 ```
 
-Behavior:
-1. Looks up the pause record (in-memory; falls back to `state_store.load_planner_state(token)`).
-2. Replays the planner trajectory up to the pause point.
-3. Continues the run with the new `tool_context` (overrides what was captured at pause time).
-4. Returns either a final result or another `PlannerPause` if the resume hits a new pause.
+What it does:
+1. **Finds the pause record.** It looks first in memory, on the internal planner of this call's `session_id`, removing the record when found, and then in `state_store.load_planner_state(token)`. If both miss, it raises `KeyError`.
+2. **Restores the run.** It restores the trajectory (including the pause step), the constraint tracker (deadline remaining, hops used) and the artifact registry, then emits a `resume` planner event.
+3. **Sets `tool_context`.** The one you pass replaces the stored one. If you pass none, the stored one is used, when it was saved.
+4. **Continues the loop.** It returns a `PlannerFinish`, or another `PlannerPause` if the run pauses again.
 
-`result` is the same shape as `planner.run(...)` returns. Loop until it's not a `PlannerPause`.
+The result has the same shape as `planner.run(...)` returns. Loop until it isn't a `PlannerPause`.
 
 ## Parameter semantics
 
-### `resume_token: str`
-Opaque token from the prior `PlannerPause`. Treat as a **secret** — it's an authorization capability. Anyone with the token can resume the paused run.
+### `token: str`
+The `resume_token` from the prior `PlannerPause`. Treat it as a **secret**: anyone who has it can resume the run.
 
-### `user_input: Any` (optional)
-A free-form value made available in the next planner step. Use cases:
-- Approval decision: `"approved"` / `"rejected"`.
-- Pasted code: `"123456"` for 2FA.
-- Selected option: `"prod"` from an `await_input` list.
+### `user_input: str | None`
+Text added to the next prompt as `Resume input: <text>`. Use cases:
+- an approval decision: `"approved"` / `"rejected"`;
+- a pasted code: `"123456"` for 2FA;
+- a selected option: `"prod"` from an `await_input` list.
 
-The LLM sees `user_input` in its next prompt and incorporates it. For structured decisions, prefer setting `tool_context` flags instead — it's more deterministic than relying on the LLM to parse `user_input`.
+The model reads it and decides. For structured decisions, prefer a `tool_context` flag that the tool checks: it is deterministic, while `user_input` relies on the model.
 
-### `tool_context: dict` (optional but recommended)
-Replaces (not merges) the `tool_context` from the pause record. This is the safest way to communicate decisions back:
+### `tool_context: dict | None` (pass it every time)
+It replaces the stored `tool_context`; the two are not merged:
 
 ```python
-# at pause time, tool_context might have been:
+# at pause time, tool_context was:
 # {"session_id": "s1", "approvals": {}}
 
 # at resume, supply the approval:
@@ -46,106 +45,93 @@ result = await planner.resume(
 )
 ```
 
-Why replace, not merge: the pause record may have lost non-serializable values during persistence. Re-passing the full `tool_context` ensures clients and config are present.
+Re-pass the full dict. The stored copy is saved only when every value is JSON-serializable, and is dropped as a whole otherwise, so clients never survive persistence.
 
-**Always include**:
-- `session_id` (for dispatch).
-- `tenant_id`, `user_id` if applicable.
-- The decision flag (`approvals`, `oauth_ready`, `provided_input`, etc.).
-- Anything the next tool will need.
+**Always include:**
+- the **same `session_id` as the run**. It routes the call to the session that holds the in-memory record, and it also keys memory;
+- `tenant_id` and `user_id` if you use them (memory isolation, artifacts, OAuth);
+- the decision (`approvals`, the provided input, …);
+- anything the next tool needs (clients, stores).
 
-### `memory_key: MemoryKey` (optional)
-For `MemoryIsolation.require_explicit_key=True`, pass the same `MemoryKey` you used at `run()`. Memory hydrates the same session correctly.
+### `memory_key: MemoryKey | None`
+Short-term memory derives its key from `tool_context` (`tenant_id`, `user_id`, `session_id`). Only `session_id` is required; tenant and user default to `default` and `anonymous`. Pass an explicit `MemoryKey` (from `penguiflow.planner.memory`) only if the identity isn't in `tool_context`.
 
 ## What survives pause/resume
 
 Survives:
-- Planner trajectory (steps taken so far).
-- Pause `payload` (your structured app-defined data).
-- Pause `reason`.
-- `tool_context` from the pause (best-effort, JSON-serializable parts only).
+- the trajectory, including the pause step `{"pause": reason, "payload": payload}`;
+- the remaining deadline and the hops used. They are not reset, so `deadline_s` and `hop_budget` cover all segments together, and the clock doesn't run while paused;
+- the pause `reason` and `payload`;
+- the run's `tool_context`. In memory it is kept as-is. In a state store it is kept only if it is entirely JSON-serializable.
 
-Does **not** survive automatically:
-- Local variables inside the paused tool function (gone — the tool raised).
-- In-memory clients (DB connections, HTTP clients) — re-supply via `tool_context` or registry.
-- Non-JSON `tool_context` values (dropped during serialization to StateStore).
+Does **not** survive:
+- local variables inside the paused tool (it raised);
+- values a tool wrote into `ctx.tool_context` (each call gets a copy);
+- clients and other non-JSON `tool_context` values, once the record goes through a state store.
 
-## The replay model
+## The continue model
 
-When the planner resumes, it doesn't continue inside the tool function. Instead:
+When the planner resumes, it doesn't continue inside the tool function:
+1. It restores the trajectory that ends with the pause step.
+2. The model is prompted with that trajectory and `Resume input: <user_input>`.
+3. The model picks the next action, usually the same tool, with the same or updated args.
+4. The tool runs again from the top, re-checks `tool_context`, and this time the precondition holds.
 
-1. The planner re-reads its trajectory.
-2. The LLM is prompted with the trajectory + the pause's `user_input`.
-3. The LLM picks the next action — usually re-invoking the same tool with updated args.
-4. The tool re-runs from the top, re-checks `tool_context`, and this time the precondition is satisfied.
-
-This is why **tools must re-check at the top** rather than expecting "to wake up after the pause."
+That is why **tools must re-check at the top**, rather than expect to "wake up" after the pause.
 
 ## OAuth resume
 
-OAuth resumes work the same way mechanically:
+OAuth resumes work the same way:
 
 ```python
-# at pause:
-# pause.payload = {
-#   "pause_type": "oauth",
-#   "provider": "github",
-#   "auth_url": "https://...",
-#   ...
-# }
+# pause.payload == {"pause_type": "oauth", "provider": "github", "auth_url": "https://...", "state": "...", ...}
 
-# UI opens auth_url
-# user completes OAuth
-# callback handler stores token in OAuthManager.token_store under (user_id, "github")
+# 1. the UI opens auth_url and the user completes OAuth
+# 2. your callback route exchanges the code; the token is stored under (user_id, provider)
+user_id, trace_id = await oauth_manager.handle_callback(code, state)
 
-# host app resumes:
+# 3. resume with the same user_id
 result = await planner.resume(
     pause.resume_token,
     user_input="oauth_completed",
-    tool_context={
-        **original_ctx,
-        "user_id": "user-123",           # same key OAuthManager will look up
-    },
+    tool_context={**original_ctx, "user_id": user_id},
 )
 ```
 
-On the next tool invocation, `OAuthManager.get_token("user-123", "github")` returns the freshly stored token. The tool gets `Authorization: Bearer <token>` and proceeds.
-
-You don't have to set `oauth_ready=True` — the example flow uses it for clarity, but the real signal is the token being present in the store.
+On the next call, `ToolNode` finds the token with `OAuthManager.get_token(user_id, provider)` and sends `Authorization: Bearer <token>`. The real signal is the token in the store; you set no flag.
 
 ## Multiple sequential pauses
 
-A single run can pause multiple times:
+A single run can pause many times:
 
 ```python
-result = await planner.run(...)
+result = await planner.run(query, tool_context=ctx)
 while isinstance(result, PlannerPause):
-    # render result.payload, wait for action
-    result = await planner.resume(result.resume_token, ...)
+    ...  # render result.payload, wait for the user
+    result = await planner.resume(result.resume_token, tool_context=ctx)
 ```
 
-Each `PlannerPause.resume_token` is distinct. Treat them as independent records.
+Each pause has its own token.
 
 ## Concurrent sessions
 
-One planner instance serves many sessions concurrently — that's the point of `session_id` dispatch. As long as each call carries the right `session_id` in `tool_context`, sessions don't interfere.
-
-The pause record is keyed by `resume_token`, not by session. Two pauses in different sessions get different tokens.
+One planner instance serves many sessions at once. Calls with the same `session_id` are serialized on that session's internal planner; different sessions run in parallel. Pause records are keyed by token, and in memory they live on the session that paused.
 
 ## Failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `KeyError` on resume | Token not found in memory or state store | Configure durable `StateStore`; check token wasn't already consumed |
-| Resume re-invokes a different tool | LLM didn't pick the gated tool | Tighten the prompt; verify the gated tool is in the catalog |
-| Tool re-checks `tool_context` but the flag is missing | Resume `tool_context` didn't include the flag | Always re-pass the full `tool_context` on resume |
-| Approval set but tool still pauses | The check reads a different key than the resume sets | Use a constant for the key shared between tool and host |
-| `user_input` ignored | LLM doesn't see it as decisive | Encode the decision in `tool_context` instead |
-| OAuth token in store but tool re-pauses | `user_id` differs between pause and resume | Normalize `user_id` (tenant-scoped, no whitespace) |
+| `KeyError` on resume | Token already used, restart without a store, or a different/missing `session_id` | Resume with the run's `session_id`; configure a durable `StateStore` |
+| Resume calls a different tool | The model didn't pick the gated tool | Tighten the prompt; check the gated tool is in the catalog and visible |
+| The tool re-checks but the flag is missing | The resume `tool_context` didn't include it | Re-pass the full `tool_context` |
+| Approval set but the tool still pauses | The tool reads a different key than the host sets | Share one constant for the key |
+| `user_input` ignored | The model doesn't treat it as decisive | Encode the decision in `tool_context` |
+| OAuth token stored, tool re-pauses | `user_id` differs between callback and resume | Normalize `user_id` |
+| Deadline hit right after resume | The deadline budget is shared across segments | Size `deadline_s` for the whole run's active time |
 
 ## Hard rules
 
-- `resume_token` is a secret. Don't log it, don't expose it to other users.
-- One-time use is **not** enforced by the planner. If you need it, delete the token from your `StateStore` on `load_planner_state`.
-- A `state_store` failure does not block pause emission — the pause is already in memory. Save/load errors are logged.
+- `resume_token` is a secret. Don't log it or expose it to other users. The planner logs only its first 8 characters.
+- In memory, a token works once (the record is removed). The planner never deletes from the state store, so delete on load there to make tokens one-time across workers.
+- A failing `save_planner_state` doesn't block the pause; it is logged as `state_store_save_failed`. A failing `load_planner_state` surfaces as `KeyError`.
 - `tool_context` on resume is a full replacement; don't omit keys you still need.

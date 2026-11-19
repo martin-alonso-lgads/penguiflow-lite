@@ -1079,9 +1079,6 @@ class TestBackgroundTasksConfig:
         config = BackgroundTasksConfig()
         assert config.default_group_merge_strategy == "APPEND"
         assert config.default_group_report == "all"
-        assert config.group_timeout_s == 600.0
-        assert config.group_partial_on_failure is True
-        assert config.max_tasks_per_group == 10
         assert config.auto_seal_groups_on_foreground_yield is True
         assert config.retain_turn_timeout_s == 60.0
         assert config.background_continuation_max_hops == 2
@@ -1094,9 +1091,6 @@ class TestBackgroundTasksConfig:
         config = BackgroundTasksConfig(
             default_group_merge_strategy="HUMAN_GATED",
             default_group_report="any",
-            group_timeout_s=300.0,
-            group_partial_on_failure=False,
-            max_tasks_per_group=5,
             auto_seal_groups_on_foreground_yield=False,
             retain_turn_timeout_s=60.0,
             background_continuation_max_hops=3,
@@ -1104,10 +1098,50 @@ class TestBackgroundTasksConfig:
         )
         assert config.default_group_merge_strategy == "HUMAN_GATED"
         assert config.default_group_report == "any"
-        assert config.group_timeout_s == 300.0
-        assert config.group_partial_on_failure is False
-        assert config.max_tasks_per_group == 5
         assert config.auto_seal_groups_on_foreground_yield is False
         assert config.retain_turn_timeout_s == 60.0
         assert config.background_continuation_max_hops == 3
         assert config.background_continuation_cooldown_s == 5.0
+
+    @pytest.mark.parametrize(
+        "removed",
+        [
+            "default_mode",
+            "default_merge_strategy",
+            "context_depth",
+            "propagate_on_cancel",
+            "spawn_requires_confirmation",
+            "max_concurrent_tasks",
+            "max_tasks_per_session",
+            "task_timeout_s",
+            "max_pending_steering",
+            "proactive_report_enabled",
+            "proactive_report_strategies",
+            "proactive_report_max_queued",
+            "proactive_report_timeout_s",
+            "proactive_report_max_hops",
+            "proactive_report_fallback_notification",
+            "group_timeout_s",
+            "group_partial_on_failure",
+            "max_tasks_per_group",
+        ],
+    )
+    def test_config_rejects_removed_fields(self, removed: str) -> None:
+        """Fields removed in 7.0 raise instead of being ignored."""
+        from pydantic import ValidationError
+
+        from penguiflow.planner.models import BackgroundTasksConfig
+
+        with pytest.raises(ValidationError, match=removed):
+            BackgroundTasksConfig.model_validate({removed: 1})
+
+    def test_config_rejects_unknown_group_report(self) -> None:
+        """default_group_report only takes all, any or none."""
+        from pydantic import ValidationError
+
+        from penguiflow.planner.models import BackgroundTasksConfig
+
+        with pytest.raises(ValidationError, match="default_group_report"):
+            BackgroundTasksConfig.model_validate(
+                {"default_group_report": True}
+            )

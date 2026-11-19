@@ -78,7 +78,6 @@ def create_default_proactive_generator(
                     update={
                         "enabled": False,
                         "allow_tool_background": False,
-                        "proactive_report_enabled": False,
                     }
                 )
 

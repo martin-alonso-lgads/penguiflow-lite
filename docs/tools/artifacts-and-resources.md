@@ -14,7 +14,7 @@ Use artifacts when tools produce:
 - structured UI outputs,
 - references passed between steps without inlining large payloads.
 
-Artifacts are also the mechanism behind many MCP resource workflows (see **[MCP resources](mcp-resources.md)**).
+Artifacts are also the mechanism behind many MCP resource workflows (see the **MCP resources** docs page, `docs/tools/mcp-resources.md`).
 
 ## Non-goals / boundaries
 
@@ -28,21 +28,45 @@ Artifacts are also the mechanism behind many MCP resource workflows (see **[MCP 
 
 Artifacts live in `penguiflow.artifacts`:
 
-- `ArtifactStore` protocol (`put_bytes`, `put_text`, `get`, `get_ref`, `exists`, `delete`)
+- `ArtifactStore` protocol (`put_bytes`, `put_text`, `get`, `get_ref`, `exists`, `delete`, `list(scope=...)`), the storage backend
+- `ScopedArtifacts` (`upload`, `download`, `get_metadata`, `list`, `exists`, `delete`), the facade tools see as `ctx.artifacts`
 - `ArtifactRef` (the only thing that should enter LLM context)
+- `ArtifactScope` (tenant/user/session/trace metadata stored with each artifact)
 - `ArtifactRetentionConfig` (TTL + size/count limits)
+
+`ArtifactStore` is `@runtime_checkable`, and stores are discovered with `isinstance(...)`. A store that lacks any of the seven methods, `list` included, is not recognised as an artifact store.
+
+### Store vs. facade
+
+Implement the **store** once per deployment; tools use the **facade**:
+
+- `ctx.artifacts` is a `ScopedArtifacts` bound to the run's `tool_context` `tenant_id`, `user_id`, `session_id` and `trace_id`. `upload(data, *, mime_type, filename, namespace, meta)` stores `str` data with `put_text` and `bytes` with `put_bytes`, always stamping the full scope. Reads (`download`, `get_metadata`, `exists`, `delete`) refuse artifacts scoped to another tenant, user or session (an artifact with no scope passes), and `list()` returns the artifacts of this tenant/user/session across traces.
+- `ctx._artifacts` is the raw `ArtifactStore`, reserved for framework internals.
+
+```python
+from penguiflow.planner import ToolContext
+
+
+async def save_report(pdf_bytes: bytes, ctx: ToolContext) -> dict[str, object]:
+    ref = await ctx.artifacts.upload(
+        pdf_bytes,
+        mime_type="application/pdf",
+        filename="report.pdf",
+    )
+    return {"artifact": ref.model_dump(), "summary": "Report saved"}
+```
 
 ### Planner integration
 
 `ReactPlanner` can use an artifact store in three ways:
 
 1. explicit: `ReactPlanner(..., artifact_store=...)`
-2. discovered: if `state_store` exposes `artifact_store` (duck-typed) or implements `ArtifactStore`
-3. fallback: `NoOpArtifactStore` (artifacts become “no-op” references)
+2. discovered: if `state_store` exposes an `artifact_store` that passes `isinstance(..., ArtifactStore)`, or implements `ArtifactStore` itself
+3. fallback: `NoOpArtifactStore` (artifacts become “no-op” references: writes return truncated refs, reads return nothing)
 
-When the planner stores an artifact, it emits:
+During a planner run, every write through `ctx.artifacts` emits:
 
-- `PlannerEvent(event_type="artifact_stored", extra={artifact_id, mime_type, ...})`
+- `PlannerEvent(event_type="artifact_stored", extra={artifact_id, mime_type, size_bytes, artifact_filename, source})`
 
 ### Tool outputs: marking artifact fields
 
@@ -67,11 +91,11 @@ ToolNode has its own artifact extraction pipeline configured via:
 
 It can:
 
-- clamp large inline strings into `ctx._artifacts.put_text(...)` (internal)
-- extract binary content into `ctx._artifacts.put_bytes(...)` (internal)
+- clamp large inline strings (over `max_inline_size`, with `auto_artifact_large_content`) into `ctx.artifacts.upload(...)`
+- extract binary content into `ctx.artifacts.upload(...)`
 - turn MCP `resource_link` blocks into “stubs” that point to resources tooling
 
-> **Note:** `ctx._artifacts` is the raw `ArtifactStore` used by penguiflow internals. Tool developers should use `ctx.artifacts` (the `ScopedArtifacts` facade) which provides `upload()`/`download()`/`list()` with automatic scope injection.
+ToolNode writes through the same `ScopedArtifacts` facade as your own tools, so its artifacts carry the run's scope and, inside a planner run, emit `artifact_stored` events.
 
 ## Operational defaults
 

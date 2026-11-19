@@ -1,4 +1,0 @@
-interface:
-  display_name: "PenguiFlow Observability"
-  short_description: "Structured logging, planner metrics, LLM tracing"
-  default_prompt: "Help me add observability to a ReactPlanner deployment: structured logging via configure_logging, PlannerEvent-derived metrics through event_callback with safe cardinality, LLM tracing (PENGUIFLOW_LLM_TRACING, TelemetryHooks), task telemetry sinks, run cost from PlannerFinish metadata, dashboards and alerts, penguiflow-admin history, and tool catalog export."

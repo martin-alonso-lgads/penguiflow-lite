@@ -1,24 +1,32 @@
 # `ShortTermMemoryConfig` and Friends
 
+All of these live in `penguiflow.planner.memory` and are plain dataclasses that validate in `__post_init__` (a bad value raises `ValueError`).
+
 ## `ShortTermMemoryConfig`
 
-Top-level configuration passed to `ReactPlanner(short_term_memory=...)`.
+Top-level configuration passed to `ReactPlanner(short_term_memory=...)`. Every field, with its default:
 
 ```python
+from penguiflow.planner.memory import (
+    MemoryBudget,
+    MemoryIsolation,
+    ShortTermMemoryConfig,
+)
+
 ShortTermMemoryConfig(
-    strategy="none" | "truncation" | "rolling_summary",
-    budget=MemoryBudget(...),
-    isolation=MemoryIsolation(...),
-    summarizer_model: str | None = None,
-    include_trajectory_digest: bool = False,
-    recovery_backlog_limit: int = ...,
-    retry_attempts: int = ...,
-    retry_backoff_base_s: float = ...,
-    degraded_retry_interval_s: float = ...,
-    token_estimator: Callable[[str], int] | None = None,
-    on_turn_added: Callable[[ConversationTurn], Awaitable[None]] | None = None,
-    on_summary_updated: Callable[[str, str], Awaitable[None]] | None = None,
-    on_health_changed: Callable[[MemoryHealth, MemoryHealth], Awaitable[None]] | None = None,
+    strategy="none",  # or "truncation" | "rolling_summary"
+    budget=MemoryBudget(),
+    isolation=MemoryIsolation(),
+    summarizer_model=None,
+    include_trajectory_digest=True,
+    recovery_backlog_limit=20,
+    retry_attempts=3,
+    retry_backoff_base_s=2.0,
+    degraded_retry_interval_s=30.0,
+    token_estimator=None,  # (str) -> int
+    on_turn_added=None,  # async (ConversationTurn) -> None
+    on_summary_updated=None,  # async (old: str, new: str) -> None
+    on_health_changed=None,  # async (old: MemoryHealth, new: MemoryHealth)
 )
 ```
 
@@ -28,82 +36,89 @@ ShortTermMemoryConfig(
 |---|---|
 | `none` | No memory injected (default; effectively off). |
 | `truncation` | Keep the last `full_zone_turns` turns; drop older. Deterministic, no LLM dependency. |
-| `rolling_summary` | Keep recent turns + an LLM-generated rolling summary. Falls back to truncation if the summarizer is unhealthy. |
+| `rolling_summary` | Keep recent turns + an LLM-generated rolling summary of older ones. While degraded, only recent turns are shown. |
 
 Pick `truncation` first. Switch to `rolling_summary` only after measuring prompt token usage and confirming a reliable summarizer model.
 
 ### `summarizer_model`
-The LLM used to refresh the rolling summary. Use a cheap, fast model (`gpt-4.1-mini`, `claude-haiku`). Summarizer failures degrade health; persistent failures keep memory in `truncation` mode.
+The LLM used to refresh the rolling summary. `None` (the default) reuses the planner's own LLM client. Use a cheap, fast model (for example `gpt-4o-mini`). Summarizer failures degrade health; while degraded, memory shows recent turns only.
 
 ### `include_trajectory_digest`
-When `True` (the default), every turn carries a compressed digest of tool usage and observations (`TrajectoryDigest`). Increases prompt size but lets the model reason about prior tool decisions. Set to `False` to trim prompts.
+When `True` (the default), each stored turn carries a compressed digest of the run's tool calls (`TrajectoryDigest`). Increases prompt size but lets the model reason about prior tool decisions. Set to `False` to trim prompts.
 
-### `recovery_backlog_limit` (default 20), `retry_attempts` (default 3), `retry_backoff_base_s` (default 2.0), `degraded_retry_interval_s` (default 30.0)
-Backoff knobs for summarizer recovery. Defaults are reasonable; tune only if you have visibility into summarizer error rates.
+### `recovery_backlog_limit`, `retry_attempts`, `retry_backoff_base_s`, `degraded_retry_interval_s`
+Summarizer retry and recovery knobs (defaults 20, 3, 2.0, 30.0); see `strategies-and-health.md`. Tune only if you have visibility into summarizer error rates.
 
 ### `token_estimator`
-Function `(str) -> int` used to estimate token counts for budget enforcement. Default uses a cheap heuristic. Provide a real tokenizer for accurate budgets.
+Function `(str) -> int` used to estimate token counts for budget enforcement. The default is `len(text) // 4 + 1`. Provide a real tokenizer for accurate budgets.
 
 ### Hooks
 - `on_turn_added(turn)` — called after a turn is appended.
-- `on_summary_updated(old, new)` — called when the rolling summary changes.
-- `on_health_changed(old, new)` — called when `MemoryHealth` transitions.
+- `on_summary_updated(old, new)` — called when a new rolling summary is stored.
+- `on_health_changed(old, new)` — called when `MemoryHealth` changes.
 
 All hooks run **fire-and-forget** in background tasks. Exceptions are swallowed. Keep them lightweight (metrics, structured logging) — do not block on I/O. For durability, use a `StateStore`.
 
 ## `MemoryBudget`
 
 ```python
+from penguiflow.planner.memory import MemoryBudget
+
 MemoryBudget(
-    full_zone_turns: int,
-    summary_max_tokens: int,
-    total_max_tokens: int,
-    overflow_policy: "truncate_summary" | "truncate_oldest" | "error",
+    full_zone_turns=5,
+    summary_max_tokens=1000,
+    total_max_tokens=10000,
+    overflow_policy="truncate_oldest",  # or "truncate_summary" | "error"
 )
 ```
 
 | Field | Purpose |
 |---|---|
 | `full_zone_turns` | Number of most-recent turns kept as full messages. 3-8 typical. |
-| `summary_max_tokens` | Max tokens for the rolling summary (rolling_summary strategy). |
-| `total_max_tokens` | Hard cap on the entire memory payload. |
-| `overflow_policy` | What to do when total exceeds the cap. |
+| `summary_max_tokens` | Max tokens for the rolling summary. A longer summary is clipped, keeping its end. Must be <= `total_max_tokens`. |
+| `total_max_tokens` | Cap on the whole memory payload, checked on every `add_turn`. `0` disables the check. |
+| `overflow_policy` | What to do when the payload exceeds `total_max_tokens`. |
 
 ### Overflow policies
 
-- `truncate_oldest` (default for services) — Drop oldest turns first.
-- `truncate_summary` — Shrink the rolling summary first (keeps recent turns intact).
-- `error` — Raise `MemoryBudgetExceeded`. Useful for hard-bound test environments.
+- `truncate_oldest` (default) — Drop pending turns first, then the oldest recent turns, and clear the summary as a last resort.
+- `truncate_summary` — Clip the rolling summary to `summary_max_tokens` first. Caution: in the current code, if the summary already fits `summary_max_tokens` and the payload is still over `total_max_tokens`, `add_turn` loops forever and blocks the event loop. Prefer `truncate_oldest`.
+- `error` — `add_turn` raises `MemoryBudgetExceeded`. Under `ReactPlanner` that exception is caught and logged as a `memory_add_turn_failed` warning: the run still returns, and that turn is not persisted. Use it only when you drive `DefaultShortTermMemory` yourself (tests, hard-bound tooling).
 
-Production recommendation: `truncate_oldest`. `error` is for tests and special cases (e.g., billing-critical paths).
+Production recommendation: `truncate_oldest`.
 
 ## `MemoryIsolation`
 
 ```python
+from penguiflow.planner.memory import MemoryIsolation
+
 MemoryIsolation(
-    tenant_key: str = "tenant_id",
-    user_key: str = "user_id",
-    session_key: str = "session_id",
-    require_explicit_key: bool = True,        # fail-closed by default
+    tenant_key="tenant_id",
+    user_key="user_id",
+    session_key="session_id",
+    require_explicit_key=True,
 )
 ```
 
-`tenant_key`/`user_key`/`session_key` are paths looked up in `tool_context`. The composite key is `f"{tenant}:{user}:{session}"` (also exposed via `MemoryKey.composite()`).
+`tenant_key`/`user_key`/`session_key` are dotted paths looked up in `tool_context` (for example `"auth.tenant_id"`). A derived key needs only the session value: a missing tenant becomes `"default"` and a missing user `"anonymous"`. The composite key is `f"{tenant_id}:{user_id}:{session_id}"` (`MemoryKey.composite()`).
 
-| `require_explicit_key` | Behavior |
+| `require_explicit_key` | Behavior when there is no `memory_key` and no session value in `tool_context` |
 |---|---|
-| `True` (default) | Memory only activates if a key is resolvable (explicit or fully derived). Otherwise silently disabled. The library's fail-closed default. |
-| `False` | Try to derive from `tool_context`; if missing, use an anonymous key. **Unsafe for multi-tenant** — only flip this for single-tenant prototypes. |
+| `True` (default) | Memory is off for that call. |
+| `False` | Every such call on the planner instance shares one anonymous key, `default:anonymous:<random>`. **Unsafe for multi-tenant** — only for single-tenant prototypes. |
 
-The fail-closed default is intentional. If you can't safely scope memory, don't use memory.
+The default fails closed only on a missing session id, not on a missing tenant or user. In multi-tenant services, pass an explicit `MemoryKey`, or make sure `tool_context` always carries `tenant_id` and `user_id`.
 
 ## `MemoryKey`
 
 ```python
-MemoryKey(tenant_id: str, user_id: str, session_id: str)
+from penguiflow.planner.memory import MemoryKey
+
+key = MemoryKey(tenant_id="t1", user_id="u1", session_id="s1")
+assert key.composite() == "t1:u1:s1"
 ```
 
-The explicit form. Pass via `planner.run(..., memory_key=MemoryKey(...))`. This always wins over derived keys.
+The explicit form. Pass via `planner.run(..., memory_key=key)` or `planner.resume(..., memory_key=key)`. It always wins over derived keys.
 
 When to use explicit vs derived:
 - **Explicit** — services, multi-tenant, anywhere a bug in `tool_context` could leak across tenants.
@@ -111,37 +126,43 @@ When to use explicit vs derived:
 
 ## `ConversationTurn`
 
-The atomic unit STM stores:
+The atomic unit STM stores. The planner builds one per finished run:
 
 ```python
+import time
+
+from penguiflow.planner.memory import ConversationTurn
+
 ConversationTurn(
-    user_message: str,
-    assistant_response: str,
-    trajectory_digest: TrajectoryDigest | None,
-    artifacts_shown: dict[str, Any],
-    artifacts_hidden_refs: list[str],
-    ts: float,
+    user_message="What's the weather?",
+    assistant_response="Sunny, 24°C.",
+    trajectory_digest=None,  # TrajectoryDigest | None
+    artifacts_shown={},
+    artifacts_hidden_refs=[],
+    ts=time.time(),
 )
 ```
 
-`artifacts_shown` keeps inline artifact metadata visible to the LLM; `artifacts_hidden_refs` carries references to artifacts the user has interacted with but aren't included inline in the prompt.
+`assistant_response` is the finish payload's `raw_answer`, or the payload as JSON. `artifacts_shown` and `artifacts_hidden_refs` are stored and persisted but never rendered into the prompt, and the planner leaves them empty; they're for custom memory implementations.
 
 ## `TrajectoryDigest`
 
 ```python
+from penguiflow.planner.memory import TrajectoryDigest
+
 TrajectoryDigest(
-    tools_invoked: list[str],
-    observations_summary: str,
-    reasoning_summary: str | None,
-    artifacts_refs: list[str],
+    tools_invoked=["search_web"],
+    observations_summary='- search_web: {"results": ["..."]}',
+    reasoning_summary=None,
+    artifacts_refs=[],
 )
 ```
 
-A compressed record of what happened during a turn. Used only when `include_trajectory_digest=True`. Trade-off: more grounding for the model vs more tokens.
+A compressed record of a turn's tool calls, built only when `include_trajectory_digest=True` (the default) and at least one tool call succeeded. Trade-off: more grounding for the model vs more tokens.
 
 ## What lands in `llm_context`
 
-When memory is active, the planner adds:
+When memory is active, the planner merges this into `llm_context` (here for `rolling_summary`; `truncation` has only `recent_turns`):
 
 ```json
 {
@@ -151,19 +172,20 @@ When memory is active, the planner adds:
         "user": "user message",
         "assistant": "assistant response",
         "trajectory_digest": {
-          "tools_invoked": ["tool.a", "tool.b"],
-          "observations_summary": "...",
-          "reasoning_summary": "..."
+          "tools_invoked": ["tool_a", "tool_b"],
+          "observations_summary": "- tool_a: {...}",
+          "reasoning_summary": "...",
+          "artifacts_refs": []
         }
       }
     ],
-    "summary": "rolling summary text (rolling_summary, when healthy)",
-    "pending_turns": ["raw turns awaiting summarization"]
+    "summary": "rolling summary text (when one exists)",
+    "pending_turns": [{"user": "...", "assistant": "..."}]
   }
 }
 ```
 
-Shape varies by strategy and health. Inspect this in dev to verify what the model actually sees.
+`pending_turns` are turns that left the full zone but aren't summarized yet. The prompt builder removes `conversation_memory` from the `llm_context` message and renders it as a separate `<read_only_conversation_memory>` system message.
 
 ## Defaults summary
 
@@ -174,7 +196,7 @@ Shape varies by strategy and health. Inspect this in dev to verify what the mode
 | `summary_max_tokens` | `1000` | 800-1000 | unchanged |
 | `total_max_tokens` | `10000` | 8000 | 16000 |
 | `overflow_policy` | `"truncate_oldest"` | `"truncate_oldest"` | `"truncate_oldest"` |
-| `require_explicit_key` | `True` (fail-closed) | `True` | `False` if single-tenant |
+| `require_explicit_key` | `True` | `True` | `False` if single-tenant |
 | `include_trajectory_digest` | `True` | `False` for tight token budgets | unchanged |
-| `summarizer_model` | `None` | `"gpt-4o-mini"` or similar | unchanged |
+| `summarizer_model` | `None` (planner's LLM) | `"gpt-4o-mini"` or similar | unchanged |
 | `memory_key` source | n/a | Explicit `MemoryKey(...)` | Derived from `tool_context` |

@@ -27,7 +27,7 @@ Each event contains:
 ### Rules: sync vs async
 Rules are classified by cost:
 - `RuleCost.FAST` → **sync** evaluation (inline, time-boxed)
-- `RuleCost.DEEP` → **async** evaluation (queued, may or may not be awaited)
+- `RuleCost.DEEP` → **async** evaluation (queued; awaited for as long as the risk router's `async_wait_ms`)
 
 Synchronous rules are used for “must-not-miss” checks (e.g., obvious prompt injection
 strings). Async rules are used for model-based classification (e.g., jailbreak
@@ -153,6 +153,11 @@ risk_router:
 
 - Prefer **STOP** for high-confidence safety violations (prompt exfiltration, tool escalation).
 - Prefer **RETRY** for “helpful correction” flows (clarify intent, enforce scope, ask for missing parameters).
-- When building async rules, ensure the planner is configured to wait for them where required,
-  otherwise treat them as monitoring/telemetry.
+- When building async rules, ensure the risk router waits for them where required (tool risk
+  tiers, `risk_router` waits, or a custom `RiskRouter`). A `STOP` that arrives after the wait is
+  applied at the same run's next guardrail check; late `PAUSE`, `REDACT` and `RETRY` decisions
+  are dropped, so treat those as monitoring/telemetry unless the router waits.
+- `gateway.async.fail_open` governs guard inbox failures (submit or await raising, or a response
+  reporting an error): `true` skips the async check, `false` stops the run with
+  `GUARDRAIL_ASYNC_ERROR`. Async timeouts follow the risk router's `on_timeout`.
 

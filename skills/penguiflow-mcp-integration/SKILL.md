@@ -1,6 +1,6 @@
 ---
 name: penguiflow-mcp-integration
-description: Wire external tools (MCP servers, UTCP, HTTP, CLI) into a PenguiFlow ReactPlanner via `ToolNode` and `ExternalToolConfig` — pick a transport, choose an auth mode (none/API key/bearer/cookie/OAuth2), substitute env vars, set timeouts/retries/concurrency, allowlist tools with `tool_filter`, enable resource discovery (`{ns}.resources_list`/`resources_read`), extract large content into artifacts, and gate OAuth flows through HITL pause/resume. Use when a user says "wire MCP tools", "connect to an MCP server", "external tools", "ToolNode", "OAuth for tools", "tool filter", "UTCP", or names `ExternalToolConfig`, `TransportType`, `AuthType`.
+description: Wire external tools (MCP servers, UTCP, HTTP, CLI) into a PenguiFlow ReactPlanner via `ToolNode` and `ExternalToolConfig` — pick a transport (stdio command or URL for MCP), pass credentials with `env=` for stdio servers or an auth mode (API key/bearer/cookie/per-user OAuth2) for URL and UTCP sources, substitute `${VAR}`, set timeouts/retries/concurrency, allowlist tools with `tool_filter`, use MCP resources (`{ns}.resources_list`/`resources_read`, `subscribe_resource` update callbacks), extract large content into artifacts, and gate per-user OAuth through `OAuthManager` and HITL pause/resume. Use when a user says "wire MCP tools", "connect to an MCP server", "external tools", "ToolNode", "OAuth for tools", "tool filter", "MCP resources", "UTCP", or names `ExternalToolConfig`, `TransportType`, `AuthType`, `OAuthManager`.
 ---
 
 # PenguiFlow MCP / External Tool Integration
@@ -10,7 +10,7 @@ description: Wire external tools (MCP servers, UTCP, HTTP, CLI) into a PenguiFlo
 - Wiring a UTCP/HTTP/CLI external tool catalog.
 - Enabling OAuth-scoped per-user tool access.
 - Tightening tool exposure (allowlists, read-only filters).
-- Enabling MCP resources (URI discovery + read).
+- Using MCP resources (URI discovery, reads, update subscriptions).
 
 ## When NOT to use
 - Wiring planner-internal tools (Python functions decorated with `@tool`) → that's just [[penguiflow-reactplanner-config]] catalog wiring.
@@ -24,83 +24,107 @@ This skill stops at "ToolNode exposes the right tools with safe defaults". Pause
 ## Workflow
 
 ### 1) Pick a transport
-`TransportType` values:
-- `MCP` — `connection` is a launch command (`npx -y @modelcontextprotocol/server-github`) or an MCP service URL.
-- `HTTP` — `connection` is a base URL; uses the `utcp` HTTP client under the hood.
-- `UTCP` — `connection` points to a UTCP manual/base URL.
-- `CLI` — `connection` is a CLI invocation pattern (via `utcp`).
+`TransportType` values (ToolNode needs `penguiflow-lite[planner]`, which brings fastmcp, utcp and tenacity):
+- `MCP`: `connection` is either a launch command (split with `shlex`, run over stdio, e.g. `npx -y @modelcontextprotocol/server-github`) or a URL starting with `http://`, `https://`, `ws://` or `wss://`.
+- `HTTP`: `connection` is a base URL; tools are called through utcp's HTTP call template.
+- `UTCP`: `connection` points to a UTCP manual or base URL.
+- `CLI`: `connection` is a command for utcp's CLI call template.
 
 Pick based on what the tool source actually speaks. MCP is the dominant choice for ecosystem tools.
 
 ### 2) Build an `ExternalToolConfig`
-```python
-from penguiflow.tools import AuthType, ExternalToolConfig, TransportType
+A stdio server gets no HTTP headers, so pass its credentials as environment variables:
 
-cfg = ExternalToolConfig(
+```python
+from penguiflow.tools import ExternalToolConfig, TransportType
+
+github = ExternalToolConfig(
     name="github",                               # namespace; tools surface as github.<tool>
     transport=TransportType.MCP,
     connection="npx -y @modelcontextprotocol/server-github",
-    auth_type=AuthType.BEARER,
-    auth_config={"token": "${GITHUB_TOKEN}"},    # ${VAR} substitution; fail-fast if unset
-    tool_filter=["get_.*", "list_.*", "search_.*"],   # regex allowlist (re.match)
-    max_concurrency=3,                            # per-instance semaphore
-    timeout_s=30.0,                               # per-call timeout
+    env={"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},  # ${VAR} from the host env
+    tool_filter=["get_", "list_", "search_"],    # regex allowlist (re.match on the bare name)
+    max_concurrency=3,                           # per-ToolNode semaphore
+    timeout_s=30.0,                              # per attempt
 )
 ```
 
-Required fields: `name`, `transport`, `connection`. Everything else has safe defaults; `references/external-tool-config.md` enumerates every field.
+A URL server gets the auth headers when connecting:
+
+```python
+from penguiflow.tools import AuthType, ExternalToolConfig, TransportType
+
+search = ExternalToolConfig(
+    name="search",
+    transport=TransportType.MCP,
+    connection="https://mcp.example.com/mcp",
+    auth_type=AuthType.BEARER,
+    auth_config={"token": "${SEARCH_TOKEN}"},
+)
+```
+
+Required fields: `name`, `transport`, `connection`. Everything else has defaults; `references/external-tool-config.md` lists every field.
 
 ### 3) Choose an auth mode
-| `AuthType` | Use for | `auth_config` keys |
+| `AuthType` | Header sent | `auth_config` keys |
 |---|---|---|
-| `NONE` | Public APIs | — |
-| `API_KEY` | API key header | `api_key`, `header_name` (default `X-API-Key`) |
-| `BEARER` | Service token | `token` |
-| `COOKIE` | Cookie auth | `cookie_name`, `cookie_value` |
-| `OAUTH2_USER` | Per-user OAuth | provider config in the `OAuthManager` (see Step 6) |
+| `NONE` | — | — |
+| `API_KEY` | `<header>: <api_key>` | `api_key` (required), `header` (default `X-API-Key`) |
+| `BEARER` | `Authorization: Bearer <token>` | `token` (required) |
+| `COOKIE` | `Cookie: <cookie_name>=<cookie_value>` | `cookie_name`, `cookie_value` (both required) |
+| `OAUTH2_USER` | `Authorization: Bearer <user token>` | none; providers live in `ToolNode(auth_manager=OAuthManager(...))` (Step 6) |
 
-Auth resolves both at `connect(...)` (for connection-time headers) and on every `ToolNode.call(...)` (so tokens can rotate). See `references/auth-and-env.md`.
+Where headers go: URL MCP servers get them once, when connecting; UTCP/HTTP/CLI sources get them on every call; stdio servers never get them (use `env=`). A missing required key raises a validation error when the config is built. See `references/auth-and-env.md`.
 
 ### 4) Substitute env vars with `${VAR}`
-Any string in `auth_config`, `connection`, or other config fields can reference env vars. Missing vars raise `ToolAuthError` at connect/call time (fail-fast by design). Multiple vars per string are supported (regex-based substitution).
+`${VAR}` is substituted in `env` values and in `auth_config` values, and nowhere else (not in `connection`). Several per string are fine. A missing variable raises `ToolAuthError` ("Missing required environment variable ...") when the value is used: at `connect()` for headers and stdio env, and again on each call for headers. For `env=` values it arrives wrapped in `ToolConnectionError`.
 
-Don't put secrets in `llm_context` — env-substituted values stay in `tool_context` / auth headers.
+Don't put secrets in `llm_context`; keep them in env vars and `auth_config`.
 
 ### 5) Allowlist with `tool_filter`
-`tool_filter` is a regex allowlist matched via `re.match(...)`. Examples: `["get_.*", "list_.*", "search_.*"]` (read-only), `["create_issue", "list_repositories"]` (specific), `None` (all). Default is permissive — use an explicit allowlist in production.
+`tool_filter` is a list of regexes matched with `re.match(...)` against the server's bare tool names, so `"get_"` matches `get_issue` (anchor with `$` for exact names). `None` or `[]` exposes every tool; the default is `None`. Examples: `["get_", "list_", "search_"]` (read-only), `["create_issue$", "list_repositories$"]` (specific). The generated `{ns}.resources_*` and `{ns}.prompts_*` tools are not filtered. Use an explicit allowlist in production.
 
-### 6) (Optional) Enable OAuth via HITL
-Set `auth_type=AuthType.OAUTH2_USER`. When a token is missing, ToolNode pauses the planner with `reason="external_event"` and payload `{"pause_type": "oauth", "provider": ..., "auth_url": ..., "state": ..., "scopes": [...], "display_name": ...}`. Requires `tool_context["user_id"]`, a configured `OAuthManager` with token store, a durable planner state store ([[penguiflow-hitl-pause-resume]]), and a callback endpoint storing tokens under `(user_id, provider)`. See `references/oauth-and-hitl.md`.
+### 6) (Optional) Per-user OAuth via HITL
+Set `auth_type=AuthType.OAUTH2_USER` and pass `ToolNode(config=cfg, registry=registry, auth_manager=OAuthManager(providers={cfg.name: OAuthProviderConfig(...)}))`. The provider key must equal the config `name`. `connect()` needs a `ToolContext` (`await node.connect(ctx)`; a bare `connect()` raises `ToolAuthError`), and every run needs `tool_context["user_id"]`. When the user has no token, ToolNode pauses the planner with `reason="external_event"` and payload `{"pause_type": "oauth", "provider": ..., "display_name": ..., "auth_url": ..., "scopes": [...], "state": ...}`. Your callback endpoint calls `await manager.handle_callback(code, state)`, which stores the token and returns `(user_id, trace_id)`; then resume the run. MCP sources send the token only when connecting. See `references/oauth-and-hitl.md`.
 
-### 7) (Optional) Enable MCP resources
-If the server supports resources, ToolNode auto-generates `{ns}.resources_list`, `{ns}.resources_read`, `{ns}.resources_templates_list`. Programmatic API: `list_resources`, `read_resource`, `list_resource_templates`, `subscribe_resource`, `unsubscribe_resource`. Large reads go to the artifact store. See `references/resources-and-artifacts.md`.
+### 7) (Optional) Use MCP resources
+If the server answers `resources/list` at connect, ToolNode adds `{ns}.resources_list`, `{ns}.resources_read` and `{ns}.resources_templates_list` tools. Programmatic API: `list_resources()`, `read_resource(uri, ctx)`, `list_resource_templates()`, `subscribe_resource(uri, callback)`, `unsubscribe_resource(uri)`. Subscriptions go through the MCP session. ToolNode is the fastmcp client's message handler (`ToolNode.handle_mcp_message`), so a server's `notifications/resources/updated` invalidates the read cache, calls the `set_resource_updated_callback` callback (which a planner holding the tools uses to emit `resource_updated` events), then your `subscribe_resource` callback with the URI. Reads over the inline threshold, and binary reads, go to the artifact store. See `references/resources-and-artifacts.md`.
 
-### 8) Connect and inspect
+### 8) Connect, inspect, close
 ```python
-tool_node = ToolNode(config=cfg, registry=registry)
+from penguiflow import ModelRegistry
+from penguiflow.tools import ToolNode
+
+registry = ModelRegistry()
+tool_node = ToolNode(config=github, registry=registry)
 await tool_node.connect()
 for spec in tool_node.get_tools():
     print(spec.name)
+...  # run the planner
+await tool_node.close()
 ```
 
-Pass `tool_node.get_tools()` (a list of `NodeSpec`) into your planner catalog. The planner skill handles catalog composition.
+Pass `tool_node.get_tools()` (a list of `NodeSpec`) into your planner catalog, e.g. `ReactPlanner(catalog=[*tool_node.get_tools(), ...])`. The planner skill handles catalog composition. `close()` tears down the client and clears the discovered tools.
 
 ## Troubleshooting (fast checks)
-- **`ToolAuthError` at connect** — a `${VAR}` is unset in the worker's env (not just your shell).
-- **Too many tools exposed** — add a stricter `tool_filter`; never expose the full catalog in production.
-- **`429`/rate-limit storms** — lower `max_concurrency`, raise retry backoff, reduce planner parallelism.
-- **OAuth pauses but never completes** — missing callback handler, no `user_id` in `tool_context`, or no durable `StateStore` for planner pause state.
-- **Resources tools not generated** — server doesn't support resources.
-- **Reads return artifacts only** — over `inline_text_if_under_chars`; download from the artifact store.
-- **Calls hang forever** — set `timeout_s` explicitly; the 30s default is too coarse for production.
-- **`npx -y` crashes under load** — run MCP servers as managed services and connect via URL.
-- **Cross-tenant token reuse** — use composite key `tenant:user_id` in your TokenStore.
+- **`ToolAuthError: Missing required environment variable ...`**: a `${VAR}` is unset in the worker's environment (not just your shell).
+- **Stdio server reports missing credentials**: stdio servers get no auth headers, and inherit only a minimal environment (`PATH`, `HOME`, `USER`, ...). Pass what the server reads in `env=`.
+- **Too many tools exposed**: add a stricter `tool_filter`. `[]` exposes everything, like `None`.
+- **`429`/rate-limit storms**: lower `max_concurrency` and reduce planner parallelism. Errors with status 429 or 500–504 are retried per `retry_policy` (3 attempts, 0.1–5 s exponential backoff).
+- **`ToolTimeoutError`**: the call exceeded `timeout_s` (default 30 s, allowed 1–300) on one attempt. Timeouts and connection errors are not retried.
+- **OAuth pauses but never completes**: the callback didn't call `handle_callback`, or reached another process (pending `state`s live in that manager's memory for 10 minutes), or the token store isn't shared, or there's no durable planner state for the pause ([[penguiflow-hitl-pause-resume]]).
+- **`ToolAuthError` with `OAUTH2_USER` on a call**: `tool_context["user_id"]` is missing, or the ToolNode wasn't connected with `connect(ctx)` (a call that has to reconnect has no context).
+- **Resource tools not generated**: the server's `resources/list` failed at connect (no resources support).
+- **Reads return artifacts**: the text is over `artifact_extraction.resources.inline_text_if_under_chars` (default 10 000 chars), or the content is binary. Download with `ctx.artifacts.download(result["artifact"]["id"])`.
+- **Artifacts download as `None`**: the planner has no artifact store (`ReactPlanner(artifact_store=...)`), so `NoOpArtifactStore` kept only a preview.
+- **`npx -y` crashes under load**: run MCP servers as managed services and connect via URL.
+- **Cross-tenant token reuse**: tokens are keyed by `(tool_context["user_id"], provider)`. Make `user_id` tenant-scoped (`tenant:user`).
 
 ## Worked examples
-- `examples/toolnode_presets/flow.py` — runnable preset wiring pattern. Inspect the directory for preset templates.
+- `examples/toolnode_presets/flow.py` prints the built-in MCP presets (`POPULAR_MCP_SERVERS`, `get_preset`). It connects to nothing.
 
 ## References (load only as needed)
-- `references/external-tool-config.md` — every `ExternalToolConfig` field, transport semantics, resilience knobs, namespacing rules.
-- `references/auth-and-env.md` — auth modes, `${VAR}` substitution, `OAuthManager`, secret hygiene.
-- `references/oauth-and-hitl.md` — OAuth pause payload, resume flow, durable state requirements.
-- `references/resources-and-artifacts.md` — MCP resources surface, `ResourceCache`, artifact extraction pipeline.
+- `references/external-tool-config.md`: every `ExternalToolConfig` field, transport semantics, resilience knobs, artifact extraction, namespacing, lifecycle.
+- `references/auth-and-env.md`: where credentials go per transport, auth modes, `${VAR}` substitution, secret hygiene.
+- `references/oauth-and-hitl.md`: `OAuthManager`, `OAuthProviderConfig`, token stores, the OAuth pause payload, callback and resume flow.
+- `references/resources-and-artifacts.md`: MCP resources, subscriptions, `ResourceCache`, artifact extraction, `ctx.artifacts`.

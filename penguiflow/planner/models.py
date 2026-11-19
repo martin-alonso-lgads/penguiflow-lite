@@ -15,7 +15,7 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from ..catalog import NodeSpec, ToolLoadingMode
@@ -852,90 +852,49 @@ class ToolVisibilityPolicy(Protocol):
 
 
 class BackgroundTasksConfig(BaseModel):
-    """Configuration for background tasks/subagent orchestration.
+    """Configuration for background tasks and task groups.
 
-    This is the single source of truth for background task settings, consumed
-    by:
-    - ReactPlanner (prompt guidance, tool validation)
-    - SessionManager/TaskService (runtime enforcement)
+    ``ReactPlanner(background_tasks=...)`` reads ``enabled``,
+    ``include_prompt_guidance`` and ``allow_tool_background``. Sessions
+    read the rest, from the config set with
+    ``StreamingSession.configure_background_tasks`` or passed as
+    ``InProcessTaskService(background_config=...)``.
 
-    Downstream teams configure these values in their agent's Config class,
-    which builds this model before passing to ReactPlanner.
+    Limits on tasks (concurrency, counts, runtime, steering queue) live in
+    :class:`~penguiflow.sessions.session.SessionLimits`, passed as
+    ``SessionManager(limits=...)``. Proactive report-back is set up with
+    ``setup_proactive_reporting()`` or
+    ``StreamingSession.configure_proactive_reporting()``. Per-call task
+    options (mode, merge strategy, context depth, cancel propagation) are
+    arguments of ``tasks.spawn`` or a tool's ``extra["background"]``.
+
+    Unknown fields are rejected, so a config that still sets a removed
+    field fails loudly instead of being ignored.
     """
 
-    # Core enablement
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = False
-    """Master switch for background task capabilities."""
+    """Add background task guidance to the planner's system prompt.
+
+    This does not disable the ``tasks.*`` tools; leave them out of the
+    catalog, or filter them with a tool policy, to remove them.
+    """
 
     include_prompt_guidance: bool = True
-    """Whether to inject background task guidance into the system prompt."""
+    """Whether ``enabled`` injects the guidance into the system prompt."""
 
     allow_tool_background: bool = False
-    """Whether tools marked with background=True can spawn async tasks."""
+    """Whether tools with ``extra["background"]["enabled"]`` run as tasks."""
 
-    # Task execution mode
-    default_mode: str = "subagent"
-    """Default mode: 'subagent' (full reasoning) or 'job' (single tool)."""
-
-    default_merge_strategy: str = "HUMAN_GATED"
-    """How task results merge into context: HUMAN_GATED, APPEND, or REPLACE."""
-
-    context_depth: str = "full"
-    """Spawned tasks' context depth: 'full', 'summary', or 'minimal'."""
-
-    propagate_on_cancel: str = "cascade"
-    """Cancel propagation: 'cascade' (cancel children) or 'orphan'."""
-
-    spawn_requires_confirmation: bool = False
-    """Whether spawning a task requires explicit user confirmation."""
-
-    # Resource limits
-    max_concurrent_tasks: int = 5
-    """Maximum number of tasks running concurrently per session."""
-
-    max_tasks_per_session: int = 50
-    """Maximum total tasks (active + completed) per session."""
-
-    task_timeout_s: int = 3600
-    """Task timeout in seconds (default: 1 hour)."""
-
-    max_pending_steering: int = 2
-    """Maximum steering messages queued per task before backpressure."""
-
-    # Proactive report-back settings
-    proactive_report_enabled: bool = False
-    """Master switch for proactive messages on auto-merge completion."""
-
-    proactive_report_strategies: list[str] = ["APPEND", "REPLACE"]
-    """Merge strategies that trigger proactive reports (not HUMAN_GATED)."""
-
-    proactive_report_max_queued: int = 5
-    """Maximum queued reports before dropping oldest."""
-
-    proactive_report_timeout_s: float = 30.0
-    """Timeout for proactive message generation."""
-
-    proactive_report_max_hops: int = 2
-    """Proactive recursion hops allowed before background spawning stops."""
-
-    proactive_report_fallback_notification: bool = True
-    """Fall back to notification panel if generation fails."""
-
-    # Task group settings (RFC_TASK_GROUPS)
     default_group_merge_strategy: str = "APPEND"
-    """Default merge strategy for task groups."""
+    """Merge strategy of new task groups that don't set one.
 
-    default_group_report: str = "all"
-    """Default report strategy for groups: 'all', 'any', or 'none'."""
+    One of ``APPEND``, ``REPLACE`` or ``HUMAN_GATED``, in any case.
+    """
 
-    group_timeout_s: float = 600.0
-    """Timeout for group completion (seal to complete)."""
-
-    group_partial_on_failure: bool = True
-    """If True, report partial results when some tasks in a group fail."""
-
-    max_tasks_per_group: int = 10
-    """Maximum tasks allowed in a single group."""
+    default_group_report: Literal["all", "any", "none"] = "all"
+    """Report strategy of new task groups that don't set one."""
 
     auto_seal_groups_on_foreground_yield: bool = True
     """Auto-seal OPEN groups when foreground yields to user."""

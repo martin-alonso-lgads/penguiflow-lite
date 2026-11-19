@@ -1,176 +1,111 @@
 # Builders and `artifact_ref` Composition
 
-`build_*` tools are the non-emitting counterparts to `render_*`. They register a reusable component payload in the in-run artifact registry and return an `artifact_ref` you can compose into parent renderers.
+`build_*` tools take the same arguments as their `render_*` twins, but they emit nothing. They validate the component, store it in the planner's in-run `ArtifactRegistry`, and return a ref the LLM can place into a parent component. Source: `penguiflow/rich_output/nodes.py` and `penguiflow/planner/artifact_registry.py`.
 
-## When builders are useful
+## The builders
 
-### Case 1: One child, many parents
-You want to show the same chart in both a tab and a grid:
+| Builder | Args model | Twin |
+|---|---|---|
+| `build_chart_echarts` | `BuildChartEChartsArgs` | `render_chart_echarts` |
+| `build_table` | `BuildTableArgs` | `render_table` |
+| `build_grid` | `BuildGridArgs` | `render_grid` |
+| `build_tabs` | `BuildTabsArgs` | `render_tabs` |
+| `build_accordion` | `BuildAccordionArgs` | `render_accordion` |
 
-```python
-chart = build_chart_echarts(option=...)
-# chart = {"artifact_ref": "art_chart_1"}
+There is no builder for `report` or `markdown`, or for components without a typed tool. Each builder is only registered when its component is allowlisted.
 
-render_tabs(tabs=[
-    {"label": "Trend", "component_artifact_ref": chart["artifact_ref"]},
-    ...
-])
+A builder returns `BuildComponentResult(ok, component, artifact_ref, dedupe_key, summary, skipped)`, for example `{"ok": true, "component": "echarts", "artifact_ref": "artifact_0", "summary": "Built echarts", ...}`. A builder needs an active planner run; called outside one, it raises. Renderers register their component too, so a `render_*` result's `artifact_ref` can also be reused.
 
-render_grid(cells=[
-    {"component_artifact_ref": chart["artifact_ref"], "span": 2},
-    ...
-])
-```
+## Where refs go
 
-Without builders, you'd have to inline the chart props in both places — wasted tokens, mismatched data.
+Put `{"artifact_ref": "<ref>"}` where a child component would go:
 
-### Case 2: Conditional inclusion
-Build several candidate children, decide later which to render:
+| Parent | Slot |
+|---|---|
+| `render_grid` / `build_grid` | `items[].artifact_ref` (keeps `colSpan`, `rowSpan`, `title`) |
+| `render_tabs` / `build_tabs` | `tabs[].artifact_ref` |
+| `render_accordion` / `build_accordion` | `items[].artifact_ref` |
+| `render_report` | `sections[].components[].artifact_ref` (keeps `caption`) |
+| `render_component` | Any dict in `props` that has an `artifact_ref` key |
 
-```python
-maybe_chart = build_chart_echarts(option=...)
-maybe_table = build_table(columns=..., rows=...)
+Each item takes one source: an `artifact_ref`, *or* `component` + `props` (tabs and accordion items can also hold `content`). Mixing them fails validation. Before validating and emitting, the renderer swaps each ref dict for the stored `{"component", "props"}` and keeps the item's other keys. The frontend only ever sees resolved components.
 
-if data.has_trend:
-    render_grid(cells=[{"component_artifact_ref": maybe_chart["artifact_ref"]}])
-else:
-    render_grid(cells=[{"component_artifact_ref": maybe_table["artifact_ref"]}])
-```
+## A composed dashboard
 
-### Case 3: Composed reports
-A report with multiple custom sections:
+These are the arguments of three tool calls, in order:
 
 ```python
-chart = build_chart_echarts(option=...)
-table = build_table(columns=..., rows=...)
+from penguiflow.rich_output.tools import (
+    BuildChartEChartsArgs,
+    BuildTableArgs,
+    DataGridColumn,
+    GridItem,
+    RenderGridArgs,
+    RenderReportArgs,
+    ReportComponentItem,
+    ReportSection,
+)
 
-render_report(
+# 1) build_chart_echarts -> {"artifact_ref": "artifact_0", ...}
+chart = BuildChartEChartsArgs(
+    option={"xAxis": {"type": "category", "data": ["Q1", "Q2"]}, "series": [{"type": "line", "data": [3, 5]}]},
+    title="Revenue",
+)
+
+# 2) build_table -> {"artifact_ref": "artifact_1", ...}
+table = BuildTableArgs(
+    columns=[DataGridColumn(field="region", header="Region"), DataGridColumn(field="revenue", format="currency")],
+    rows=[{"region": "EMEA", "revenue": 1200}],
+)
+
+# 3) render_grid, reusing both refs plus an inline child
+dashboard = RenderGridArgs(
+    columns=2,
+    items=[
+        GridItem(artifact_ref="artifact_0", col_span=2),
+        GridItem(artifact_ref="artifact_1"),
+        GridItem(component="markdown", props={"content": "Source: warehouse"}),
+    ],
+)
+
+# The same chart can go into a report later in the run
+report = RenderReportArgs(
     title="Q3 review",
     sections=[
-        {"heading": "Summary", "content": "..."},
-        {"heading": "Trend", "component_artifact_ref": chart["artifact_ref"]},
-        {"heading": "Details", "component_artifact_ref": table["artifact_ref"]},
+        ReportSection(
+            title="Trend",
+            components=[ReportComponentItem(artifact_ref="artifact_0", caption="Revenue by quarter")],
+        ),
     ],
 )
 ```
 
-## Builder tools (mirroring renderers)
+A ref is not consumed by use: it can go into any number of parents within the run. A builder's output can itself contain refs, for example a `build_grid` of built charts referenced from `render_tabs`.
 
-| Builder | Pairs with |
-|---|---|
-| `build_chart_echarts` | `render_chart_echarts` |
-| `build_table` | `render_table` |
-| `build_report` | `render_report` |
-| `build_grid` | `render_grid` |
-| `build_tabs` | `render_tabs` |
-| `build_accordion` | `render_accordion` |
-| `build_markdown` | `render_markdown` |
-
-Each builder:
-- Takes the same input model as its renderer.
-- Does **not** emit `artifact_chunk` — the component isn't visible until composed into a parent.
-- Returns `{"artifact_ref": "art_..."}`.
-
-## In-run artifact registry
-
-Builders register payloads in a per-run registry. The registry:
-- Lives only for the duration of one `planner.run(...)`.
-- Doesn't persist across pause/resume **automatically** — but if you have a `StateStore` with planner state persistence, refs are reachable during the same run via the saved state.
-- Is **not** the durable `ArtifactStore` (covered in [[penguiflow-statestore]]) — those are different surfaces.
-
-For cross-run persistence (e.g., "the chart from yesterday's session"), use:
-1. Render with `render_*` so an `artifact_chunk` is emitted.
-2. Frontend snapshots the chunk to durable storage of your choice.
-
-Or:
-1. Use the `ArtifactStore` directly (`ctx.artifacts.upload(...)`).
-2. Reference the persisted artifact in future runs via your app layer.
-
-## Composition rules
-
-### Parent slots that accept `component_artifact_ref`
-
-Renderers expose `component_artifact_ref` (or `component` + `props` inline) on child slots. Examples:
-- `render_grid(cells=[{component_artifact_ref: ...}, {component: "echarts", props: {...}}, ...])` — mix and match.
-- `render_tabs(tabs=[{label: ..., component_artifact_ref: ...}, ...])`.
-- `render_accordion(sections=[{heading: ..., component_artifact_ref: ...}, ...])`.
-
-When you pass `component_artifact_ref`, the renderer resolves it at emit time. If the ref isn't found, the renderer fails — typically because:
-- You called the builder in a different run.
-- You consumed the ref via a `render_*` that finalized the registry entry.
-
-### Refs are single-use? No.
-A ref can be composed into multiple parents within the same run. The registry retains the payload until the run ends.
-
-### Refs in nested compositions
-You can build a grid of charts:
+## `list_artifacts`
 
 ```python
-charts = [build_chart_echarts(option=opt) for opt in options]
-grid = build_grid(cells=[{"component_artifact_ref": c["artifact_ref"]} for c in charts])
-render_tabs(tabs=[
-    {"label": "Dashboard", "component_artifact_ref": grid["artifact_ref"]},
-    {"label": "Detail",    "component_artifact_ref": charts[0]["artifact_ref"]},
-])
+from penguiflow.rich_output.tools import ListArtifactsArgs
+
+ListArtifactsArgs(kind="ui_component", source_tool="build_chart_echarts", limit=10)
 ```
 
-The resolver walks the ref tree at emit time.
+- `kind` is `"all"` (the default), `"ui_component"`, `"binary"` or `"tool_artifact"`; `"tool_artifact"` is treated like `"all"`.
+- `limit` defaults to 25 and keeps the **last** N entries.
+- With `"all"` or `"binary"`, the listing also includes artifacts in the scoped `ArtifactStore` (`ctx.artifacts.list()`).
+- The result is `{"ok": true, "artifacts": [...]}`. Each entry has `ref`, `kind`, `source_tool`, `component`, `title`, `summary`, `artifact_id`, `mime_type`, `size_bytes`, `created_step`, `renderable` and `metadata`.
 
-## Patterns
+Binary artifacts in the registry (stored by tools during the run, or by the observation clamp) can be referenced too. They resolve to an `image`, `embed` (PDF) or `markdown` component that points at the artifact URL.
 
-### Pattern: "compose then render"
-```python
-# build all children
-parts = {
-    "chart": build_chart_echarts(option=chart_opt),
-    "table": build_table(columns=cols, rows=rows),
-    "summary": build_markdown(text=summary_text),
-}
+## Lifetime
 
-# decide layout based on user intent
-if user_wants_dashboard:
-    render_grid(cells=[
-        {"component_artifact_ref": parts["chart"]["artifact_ref"]},
-        {"component_artifact_ref": parts["table"]["artifact_ref"]},
-        {"component_artifact_ref": parts["summary"]["artifact_ref"]},
-    ])
-else:
-    render_report(title="Analysis", sections=[
-        {"heading": "Trend",   "component_artifact_ref": parts["chart"]["artifact_ref"]},
-        {"heading": "Data",    "component_artifact_ref": parts["table"]["artifact_ref"]},
-        {"heading": "Summary", "component_artifact_ref": parts["summary"]["artifact_ref"]},
-    ])
-```
-
-### Pattern: "inline then promote"
-Start with inline props for prototyping; when a child becomes reusable, promote it to a builder.
-
-```python
-# v1: inline (single use)
-render_tabs(tabs=[
-    {"label": "Chart", "component": "echarts", "props": chart_opt},
-])
-
-# v2: promoted (reused in tabs and a follow-up report)
-chart = build_chart_echarts(option=chart_opt)
-render_tabs(tabs=[{"label": "Chart", "component_artifact_ref": chart["artifact_ref"]}])
-render_report(title="Detail", sections=[
-    {"heading": "Trend", "component_artifact_ref": chart["artifact_ref"]},
-])
-```
+- A new `run()` starts an empty registry, and refs count from `artifact_0`.
+- The registry is snapshotted into `trajectory.metadata["artifact_registry"]`, so refs survive a pause and `resume()` of the same run.
+- A ref from another run fails with `Unknown artifact_ref 'artifact_0'`.
+- For anything that must outlive the run, store it with `ctx.artifacts.upload(...)` (see [[penguiflow-statestore]]), or persist the emitted `artifact_chunk` in your app.
 
 ## Operational defaults
 
-- Use builders when ref reuse > 1 within a run.
-- Don't pre-build everything speculatively — each `build_*` call costs LLM tokens.
-- Keep ref ids opaque; don't parse them on the frontend.
-- Treat refs as run-scoped. For cross-run persistence, use `ArtifactStore`.
-
-## Failure modes
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| "artifact_ref not found" | Ref from a different run | Build in the same run as the renderer |
-| Renderer emits but frontend shows empty cells | `component_artifact_ref` not resolved (bug or version mismatch) | Inspect emitted `artifact_chunk`; check renderer wiring |
-| Duplicate UI showing same chart twice | Both built and inlined the same data | Pick one; either build once and ref, or inline once |
-| Slow UI for large tabs | Many builders create many refs that all resolve at parent emit time | Reduce ref tree depth; flatten if possible |
+- Build only what you reuse; each `build_*` call is a tool step and costs LLM tokens.
+- Treat refs as opaque, run-scoped ids; the frontend never needs them.
+- If the LLM repeats an identical build in the next step, the planner returns the previous ref with `skipped="duplicate_build"`.

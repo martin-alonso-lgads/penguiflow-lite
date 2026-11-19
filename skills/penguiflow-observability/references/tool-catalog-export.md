@@ -7,7 +7,7 @@ A ReactPlanner agent has no graph to draw — its "topology" is the **tool catal
 Every catalog entry (`NodeSpec`, from `build_catalog(...)`, `ToolNode`, `A2AAgentToolset.tool(...)`, ...) renders a JSON-serializable record:
 
 ```python
-record = spec.to_tool_record()
+record = spec.to_tool_record()  # spec: a NodeSpec from your catalog
 # {
 #   "name", "desc", "side_effects", "loading_mode", "tags", "auth_scopes",
 #   "cost_hint", "latency_hint_ms", "safety_notes",
@@ -20,24 +20,26 @@ This is the same information the planner renders into its prompt, so the export 
 
 ## CI integration: as-built catalog
 
-Generate the catalog on every commit and fail on unintended changes:
+Generate the catalog on every commit and fail on unintended changes. `app.agent.build_catalog_for_prod` stands for your own catalog factory, and `./tool-catalog.json` is an output path you pick and commit in your project (PenguiFlow doesn't create it):
 
 ```bash
 uv run python -c "import json; from app.agent import build_catalog_for_prod as c; \
-  print(json.dumps([s.to_tool_record() for s in c()], indent=2, sort_keys=True))" > docs/tool-catalog.json
-git diff --exit-code docs/tool-catalog.json   # fail if changed without intent
+  print(json.dumps([s.to_tool_record() for s in c()], indent=2, sort_keys=True))" > ./tool-catalog.json
+git diff --exit-code ./tool-catalog.json   # fail if changed without intent
 ```
 
 Review signals in the diff:
-- New tools with `side_effects` other than `"pure"` / `"read"`.
+- New tools with `side_effects` other than `"pure"` / `"read"` (the others are `"write"`, `"external"`, `"stateful"`).
 - Changed `args_schema` (breaking for prompts, examples and recorded trajectories).
 - Changed `loading_mode` (always vs deferred) — affects prompt size and tool discovery.
 
 ## A readable summary table
 
 ```python
-for spec in catalog:
-    print(f"| {spec.name} | {spec.side_effects} | {', '.join(spec.tags)} | {spec.loading_mode.value} |")
+for spec in catalog:  # the list[NodeSpec] your factory builds
+    tags = ", ".join(spec.tags)
+    mode = spec.loading_mode.value
+    print(f"| {spec.name} | {spec.side_effects} | {tags} | {mode} |")
 ```
 
 Paste it into the agent's README next to its dashboard links.

@@ -97,6 +97,9 @@ from .react_runtime import (
     _emit_step_start as _emit_step_start_impl,
 )
 from .react_runtime import (
+    _guardrail_run_id as _guardrail_run_id_impl,
+)
+from .react_runtime import (
     _handle_finish_action as _handle_finish_action_impl,
 )
 from .react_runtime import (
@@ -1465,9 +1468,14 @@ class ReactPlanner:
             ).items():
                 merged_payload.setdefault(key, value)
 
+        run_id = (
+            _guardrail_run_id_impl(trajectory)
+            if trajectory is not None
+            else None
+        )
         return GuardrailEvent(
             event_type=event_type,
-            run_id=self.guardrail_run_id or "unknown",
+            run_id=run_id or self.guardrail_run_id or "unknown",
             text_content=text_content,
             tool_name=tool_name,
             tool_args=tool_args,
@@ -1509,6 +1517,7 @@ class ReactPlanner:
     ) -> dict[str, Any]:
         """Return a guardrail decision as a JSON-serializable dict."""
         stop = decision.stop
+        pause = decision.pause
         return {
             "action": decision.action.value,
             "rule_id": decision.rule_id,
@@ -1522,6 +1531,14 @@ class ReactPlanner:
                 "internal_reason": stop.internal_reason,
             }
             if stop is not None
+            else None,
+            "pause": {
+                "scope": pause.scope,
+                "approver_roles": list(pause.approver_roles),
+                "prompt": pause.prompt,
+                "timeout_s": pause.timeout_s,
+            }
+            if pause is not None
             else None,
         }
 

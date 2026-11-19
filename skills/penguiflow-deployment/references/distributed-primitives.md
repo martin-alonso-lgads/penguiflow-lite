@@ -17,7 +17,7 @@ Optional capabilities (duck-typed, detected at runtime):
 |---|---|---|
 | Planner pause state | `save_planner_state`, `load_planner_state` | `PlannerPause` → resume on any worker ([[penguiflow-hitl-pause-resume]]) |
 | Memory | `save_memory_state`, `load_memory_state` | short-term memory ([[penguiflow-memory]]) |
-| Conversation bindings | `find_binding`, `list_bindings`, `mark_binding_terminal` | `A2AAgentToolset` continuity ([[penguiflow-a2a-integration]]) |
+| Conversation bindings | `find_binding` (also `list_bindings`, `mark_binding_terminal`, which the library doesn't call) | `A2AAgentToolset` continuity ([[penguiflow-a2a-integration]]) |
 | Tasks / updates | `save_task`, `list_tasks`, `save_update`, `list_updates` | `StreamingSession` persistence and replay ([[penguiflow-background-tasks]]) |
 | Steering | `save_steering`, `list_steering` | steering audit |
 | Trajectories / planner events | `save_trajectory`, `get_trajectory`, `save_planner_event`, `list_planner_events` | run inspection |
@@ -25,6 +25,10 @@ Optional capabilities (duck-typed, detected at runtime):
 
 Wire it once:
 ```python
+from penguiflow.planner import ReactPlanner
+from penguiflow.sessions import SessionManager
+from penguiflow_a2a import A2AConfig, A2AService
+
 planner = ReactPlanner(..., state_store=store)
 sessions = SessionManager(state_store=store)
 service = A2AService(planner, agent_card=card, config=A2AConfig(agent_url=...))   # uses the planner's store for bindings
@@ -33,12 +37,23 @@ service = A2AService(planner, agent_card=card, config=A2AConfig(agent_url=...)) 
 Backends: in-memory (`InMemoryStateStore`, dev only), Redis, Postgres, custom. Full contract in [[penguiflow-statestore]].
 
 ### Idempotency rule
-`save_event` and `save_update` may be called more than once for the same record (retries, recovery). Implementations must dedupe (unique constraint on event/update id). Event persistence is best-effort; errors are logged and execution continues.
+`save_event` and `save_update` may be called more than once for the same record (retries, recovery), so implementations must dedupe (a unique constraint on the event or update id).
+
+Persistence errors are not swallowed by default. A failing session task save fails the spawn or status change that made it. Only a few writes are best-effort and logged:
+- planner pause saves (`state_store_save_failed`);
+- background trajectory and planner-event persistence;
+- `A2AService` binding saves (`a2a_remote_binding_save_failed`).
 
 ## `RemoteTransport` (agent-to-agent calls)
 
 `penguiflow.remote.RemoteTransport`:
 ```python
+from collections.abc import AsyncIterator
+from typing import Protocol
+
+from penguiflow.remote import RemoteCallRequest, RemoteCallResult, RemoteStreamEvent
+
+
 class RemoteTransport(Protocol):
     async def send(self, request: RemoteCallRequest) -> RemoteCallResult: ...
     def stream(self, request: RemoteCallRequest) -> AsyncIterator[RemoteStreamEvent]: ...   # not async; returns iterator directly
@@ -65,7 +80,7 @@ Each specialist task is one planner run keyed by the A2A `contextId` (`tool_cont
 ## Recovery semantics
 
 On worker restart you can recover:
-- **Paused runs** — `load_planner_state(token)`; call `planner.resume(token, user_input=...)` on any worker.
+- **Paused runs** — `load_planner_state(token)`; call `planner.resume(token, user_input=..., tool_context=...)` on any worker, with the run's `session_id`. Paused **A2A** tasks are the exception: `A2AService` keeps their tokens in memory, so they resume only on the replica that paused them.
 - **Memory** — `load_memory_state(key)` on the next run for that `session_id`.
 - **Session history** — `list_tasks` / `list_updates` for reconnecting clients.
 - **Remote conversations** — `find_binding` returns the remote `context_id` / `task_id`.
@@ -92,14 +107,14 @@ The library can't enforce idempotency for you — it's a property of the surroun
 2. **Redis** (or any queue) for inbound jobs.
 3. **Stateless worker pool** building planners from a factory.
 4. **`A2AHttpTransport`** for outbound agent calls; `A2AService` for inbound.
-5. **LLM tracing** (`PENGUIFLOW_LLM_TRACING=mlflow`) and planner-event metrics.
+5. **LLM tracing** (`PENGUIFLOW_LLM_TRACING=mlflow`, with `use_native_llm=True` on the planner) and planner-event metrics.
 6. **OpenTelemetry** for cross-service traces (your request id ↔ `tool_context["trace_id"]`).
 
-Pauses survive worker swaps. Memory persists. A2A bindings recover across restarts.
+Planner pauses survive worker swaps (A2A pauses don't). Memory persists. A2A bindings recover across restarts.
 
 ## Anti-patterns
 
 - **`StateStore` only in-memory** in multi-worker production — defeats pause/resume, memory and bindings.
 - **No `agent_url` on specialists** — no bindings recorded for their tasks.
-- **Mixing tenants under one `session_id`** — memory and bindings merge.
+- **Mixing tenants under one `session_id`, or passing `tenant` instead of `tenant_id`** — memory and bindings merge.
 - **No idempotency on external writes** — duplicates on retry and recovery.

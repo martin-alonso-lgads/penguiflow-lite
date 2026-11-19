@@ -1139,13 +1139,25 @@ class A2AService:
             return
         if not configs:
             return
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 self._push_sender.send(config.push_notification_config, event)
                 for config in configs
             ),
             return_exceptions=True,
         )
+        for config, result in zip(configs, results, strict=True):
+            if isinstance(result, BaseException):
+                # Never log the webhook URL or token: both can carry secrets.
+                logger.warning(
+                    "a2a_push_delivery_failed",
+                    extra={
+                        "task_id": task_id,
+                        "config_id": config.push_notification_config.id,
+                        "error_type": type(result).__name__,
+                    },
+                    exc_info=result,
+                )
 
     # -- payload conversion ---------------------------------------------------
 

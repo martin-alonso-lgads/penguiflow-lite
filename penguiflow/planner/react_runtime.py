@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
@@ -1158,6 +1159,41 @@ async def _persist_events(
         )
 
 
+_GUARDRAIL_RUN_ID_KEY = "guardrail_run_id"
+
+
+def _guardrail_run_id(trajectory: Trajectory) -> str | None:
+    """Return the guardrail run id stored on ``trajectory``, if any."""
+    value = trajectory.metadata.get(_GUARDRAIL_RUN_ID_KEY)
+    return value if isinstance(value, str) else None
+
+
+def _start_guardrail_run(
+    planner: ReactPlanner, trajectory: Trajectory
+) -> None:
+    """Give a new run its own guardrail run id.
+
+    The id lives in the trajectory metadata, so it survives pause and
+    resume, and concurrent runs on one planner never share it.
+    """
+    if planner.guardrails_enabled():
+        trajectory.metadata[_GUARDRAIL_RUN_ID_KEY] = uuid4().hex
+
+
+def _end_guardrail_run(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    result: PlannerFinish | PlannerPause | None,
+) -> None:
+    """Tell the gateway a run is over, unless it only paused."""
+    if isinstance(result, PlannerPause):
+        return
+    gateway = planner.guardrail_gateway
+    run_id = _guardrail_run_id(trajectory)
+    if gateway is not None and run_id is not None:
+        gateway.end_run(run_id)
+
+
 def _fire_persistence_tasks(
     planner: ReactPlanner, trajectory: Trajectory, result: object | None
 ) -> None:
@@ -1247,6 +1283,7 @@ async def run(
     )
     if extracted_results:
         trajectory.background_results.update(extracted_results)
+    _start_guardrail_run(planner, trajectory)
     planner.artifact_registry = ArtifactRegistry.from_snapshot(
         trajectory.metadata.get("artifact_registry")
     )
@@ -1292,6 +1329,7 @@ async def run(
     finally:
         planner.active_tool_names = previous_active
         _fire_persistence_tasks(planner, trajectory, result)
+        _end_guardrail_run(planner, trajectory, result)
     assert result is not None
     await planner.maybe_record_memory_turn(
         query, result, trajectory, resolved_key
@@ -1411,6 +1449,7 @@ async def resume(
     finally:
         planner.active_tool_names = previous_active
         _fire_persistence_tasks(planner, trajectory, result)
+        _end_guardrail_run(planner, trajectory, result)
     assert result is not None
     await planner.maybe_record_memory_turn(
         trajectory.query, result, trajectory, resolved_key

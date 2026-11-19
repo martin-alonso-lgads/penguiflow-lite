@@ -115,6 +115,35 @@ class MergeStrategy(str, Enum):
     HUMAN_GATED = "human_gated"
 
 
+_MERGE_STRATEGY_NAMES: dict[str, MergeStrategy] = {
+    "append": MergeStrategy.APPEND,
+    "replace": MergeStrategy.REPLACE,
+    "human_gated": MergeStrategy.HUMAN_GATED,
+    "human-gated": MergeStrategy.HUMAN_GATED,
+    "human": MergeStrategy.HUMAN_GATED,
+}
+
+
+def merge_strategy_from_name(
+    value: object, default: MergeStrategy
+) -> MergeStrategy:
+    """Parse a merge strategy name in any case; ``default`` if unknown.
+
+    Args:
+        value: A :class:`MergeStrategy`, a name such as ``"APPEND"`` or
+            ``"human_gated"``, or ``None``.
+        default: The strategy to use when ``value`` is missing or unknown.
+
+    Returns:
+        The matching strategy, or ``default``.
+    """
+    if isinstance(value, MergeStrategy):
+        return value
+    if value is None:
+        return default
+    return _MERGE_STRATEGY_NAMES.get(str(value).lower().strip(), default)
+
+
 class NotificationAction(BaseModel):
     """One actionable button/option attached to a `NotificationPayload`."""
 
@@ -479,4 +508,5 @@ __all__ = [
     "TaskStatus",
     "TaskType",
     "UpdateType",
+    "merge_strategy_from_name",
 ]

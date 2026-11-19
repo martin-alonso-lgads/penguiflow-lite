@@ -1,93 +1,103 @@
 # Router Topology: `AgentRegistry`, `RouterPolicy`, `A2ARouterToolset`
 
-When a manager agent needs to choose among multiple specialist A2A agents, use the registry + router toolset together.
+When a manager agent has to choose among several specialist A2A agents, keep them in an `AgentRegistry` and give the planner one `A2ARouterToolset` tool. The tool picks the best agent and skill for each call, then delegates through an `A2AAgentToolset` (see `client-and-toolset.md`).
 
 ## `AgentRegistry`
 
-In-memory registry of remote A2A agents.
+An in-memory registry of `RemoteAgentRecord`s, keyed by `agent_url` with trailing slashes stripped. Registering the same URL again replaces the record.
 
 ```python
 from penguiflow_a2a import AgentRegistry, RemoteAgentRecord, RemoteSkillRecord
 
 registry = AgentRegistry()
-registry.register(RemoteAgentRecord(
-    agent_url="https://specialist-a.example.com",
-    name="Specialist A",
-    description="Handles finance queries",
-    version="1.0.0",
-    skills=(
-        RemoteSkillRecord(
-            agent_url="https://specialist-a.example.com",
-            skill_id="answer",
-            name="answer",
-            description="Answer a finance question",
-            tags=("finance",),
-            input_modes=("text/plain",),
-            output_modes=("application/json",),
+registry.register(
+    RemoteAgentRecord(
+        agent_url="https://finance.example.com",
+        name="Finance",
+        description="Answers finance questions",
+        version="1.0.0",
+        skills=(
+            RemoteSkillRecord(
+                agent_url="https://finance.example.com",
+                skill_id="answer",
+                name="answer",
+                description="Answer a finance question",
+                tags=("finance", "revenue"),
+                input_modes=("text/plain",),
+                output_modes=("text/plain",),
+            ),
         ),
-    ),
-    streaming=True,
-    push_notifications=False,
-    tenant_id="acme",
-    trust_tier="standard",     # untrusted | standard | trusted
-    latency_tier="standard",   # fast | standard | slow
-    auth_schemes=("bearer",),
-))
-```
-
-Or register from a card (auto-derives skills):
-
-```python
-registry.register_card(
-    agent_url="https://specialist-b.example.com",
-    card=card_dict,
-    tenant_id="acme",
-    trust_tier="trusted",
-    latency_tier="fast",
-    auth_schemes=("oauth",),
-    metadata={"region": "us-east-1"},
+        streaming=True,
+        tenant_id="acme",
+        trust_tier="trusted",        # low | standard | trusted | critical
+        latency_tier="interactive",  # interactive | standard | batch
+        auth_schemes=("bearer",),
+    )
 )
 ```
+
+Or register from an agent card (a dict or a `penguiflow_a2a.models.AgentCard`). `register_card` builds one `RemoteSkillRecord` per card skill (id, name, description, tags, input/output modes, security), reads `streaming` and `pushNotifications` from the card's capabilities, and returns the record. A card without skills gets a single `default` skill.
+
+```python
+from penguiflow_a2a import AgentRegistry, fetch_agent_card
+
+
+async def register_specialist(registry: AgentRegistry) -> None:
+    card = await fetch_agent_card("https://legal.example.com", timeout_s=5.0)
+    registry.register_card(
+        agent_url="https://legal.example.com",
+        card=card,
+        tenant_id="acme",
+        trust_tier="standard",
+        latency_tier="batch",
+        auth_schemes=("bearer",),
+        metadata={"region": "eu-west-1"},
+    )
+```
+
+`fetch_agent_card(agent_url, headers=None, timeout_s=None)` GETs `<agent_url>/.well-known/agent-card.json` and needs `penguiflow-lite[a2a-client]` (httpx).
 
 ### Declarative loading
 
 ```python
-from penguiflow_a2a import load_agent_registry_config
+from penguiflow_a2a import AgentRegistry, load_agent_registry_config
 
-registry = load_agent_registry_config("/etc/manager/agents.yaml")
+registry = load_agent_registry_config("/etc/manager/agents.yaml")  # .json, .yaml/.yml or .toml
+
+registry = AgentRegistry.from_config(
+    {
+        "agents": [
+            {
+                "agent_url": "https://finance.example.com",
+                "card": {"name": "Finance", "skills": [{"id": "answer", "tags": ["finance"]}]},
+                "tenant_id": "acme",
+                "trust_tier": "trusted",
+                "latency_tier": "interactive",
+                "auth_schemes": ["bearer"],
+            },
+        ],
+    }
+)
 ```
 
-Or in-memory:
-
-```python
-registry = AgentRegistry.from_config({
-    "agents": [
-        {"agent_url": "https://specialist-a/", "card": {...}, "tenant_id": "acme",
-         "trust_tier": "standard", "latency_tier": "standard", "auth_schemes": ["bearer"]},
-        {"agent_url": "https://specialist-b/", "card": {...}, "tenant_id": "acme",
-         "trust_tier": "trusted", "latency_tier": "fast"},
-    ],
-})
-```
-
-The loader normalizes URLs (`_normalize_agent_url`), validates the shape, and coerces tier enums.
+Each entry needs a `card` object and an `agent_url` (or `agentUrl`, or the card's `url`). `tenant_id`, `trust_tier`, `latency_tier`, `auth_schemes` and `metadata` are optional, and the camelCase spellings are accepted too. A malformed entry or an unknown tier raises `RegistryConfigError`. YAML needs `pyyaml`.
 
 ## `RouterPolicy`
 
-Production guardrails applied **before** route scoring.
+Production guardrails applied before scoring. All fields have defaults.
 
 ```python
 from penguiflow_a2a import RouterPolicy
 
 policy = RouterPolicy(
-    allowed_agents=("https://specialist-a/", "https://specialist-b/"),
+    allowed_agents=("https://finance.example.com", "https://legal.example.com"),
     denied_agents=(),
     max_candidates=5,
     require_same_tenant=True,
     min_trust_tier="standard",
     required_execution_mode=None,
     required_auth_schemes=("bearer",),
-    fallback_agent_url="https://specialist-a/",
+    fallback_agent_url="https://finance.example.com",
     fallback_skill="answer",
     timeout_s=30.0,
     poll_interval_s=0.25,
@@ -95,117 +105,117 @@ policy = RouterPolicy(
 )
 ```
 
-The policy filters the candidate set:
-- `allowed_agents` whitelist (empty = allow all).
-- `denied_agents` blacklist.
-- `require_same_tenant` enforces `tenant_id` match between request and agent.
-- `min_trust_tier` excludes lower-tier agents.
-- `required_execution_mode` filters by capability (`stream`, `task`, `blocking`).
-- `required_auth_schemes` filters by supported auth.
+| Field | Effect |
+|---|---|
+| `allowed_agents` | When non-empty, only these URLs are candidates. |
+| `denied_agents` | These URLs are never candidates. |
+| `require_same_tenant` | With a request tenant, agents must have exactly that `tenant_id` (agents without one are excluded). Agents whose `tenant_id` differs from the request's are excluded even without a policy. |
+| `min_trust_tier` | Used when the request sets none. Excludes agents below the tier. |
+| `required_execution_mode` | Used when the request sets none. Only `"stream"` filters: it excludes agents without `streaming=True`. |
+| `required_auth_schemes` | Used when the request sets none. The agent must share at least one scheme; agents with no schemes are excluded. |
+| `max_candidates` | Default `limit` of `route()`. |
+| `fallback_agent_url`, `fallback_skill` | When nothing matches, route to this agent (and skill, else its first skill). The fallback must still pass the filters above. It scores `0.0` with reasons `("policy_fallback",)`. |
+| `timeout_s`, `poll_interval_s`, `max_poll_attempts` | Used by `A2ARouterToolset` for the delegated call. |
 
-If the filter empties the candidate set, the policy can fall back to `fallback_agent_url`/`fallback_skill`.
-
-## `AgentRouteRequest`
-
-Inputs the registry uses to score candidates.
+## Routing: `route()` and `best()`
 
 ```python
-from penguiflow_a2a import AgentRouteRequest
+from penguiflow_a2a import AgentRegistry, AgentRouteRequest, RouterPolicy
 
-request = AgentRouteRequest(
-    query="What was Q3 revenue?",
-    skill="answer",
-    input_mode="text/plain",
-    output_mode="application/json",
-    tenant_id="acme",
-    required_execution_mode="stream",
-    auth_schemes=("bearer",),
-    min_trust_tier="standard",
-)
 
-candidates = registry.score(request, policy=policy)
+def explain_route(registry: AgentRegistry, policy: RouterPolicy) -> None:
+    request = AgentRouteRequest(
+        query="What was Q3 revenue?",
+        skill="answer",
+        input_mode="text/plain",
+        output_mode="text/plain",
+        tenant_id="acme",
+        required_execution_mode="stream",
+        auth_schemes=("bearer",),
+        min_trust_tier="standard",
+    )
+    for candidate in registry.route(request, policy=policy):  # best first
+        print(candidate.agent.agent_url, candidate.skill.skill_id, candidate.score, candidate.reasons)
+    best = registry.best(request, policy=policy)  # AgentRouteCandidate | None
+    print(best)
 ```
 
-Scoring considers:
-- Skill name match (exact > tag overlap > description fuzz).
-- Input/output mode compatibility.
-- Tenant scope.
-- Trust and latency tiers (higher trust + faster latency = higher score).
-- Auth scheme overlap.
+`route(request, *, limit=None, policy=None)` applies the filters, scores every skill of every remaining agent, and returns `AgentRouteCandidate(agent, skill, score, reasons)` objects sorted by score. It returns at most `limit`, else `policy.max_candidates`, else 5. `best(request, *, policy=None)` returns the top candidate or `None`.
 
-Result is a list of `AgentRouteCandidate(agent, skill, score, reasons)` sorted by score, capped at `policy.max_candidates`.
+Scoring, per skill:
 
-The `reasons` field is human-readable — emit it via observability to debug routing decisions.
+| Signal | Score | Reason |
+|---|---|---|
+| `request.skill` words overlap the skill's id, name, description words and tags | +40, +10 per shared word; **no overlap skips the skill** | `skill_match:<words>` |
+| Query words overlap the skill's and agent's words | +5 per word, max +30 | `query_overlap:<words>` |
+| `input_mode` / `output_mode` listed by the skill | +5 each; a skill that lists modes but not this one is **skipped**; a skill that lists none is not penalised | `input_mode:<mode>`, `output_mode:<mode>` |
+| `required_execution_mode="stream"` and the agent streams | +8 | `streaming` |
+| `required_execution_mode="task"` | +3 | `task_capable` |
+| Trust tier (`low` 0 … `critical` 3) | ×4 | `trust:<tier>` |
+| Latency tier (`batch` 0, `standard` 1, `interactive` 2) | ×2 | `latency:<tier>` |
+
+Words are lowercased alphanumeric tokens. Tags are compared as given, so keep them lowercase.
 
 ## `A2ARouterToolset`
 
-Wraps the registry as a planner tool. The planner calls one of:
-- `router.delegate(query=..., skill=...)` — picks the top candidate and delegates.
-- Manual: planner reads candidates, then calls a specific `A2AAgentToolset.tool(...)`.
+Wraps the registry as a single planner tool. Every delegation shares one `transport`.
 
 ```python
-from penguiflow_a2a import A2ARouterToolset
+from penguiflow_a2a import A2AHttpTransport, A2ARouterToolset, AgentRegistry, RouterPolicy
 
+registry = AgentRegistry()
 router_toolset = A2ARouterToolset(
     registry=registry,
-    policy=policy,
-    transport_factory=lambda agent_url: A2AHttpTransport(base_url=agent_url, ...),
+    transport=A2AHttpTransport(timeout_s=30.0),
+    default_execution_mode="auto",  # auto | blocking | stream | task
+    default_timeout_s=30.0,
+    policy=RouterPolicy(require_same_tenant=True),
 )
-
-node_spec = router_toolset.delegate_tool(
-    name="route_and_delegate",
-    desc="Route the user's query to the best specialist agent",
+node_spec = router_toolset.tool(
+    name="delegate_to_agent",  # the default
+    desc="Delegate the request to the best matching specialist agent.",
 )
 ```
 
-Inputs (`RouterDelegationArgs`):
-- `query: str`
-- `skill: str | None`
-- `tenant_id: str | None`
-- ... (mirrors `AgentRouteRequest`)
+Add `node_spec` to the planner catalog. On each call the tool:
 
-Output (`RouterDelegationResult`):
-- `agent_url: str`
-- `skill: str`
-- `score: float`
-- `reasons: tuple[str, ...]`
-- `result: Any` — what the specialist returned.
+1. Reads the tenant from `tool_context["tenant_id"]`, else `tool_context["tenant"]`.
+2. Picks the execution mode: `args.execution_mode`, else `policy.required_execution_mode`, else `default_execution_mode`.
+3. Builds an `AgentRouteRequest` from the args, that tenant and mode, and the policy's auth schemes and minimum trust tier, then calls `registry.route(request, policy=policy)`. With no candidate it raises `RuntimeError("No compatible A2A specialist found")`.
+4. Delegates to the top candidate through an `A2AAgentToolset` built for that agent (its card, and `policy.timeout_s` or `default_timeout_s`). The payload sent is `args.payload`, or `{"query": args.query}` when that is empty. Conversation bindings, remote pauses and stream chunks work as for `A2AAgentToolset`.
 
-The router toolset reuses `A2AAgentToolset` under the hood for the actual call, so conversation continuity, execution-mode selection, and cancellation propagation all work.
+Inputs (`RouterDelegationArgs`): `query: str`, `skill: str | None`, `payload: dict[str, Any]`, `execution_mode: ExecutionMode | None`, `input_mode: str | None`, `output_mode: str | None`.
+
+Output (`RouterDelegationResult`): `agent_url`, `skill`, `score`, `reasons: list[str]`, `result` (the remote answer as returned: text or data), and `route_metadata` with `candidate_count`, `execution_mode`, `agent_name`, `trust_tier`, `latency_tier` and `tenant_id`.
 
 ## Patterns
 
-### Pattern 1: Strict policy + fallback
-
-When uptime matters more than optimality:
+### Strict policy with a fallback
 
 ```python
+from penguiflow_a2a import RouterPolicy
+
 policy = RouterPolicy(
-    allowed_agents=(),
     require_same_tenant=True,
-    fallback_agent_url="https://always-on.example.com/",
+    min_trust_tier="trusted",
+    fallback_agent_url="https://always-on.example.com",
     fallback_skill="answer",
 )
 ```
 
-If filtering empties the set, the fallback agent handles the request.
+If no agent passes the filters and scoring, the fallback agent handles the request, provided it passes the same filters.
 
-### Pattern 2: Explain-only routing
+### Explain before delegating
 
-Planner reads `candidates` and explains its choice to the user before delegating:
+Call `registry.route(request, policy=policy)` from your own tool or UI, show the `reasons`, and delegate only after the user confirms (through a dedicated `A2AAgentToolset` tool for the chosen agent).
 
-```python
-candidates = registry.score(request, policy=policy)
-# planner inspects `reasons` and confirms with the user before calling delegate_tool
-```
+### Multi-skill specialists
 
-### Pattern 3: Multi-skill specialists
-
-A single specialist can register multiple `RemoteSkillRecord`s. Score them independently with `request.skill` set.
+One agent can carry several `RemoteSkillRecord`s. Each skill is scored on its own, so set `skill` in the request (or the tool args) to target one.
 
 ## Operational rules
-- `agent_url` is the routing key. Normalize URLs (trailing slash, scheme) at registration.
-- `tenant_id` is the multi-tenant boundary. `require_same_tenant=True` is the production default.
-- Treat `RouterPolicy` as authorization input, not the only check. Don't allow callers to override `denied_agents`.
-- Log `reasons` for every route decision — it's the audit trail.
-- Refresh the registry on a schedule if agent cards change; the in-memory `AgentRegistry` is mutable.
+- `agent_url` is the routing key. Use the same URL form everywhere; only trailing slashes are normalised.
+- `tenant_id` is the multi-tenant boundary. Keep `require_same_tenant=True` (the default) and set `tool_context["tenant_id"]` on every run.
+- Treat `RouterPolicy` as authorization input, not the only check. Don't let callers override `denied_agents`.
+- Log `reasons` and `route_metadata` for every delegation; they are the audit trail.
+- The registry is mutable and in-memory. Re-register agents when their cards change.

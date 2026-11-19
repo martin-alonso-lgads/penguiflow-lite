@@ -32,6 +32,7 @@ from .react_utils import _safe_json_dumps, _serialize_validation_errors
 if TYPE_CHECKING:
     from ..catalog import NodeSpec
     from .artifact_handling import _ArtifactCollector, _SourceCollector
+    from .guardrails import GuardrailDecision
     from .react import ReactPlanner
     from .trajectory import Trajectory
 
@@ -102,6 +103,26 @@ class _CheckedResult:
     llm_observation: dict[str, Any]
 
 
+async def _guardrail_pause(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    decision: GuardrailDecision,
+) -> PlannerPause:
+    """Record a guardrail PAUSE and return it for the tool outcome.
+
+    ``pause_from_context`` raises to unwind tool code; guardrail checks
+    run outside the tool, so the signal is caught here and the recorded
+    pause is returned instead.
+    """
+    payload = {"guardrail": planner.guardrail_decision_payload(decision)}
+    try:
+        return await planner.pause_from_context(
+            "approval_required", payload, trajectory
+        )
+    except _PlannerPauseError as signal:
+        return signal.pause
+
+
 async def _guardrail_after_tool(
     planner: ReactPlanner,
     trajectory: Trajectory,
@@ -152,16 +173,8 @@ async def _guardrail_after_tool(
             streams=ctx.collect_chunks() or None,
         )
     if decision.action.value == "PAUSE":
-        pause_payload = {
-            "guardrail": planner.guardrail_decision_payload(decision)
-        }
-        pause = await planner.pause_from_context(
-            "approval_required",
-            pause_payload,
-            trajectory,
-        )
         return ToolCallOutcome(
-            pause=pause,
+            pause=await _guardrail_pause(planner, trajectory, decision),
             streams=ctx.collect_chunks() or None,
         )
     if decision.action.value == "REDACT" and decision.redactions:
@@ -464,16 +477,10 @@ async def _guardrail_before_tool(
                     streams=None,
                 )
             if decision.action.value == "PAUSE":
-                pause_payload = {
-                    "guardrail": planner.guardrail_decision_payload(decision)
-                }
-                pause = await planner.pause_from_context(
-                    "approval_required",
-                    pause_payload,
-                    trajectory,
-                )
                 return ToolCallOutcome(
-                    pause=pause,
+                    pause=await _guardrail_pause(
+                        planner, trajectory, decision
+                    ),
                     streams=None,
                 )
     return None
@@ -592,7 +599,10 @@ async def _spawn_background_call(
             session_id = ctx.tool_context.get("session_id")
             parent_task_id = ctx.tool_context.get("task_id")
             if isinstance(session_id, str):
-                from penguiflow.sessions.models import MergeStrategy
+                from penguiflow.sessions.models import (
+                    MergeStrategy,
+                    merge_strategy_from_name,
+                )
 
                 mode = (
                     background_cfg.get("mode")
@@ -602,19 +612,10 @@ async def _spawn_background_call(
                 mode_value = (
                     str(mode).lower().strip() if mode is not None else "job"
                 )
-                merge_raw = background_cfg.get("default_merge_strategy")
-                merge_value = (
-                    str(merge_raw).lower().strip()
-                    if merge_raw is not None
-                    else MergeStrategy.HUMAN_GATED.value
+                merge_strategy = merge_strategy_from_name(
+                    background_cfg.get("default_merge_strategy"),
+                    MergeStrategy.HUMAN_GATED,
                 )
-                merge_strategy = {
-                    "append": MergeStrategy.APPEND,
-                    "replace": MergeStrategy.REPLACE,
-                    "human_gated": MergeStrategy.HUMAN_GATED,
-                    "human-gated": MergeStrategy.HUMAN_GATED,
-                    "human": MergeStrategy.HUMAN_GATED,
-                }.get(merge_value, MergeStrategy.HUMAN_GATED)
                 notify_on_complete = (
                     background_cfg.get("notify_on_complete", True) is not False
                 )

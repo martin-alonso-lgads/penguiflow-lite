@@ -1,173 +1,147 @@
-# `BackgroundTasksConfig` Reference
+# Configuration and Policies
 
-Configuration for planner-driven background tasks. Pass to `ReactPlanner(..., background_tasks=BackgroundTasksConfig(...))`. All defaults are from `penguiflow.planner.models.BackgroundTasksConfig`.
+Background behaviour is configured in three places:
+- `BackgroundTasksConfig`: prompt guidance, tool background, group defaults;
+- `SessionLimits` on `SessionManager(limits=...)`: caps and timeouts;
+- per call: `tasks.spawn` args, or a tool's `extra["background"]`.
 
-## Enablement
+## `BackgroundTasksConfig`
 
-| Field | Default | Purpose |
-|---|---|---|
-| `enabled` | `False` | Master switch. Tasks are off unless this is True. |
-| `include_prompt_guidance` | `True` | Add planner-side hints describing `task.subagent`/`task.tool` opcodes and `tasks.*` tools. |
-
-When `enabled=False`, `tasks.*` tools and `task.*` opcodes are not available; spawn attempts fail explicitly.
-
-## Execution mode and merge
+From `penguiflow.planner.models` (also exported by `penguiflow.planner`). `ReactPlanner(background_tasks=...)` reads the first three fields. Sessions read the rest, from the config set with `StreamingSession.configure_background_tasks(config)` or passed as `InProcessTaskService(background_config=...)`. The service applies it to a session each time it spawns there.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `allow_tool_background` | `False` | When True, tools with `spec.extra["background"]["enabled"]=True` can spawn async instead of running inline. |
-| `default_mode` | `"subagent"` | `"subagent"` (full sub-planner) or `"job"` (single tool). |
-| `default_merge_strategy` | `"HUMAN_GATED"` | `"HUMAN_GATED"`, `"APPEND"`, `"REPLACE"`. Default merge for tool-initiated and explicit spawns. |
-| `context_depth` | `"full"` | `"full"` / `"summary"` / `"minimal"` snapshot depth handed to the spawned task. |
-| `propagate_on_cancel` | `"cascade"` | `"cascade"` (kill children when parent cancels) or `"orphan"`. |
-| `spawn_requires_confirmation` | `False` | When True, spawning a task requires explicit user confirmation. |
+| `enabled` | `False` | Adds background-task guidance to the system prompt. It does **not** turn the `tasks.*` tools on or off. |
+| `include_prompt_guidance` | `True` | Whether `enabled` adds the guidance. |
+| `allow_tool_background` | `False` | Lets tools with `extra["background"]["enabled"]` run as tasks. |
+| `default_group_merge_strategy` | `"APPEND"` | Merge strategy of a new group that doesn't set one. `APPEND`, `REPLACE` or `HUMAN_GATED`, in any case. |
+| `default_group_report` | `"all"` | Report strategy of a new group: `"all"`, `"any"` or `"none"`. |
+| `auto_seal_groups_on_foreground_yield` | `True` | Seal the turn's open groups when a session foreground task ends. |
+| `retain_turn_timeout_s` | `60.0` | Max wait for a retained group before the foreground continues. |
+| `background_continuation_max_hops` | `2` | Continuation cycles after a retained wait times out. |
+| `background_continuation_cooldown_s` | `0.0` | Delay between continuation cycles. |
 
-### Tool-initiated path
+The model uses `extra="forbid"`, so unknown fields raise `ValidationError`.
 
-A tool call is rerouted to a background task when **all** are true:
-1. `background_tasks.allow_tool_background=True`.
-2. The tool's `NodeSpec.extra["background"]["enabled"] is True`.
-3. `tool_context["task_service"]` is present.
-4. `tool_context["session_id"]` is a string.
+To turn background work off, leave `tasks.*` out of the catalog (or hide them with a tool policy) and keep `allow_tool_background=False`.
 
-When that happens, the foreground tool call returns:
+### Where the removed fields went
+
+7.0.0 removed 18 fields that were never read:
+
+| Removed field | Use instead |
+|---|---|
+| `max_concurrent_tasks`, `max_tasks_per_session`, `task_timeout_s` | `SessionLimits.max_concurrent_tasks`, `max_tasks_per_session` / `max_background_tasks`, `max_task_runtime_s` |
+| `max_pending_steering` | `SessionLimits.steering_queue_size` (each task's inbox size) |
+| `proactive_report_enabled`, `_strategies`, `_max_queued`, `_timeout_s`, `_max_hops`, `_fallback_notification` | the matching args (`enabled`, `strategies`, `max_queued`, `timeout_s`, `max_hops`, `fallback_notification`) of `setup_proactive_reporting()` or `StreamingSession.configure_proactive_reporting()` |
+| `default_mode`, `default_merge_strategy`, `context_depth`, `propagate_on_cancel` | `tasks.spawn` args (`mode`, `merge_strategy`, `context_depth`, `propagate_on_cancel`), or the tool's `extra["background"]` (`mode`, `default_merge_strategy`) |
+| `spawn_requires_confirmation` | No replacement. Veto spawns with a `SpawnGuard` (`InProcessTaskService(spawn_guard=...)`). |
+| `group_timeout_s`, `group_partial_on_failure`, `max_tasks_per_group` | No replacement. A group with a failed task ends `failed`, and session limits cap the task count. |
+
+## `SessionLimits`
+
+From `penguiflow.sessions`. Every session the manager creates enforces these limits:
+
+| Field | Default | Effect |
+|---|---|---|
+| `max_tasks_per_session` | `8` | Non-terminal tasks per session, foreground included. Spawning past it raises `task_limit_exceeded`. |
+| `max_background_tasks` | `4` | Non-terminal background tasks. Spawning past it raises `background_task_limit_exceeded`. |
+| `max_concurrent_tasks` | `3` | Tasks running at once. The rest wait (status update `queued`); `0` disables the cap. |
+| `max_task_runtime_s` | `900` | Per-task wall clock. On expiry the task is FAILED with error `timeout`; `None` disables it. |
+| `max_pending_patches` | `32` | Human-gated patches awaiting approval. Past it: `pending_patch_limit_exceeded`. |
+| `update_queue_size` | `500` | Per-subscriber update queue. |
+| `steering_queue_size` | `200` | Per-task steering inbox. |
+| `max_steering_payload_bytes`, `max_steering_events_per_task` | | Steering payload size cap and duplicate-detection window. |
+
+## Proactive reporting
+
+Proactive reports tell the user about auto-merged results without waiting for their next message. They are off until you set them up on the session:
+
 ```python
-{
-    "task_id": "...",
-    "status": "PENDING",
-    "message": "spawned:job"  # or "spawned:subagent"
-}
+from penguiflow.sessions import setup_proactive_reporting
+
+session = await sessions.get_or_create("s1")
+setup_proactive_reporting(
+    session,
+    make_foreground,                 # builds the planner that writes the report
+    enabled=True,                    # False makes the call a no-op
+    strategies=["APPEND", "REPLACE"],  # default; uppercase names
+    max_queued=5,
+    timeout_s=60.0,
+    max_hops=2,
+    fallback_notification=True,
+)
 ```
 
-The planner records this observation. Foreground continues; the task runs out-of-band and merges per the configured strategy when done.
+What happens next:
+- An `append` or `replace` task completes, and a report request is queued.
+- The reporter waits while a session foreground task is running, then calls `make_foreground().run(...)` with the results in `llm_context["proactive_report"]`.
+- It publishes the answer as a `RESULT` update with `proactive: True`, and removes the reported results from `background_results`.
+- Grouped tasks with report strategy `"all"` produce one report for the whole group.
+- Human-gated tasks get no report. A human-gated group publishes a `CHECKPOINT` (`kind: "group_approval"`) instead.
+- A report run may spawn more tasks. `max_hops` bounds that chain: at 0 hops, `tasks.spawn` raises `proactive_hops_exhausted` and tool background is off.
+- If the report times out or fails and `fallback_notification` is set, a `NOTIFICATION` update is published instead.
 
-Tool-spec metadata example:
+`StreamingSession.configure_proactive_reporting(generator=..., enabled=...)` takes the same options with your own async `generator(request: ProactiveReportRequest)`; its `timeout_s` default is `30.0`.
+
+## Tool-initiated background spawns
+
 ```python
-spec = NodeSpec(
-    name="scrape_site",
-    desc="...",
-    side_effects="external",
+from pydantic import BaseModel
+
+from penguiflow.catalog import tool
+from penguiflow.planner import ToolContext
+
+
+class ScrapeArgs(BaseModel):
+    url: str
+
+
+class ScrapeOut(BaseModel):
+    text: str
+
+
+@tool(
+    desc="Scrape a site (slow)",
+    side_effects="read",
     extra={
         "background": {
-            "enabled": True,
-            "mode": "job",                    # override default_mode
-            "merge_strategy": "APPEND",        # override default_merge_strategy
-            "notify_on_complete": True,        # platform-specific
-        },
+            "enabled": True,                    # required, must be True
+            "mode": "job",                      # default "job"; or "subagent"
+            "default_merge_strategy": "append",  # any case; default human_gated
+            "notify_on_complete": True,         # default True
+        }
     },
+)
+async def scrape_site(args: ScrapeArgs, ctx: ToolContext) -> ScrapeOut:
     ...
-)
 ```
 
-## Limits
+The call is spawned instead of run when the planner has `allow_tool_background=True` and `tool_context` has `task_service` and a string `session_id`. Otherwise it runs inline. The observation is a `BackgroundTaskHandle`: `{"task_id": ..., "status": "PENDING", "message": "spawned:job"}`.
+- `mode="job"` calls `spawn_tool_job`, which needs a `tool_job_factory` on the service.
+- `mode="subagent"` spawns a subagent asked to run the tool with the same args.
 
-| Field | Default | Purpose |
-|---|---|---|
-| `max_concurrent_tasks` | `5` | Hard cap on simultaneous tasks per session. Spawn fails when exceeded. |
-| `max_tasks_per_session` | `50` | Hard cap on total tasks (active + completed) per session. |
-| `task_timeout_s` | `3600` (1 hour, **int** seconds) | Per-task wall-clock timeout. |
-| `max_pending_steering` | `2` | Max steering messages queued per task before backpressure. |
-
-These defaults are conservative; tune downward for latency-sensitive products and upward for long-running research agents.
-
-## Proactive reporting (auto-merge modes)
-
-When `default_merge_strategy` is `APPEND` or `REPLACE`, completed tasks merge automatically. Controls:
-
-| Field | Default | Purpose |
-|---|---|---|
-| `proactive_report_enabled` | `False` | When True, the planner notifies the user as tasks complete. |
-| `proactive_report_strategies` | `["APPEND", "REPLACE"]` | Merge strategies that trigger proactive reports. |
-| `proactive_report_max_queued` | `5` | Max queued reports before dropping oldest. |
-| `proactive_report_timeout_s` | `30.0` | Timeout for proactive message generation. |
-| `proactive_report_max_hops` | `2` | Max recursion hops before disabling background spawning. |
-| `proactive_report_fallback_notification` | `True` | Fall back to notification panel if generation fails. |
-
-For chat UIs, `proactive_report_enabled=True` produces "Heads up — research on segment A is in. Want me to incorporate it?" style messages.
-
-## Task groups
-
-| Field | Default | Purpose |
-|---|---|---|
-| `default_group_merge_strategy` | `"APPEND"` | Strategy applied at `tasks.apply_group`. |
-| `default_group_report` | `True` | Produce a single user-facing summary on apply. |
-| `max_tasks_per_group` | `10` | Hard cap per group. |
-
-Groups bundle related background work into one merge. Useful when:
-- Multi-segment research: each segment is a task, the group is the consolidated report.
-- Parallel transformations: each variant is a task, the group decides which to apply.
-- Multi-step ETL: each step is a task, the group seals when all succeed.
-
-## Operational defaults
-
-Conservative starting point:
-```python
-BackgroundTasksConfig(
-    enabled=True,
-    allow_tool_background=False,            # flip True only after observability is in place
-    default_mode="subagent",
-    default_merge_strategy="HUMAN_GATED",
-    max_concurrent_tasks=4,
-    max_tasks_per_session=20,
-    task_timeout_s=300.0,
-    proactive_report_enabled=False,
-    default_group_merge_strategy="HUMAN_GATED",
-    default_group_report=True,
-    max_tasks_per_group=10,
-)
-```
-
-Tighter (latency-sensitive product):
-- `max_concurrent_tasks=2`
-- `task_timeout_s=60.0`
-- `default_merge_strategy="APPEND"` (lower friction)
-
-Looser (long-running research agent):
-- `max_concurrent_tasks=8`
-- `task_timeout_s=1800.0`
-- `default_merge_strategy="HUMAN_GATED"` (operator reviews each)
+Group args are not available on this path.
 
 ## Prompt guidance
 
-With `include_prompt_guidance=True`, the planner's system prompt gains a section describing:
-- How to use `task.subagent` and `task.tool` opcodes.
-- When to prefer background over inline (slow work, parallel-able work).
-- How task groups consolidate reports.
+With `enabled=True` and `include_prompt_guidance=True`, the system prompt gets a `<background_tasks>` section: when to spawn, the `tasks.*` tools, merge rules, steering, context divergence. Set `include_prompt_guidance=False` if your own prompt already covers it.
 
-Disable this if your prompt is already opinionated about task patterns and you don't want the default guidance to conflict.
+## Telemetry
 
-## Foreground vs subagent visibility
+`TaskTelemetryEvent` (`penguiflow.sessions.telemetry`) goes to the `telemetry_sink` of `SessionManager` or `StreamingSession`:
+- `event_type`: `task_spawned`, `task_completed`, `task_failed`, `task_cancelled`, `task_group_completed`, `task_group_failed`;
+- `outcome`, `session_id`, `task_id` (the group id for group events), `parent_task_id`, `trace_id`, `task_type`, `status`, `mode`, `spawn_reason`, `duration_ms`, `extra` (`error`, `reason`, group counts).
 
-**Critical**: subagents must not be able to spawn more tasks unless you explicitly want recursion.
+Use `LoggingTaskTelemetrySink()` or implement `async def emit(self, event)`. Track spawn rate, the duration of each mode, failure and timeout rates, and the human-gated backlog (`len(session.pending_patches)`).
 
-Two layers of defense:
-1. Don't include `tasks.*` in the subagent's catalog.
-2. Apply a `ToolVisibilityPolicy` for subagent contexts that filters out `tasks.*`.
-
-The planner doesn't enforce this automatically — it's your responsibility at planner-init time.
-
-## Observability
-
-`PlannerEvent` types emitted by the background subsystem:
-- `task_spawned`, `task_started`, `task_completed`, `task_failed`, `task_cancelled`.
-- `task_merged` (when context patch applies).
-- `task_group_sealed`, `task_group_applied`.
-
-Track:
-- Tasks spawned per session.
-- Time-to-completion p50/p95/p99 by mode.
-- Failure rate by mode.
-- Merge backlog (tasks completed but not yet merged, for HUMAN_GATED).
-- Time-to-merge (operator workflow signal).
-
-See [[penguiflow-observability]] for the broader event taxonomy.
-
-## Common configuration mistakes
+## Common mistakes
 
 | Mistake | Consequence | Fix |
 |---|---|---|
-| `enabled=True` but no `task_service` in `tool_context` | All `tasks.*` calls fail | Wire the service |
-| No limits set | One bad session DoSes the worker | Set `max_concurrent_tasks`, `max_tasks_per_session` |
-| `default_merge_strategy="APPEND"` from day 1 | Hard to debug context drift | Start `HUMAN_GATED`, promote to APPEND only with observability |
-| `tasks.*` visible to subagents | Recursive task explosion | Visibility policy |
-| `task_timeout_s=None` for tool-initiated background | Wedged tasks accumulate | Set a real timeout |
+| Limits set on `BackgroundTasksConfig` | `ValidationError` | Use `SessionLimits` |
+| `enabled=False` taken as "off" | Tools still spawn if they're in the catalog | Remove `tasks.*` from the catalog |
+| Uppercase `merge_strategy` in `tasks.spawn` args | Args fail validation | Use `human_gated` / `append` / `replace` |
+| Lowercase `strategies` for proactive reports | Reports never fire | Use `"APPEND"`, `"REPLACE"` |
+| `append` from day one | Unreviewed results reach the user | Start `human_gated`; promote trusted tasks |
+| No `tool_job_factory` | Job spawns raise `tool_background_unavailable` | Pass one (see `task-service-protocol.md`) |

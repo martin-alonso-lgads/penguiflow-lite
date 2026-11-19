@@ -786,6 +786,102 @@ def test_toolnode_handle_resource_updated_invokes_callback() -> None:
     assert seen == ["file:///callback.txt"]
 
 
+def _resource_updated(uri: str) -> mcp_types.ServerNotification:
+    return mcp_types.ServerNotification(
+        mcp_types.ResourceUpdatedNotification(
+            params=mcp_types.ResourceUpdatedNotificationParams(uri=AnyUrl(uri))
+        )
+    )
+
+
+class _FakeSession:
+    """MCP session double that records resource (un)subscriptions."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, AnyUrl]] = []
+
+    async def subscribe_resource(self, uri: AnyUrl) -> None:
+        """Record a subscription to ``uri``."""
+        self.calls.append(("subscribe", uri))
+
+    async def unsubscribe_resource(self, uri: AnyUrl) -> None:
+        """Record an unsubscription from ``uri``."""
+        self.calls.append(("unsubscribe", uri))
+
+
+class _SessionOnlyClient:
+    """Client double that, like fastmcp, only subscribes via its session."""
+
+    def __init__(self) -> None:
+        self.session = _FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_handle_mcp_message_routes_resource_updates(
+    artifact_store: InMemoryArtifactStore,
+) -> None:
+    """A resource update invalidates the cache and notifies callbacks."""
+    node = ToolNode(config=build_config(), registry=ModelRegistry())
+    node.connected = True
+    node.resources_supported = True
+    node.mcp_client = _SessionOnlyClient()
+    cache = ResourceCache("test", ResourceCacheConfig())
+    node.resource_cache = cache
+
+    async def read_fn(uri: str) -> dict[str, object]:
+        return {"contents": [{"uri": uri, "text": "cached content"}]}
+
+    await cache.get_or_fetch(
+        "file:///data/a.txt", read_fn, DummyCtx(artifact_store)
+    )
+    updated: list[str] = []
+    node.set_resource_updated_callback(updated.append)
+    subscribed: list[str] = []
+    assert await node.subscribe_resource(
+        "file:///data/a.txt", subscribed.append
+    )
+
+    node.handle_mcp_message(_resource_updated("file:///data/a.txt"))
+    await asyncio.sleep(0)
+
+    assert cache.size == 0
+    assert updated == ["file:///data/a.txt"]
+    assert subscribed == ["file:///data/a.txt"]
+
+
+def test_handle_mcp_message_ignores_other_messages() -> None:
+    """Messages other than resource updates are ignored."""
+    node = ToolNode(config=build_config(), registry=ModelRegistry())
+    updated: list[str] = []
+    node.set_resource_updated_callback(updated.append)
+
+    node.handle_mcp_message(
+        mcp_types.ServerNotification(
+            mcp_types.ResourceListChangedNotification()
+        )
+    )
+    node.handle_mcp_message(RuntimeError("transport error"))
+
+    assert updated == []
+
+
+@pytest.mark.asyncio
+async def test_subscribe_resource_falls_back_to_session() -> None:
+    """Subscriptions go through ``client.session`` with an ``AnyUrl``."""
+    node = ToolNode(config=build_config(), registry=ModelRegistry())
+    client = _SessionOnlyClient()
+    node.connected = True
+    node.resources_supported = True
+    node.mcp_client = client
+
+    assert await node.subscribe_resource("file:///data/a.txt") is True
+    assert await node.unsubscribe_resource("file:///data/a.txt") is True
+    assert client.session.calls == [
+        ("subscribe", AnyUrl("file:///data/a.txt")),
+        ("unsubscribe", AnyUrl("file:///data/a.txt")),
+    ]
+
+
 # ─── Handler Tests ───────────────────────────────────────────────────────────
 
 

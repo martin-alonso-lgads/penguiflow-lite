@@ -5,10 +5,11 @@ This skill bundles snapshots of key PenguiFlow documents so downstream agents
 can work from a self-contained spec. When PenguiFlow changes, rerun this script
 to refresh the bundled references.
 
-Example (from the PenguiFlow repo root):
+`<skills-dir>` is the folder the skill is installed in (`skills` in the
+PenguiFlow repo). Example (from the PenguiFlow repo root):
 
-    python3
-    ~/.codex/skills/penguiflow-statestore/scripts/sync_references_from_repo.py
+    python3 \
+    <skills-dir>/penguiflow-statestore/scripts/sync_references_from_repo.py \
     --repo .
 """
 

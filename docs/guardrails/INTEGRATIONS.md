@@ -22,7 +22,9 @@ memory at agent startup.
 Highlights:
 - Few-shot seed prompts expanded with LLM augmentation to 100-200 samples.
 - Lightweight model (embeddings + LogisticRegression) for fast CPU inference.
-- Async guardrail uses RETRY guidance rather than hard STOP.
+- Async guardrail uses RETRY guidance rather than hard STOP. A late async RETRY is dropped,
+  so it only applies when the risk router waits for the rule on `llm_before` (the default
+  router usually doesn't).
 - Classification input is augmented with context to handle short utterances
   like "yes, go on" or "continue".
 

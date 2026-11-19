@@ -2,177 +2,117 @@
 
 ## Why groups
 
-A single foreground turn may spawn several related background tasks:
-- "Research these 3 segments." (3 subagent tasks)
-- "Refresh data for these 5 reports." (5 jobs)
-- "Compute variants A/B/C." (3 subagent tasks evaluating different approaches)
-
-Without grouping, each task merges independently — the user sees a fragmented stream of partial updates. Groups consolidate the report.
+One foreground turn often spawns related tasks: "research these 3 segments", "refresh these 5 reports". Without a group, each task reports on its own, and the user sees a stream of partial updates. A group reports once, and its human-gated results can be approved together.
 
 ## Group lifecycle
 
 ```
-spawn(... group="g1")
-spawn(... group="g1")
-spawn(... group="g1")
-    │
-    ▼
-all tasks complete (or sealed early)
-    │
-    ▼
-group is "sealed" (no more tasks can join)
-    │
-    ▼
-tasks.apply_group(group="g1")
-    │
-    ▼
-single consolidated merge applies to foreground context
-    │
-    ▼
-(if default_group_report=True) user-facing summary generated
+open ──seal──▶ sealed ──all tasks terminal──▶ complete   (no task failed)
+                                          └─▶ failed     (any task failed or was cancelled)
 ```
 
-## Sealing a group
+- **Create or join.** `tasks.spawn(group="market_q3", ...)` joins an **open** group with that name created in the same turn, or creates one. The turn comes from `tool_context["turn_id"]`, so pass a fresh `turn_id` on each user turn. `group_id=...` joins that exact group, which must be open (otherwise `group_not_joinable`).
+- **Strategies are fixed at creation.** `group_merge_strategy` and `group_report` on the creating spawn. Otherwise `BackgroundTasksConfig.default_group_merge_strategy` (default `APPEND`) and `default_group_report` (default `"all"`), from the session's config.
+- **Seal** in any of these ways. A sealed group accepts no more tasks.
+  - `group_sealed=True` on a spawn;
+  - `tasks.seal_group(group_id=...)` or `tasks.seal_group(group=...)`;
+  - `retain_turn=True`;
+  - automatically when a session foreground task ends (`auto_seal_groups_on_foreground_yield`). A direct `planner.run(...)` does not trigger this, so seal explicitly or call `await session.on_foreground_yield()` afterwards.
+- **Complete.** When the group is sealed and every task is terminal, it becomes `complete` or `failed`. A `task_group_completed` / `task_group_failed` telemetry event follows, and with report strategy `"all"` one group report is queued (when proactive reporting is set up).
 
-Two ways:
-1. **Explicit**: planner calls `tasks.seal_group(group="g1")` when it's done spawning.
-2. **Auto**: `max_tasks_per_group` reached, or all spawned tasks complete and the service auto-seals (platform-specific).
+Report strategies: `"all"` (one report for the group), `"any"` (a report per task), `"none"` (no report; the agent polls).
 
-Once sealed, no new `tasks.spawn(... group="g1")` is allowed. Spawn calls fail.
+## What the group's merge strategy controls
 
-## Applying a group
+Each task's result still merges by that task's own `merge_strategy` (default `human_gated` in `tasks.spawn`). The group's strategy decides:
+- **The report.** A `human_gated` group publishes a `CHECKPOINT` (`kind: "group_approval"`) instead of a synthesized report.
+- **`retain_turn`.** Waiting happens only for `append`/`replace` groups. The spawn args reject `retain_turn=True` when the strategy is `human_gated`.
 
-```python
-tasks.apply_group(group="g1", merge_strategy=None)
-```
+Human-gated patches from a group's tasks are collected in `TaskGroup.patches`. `tasks.apply_group(group_id=..., action="apply" | "reject", strategy=None)` handles them all at once, and only once the group is complete (otherwise `group_not_complete`).
 
-- `merge_strategy=None` → use `default_group_merge_strategy`.
-- `merge_strategy="HUMAN_GATED"` → produce a candidate merge, wait for operator approval.
-- `merge_strategy="APPEND"` → append all task results to foreground context.
-- `merge_strategy="REPLACE"` → replace a specified slice (planner must supply the slice).
+## Merge strategies
 
-Output: a merge summary dict the planner can render. Includes:
-- Task ids.
-- Results (or refs to result artifacts).
-- Any conflicts (overlapping context patches).
-- The applied patch.
+Values are lowercase (`MergeStrategy.HUMAN_GATED == "human_gated"`).
 
-## Merge strategies in depth
+### `human_gated` (default)
+The patch waits in `session.pending_patches` as a `PendingContextPatch`: `patch_id`, `task_id`, `patch`, `strategy`, `created_at`. The session publishes a `CHECKPOINT` update with this content: `kind: "context_patch"`, `patch_id`, `task_id`, `digest`, `diverged`, `prompt`, `options: ["approve", "reject"]`.
 
-### `HUMAN_GATED` (default)
+To approve or reject, use one of:
+- the tool `tasks.apply_patch(patch_id=..., action="apply" | "reject")`;
+- `task_service.apply_patch(session_id=..., patch_id=..., action=...)`;
+- `session.steer(SteeringEvent(..., event_type=SteeringEventType.APPROVE, payload={"patch_id": ...}))`, or `REJECT`.
 
-Result waits for operator. The host app:
-1. Detects completed tasks via `tasks.list(...)` or `tasks.get(...)`.
-2. Presents them to the operator.
-3. Operator approves → host calls `tasks.apply_group(...)` or per-task apply.
+An approved patch is merged as `append` unless you pass `strategy`. Use this strategy for anything whose result changes what the user sees or what the agent does next.
 
-Pros: safety. Cons: requires a merge UI; adds operator latency.
+### `append` / `replace`
+The result is stored at once as a `BackgroundTaskResult` in the session's `background_results[task_id]`, with `summary` (from the digest), `payload`, `facts` and `artifacts`. The in-process session handles both strategies the same way. Use them for trusted, idempotent enrichment.
 
-Use for: any task whose result modifies user-facing state (writes, sends, edits).
-
-### `APPEND`
-
-Result is appended to the foreground context automatically. The planner's next step sees it.
-
-Pros: low friction, hands-free. Cons: context can drift unexpectedly; debugging is harder.
-
-Use for: trusted, idempotent enrichment (fact refresh, summary updates).
-
-### `REPLACE`
-
-Result replaces a specified slice using a `ContextPatch`. Requires the spawned task to declare what it replaces.
-
-Pros: cleanest mental model for "refresh this part of context". Cons: requires patch metadata; harder to author.
-
-Use for: scheduled refresh, deterministic regeneration ("re-summarize the conversation from turn 5").
+### Context divergence
+A patch remembers the context version and hash its task started from. If the session context changed since then, the patch gets `context_diverged=True`, and a warning `NOTIFICATION` ("Context changed") is published.
 
 ## `ContextPatch`
 
-The merge primitive. Fields:
-- `target_path`: dotted path in the context tree.
-- `op`: `"append"` | `"replace"` | `"upsert"`.
-- `value`: the new content.
-- `metadata`: provenance (task id, timestamp, mode).
+`penguiflow.sessions.models.ContextPatch` has these fields:
+- `task_id`, `spawned_from_event_id`;
+- `source_context_version`, `source_context_hash`, `context_diverged`, `completed_at`;
+- `digest: list[str]`, `facts: dict`, `artifacts: list[dict]`, `sources: list[dict]`;
+- `recommended_next_steps: list[str]`, `assumptions: list[str]`.
 
-`APPEND` and `REPLACE` merge strategies internally use `ContextPatch`. For custom merge logic, your `TaskService` can return arbitrary patches and the planner applies them.
-
-## Operator workflows for HUMAN_GATED
-
-A typical UI:
-1. **Inbox** — list of completed-but-unmerged tasks/groups.
-2. **Preview** — show the candidate patch, the prior context, the new context.
-3. **Approve / Reject** — apply or discard.
-4. **Conflict resolution** — if multiple patches overlap, operator picks.
-
-For chat agents, this can be inline: a "merge these findings?" prompt with [Approve] [Reject] buttons. Tie into [[penguiflow-rich-output]] `ui_confirm`.
-
-## Group reports
-
-`default_group_report=True` produces a single user-facing summary when a group is applied:
-- All results joined.
-- LLM summarizer condenses across tasks.
-- One coherent paragraph instead of N raw results.
-
-Disable when:
-- The host app already renders results elsewhere (and the report would be redundant).
-- You need raw results, not LLM synthesis.
+A subagent's patch carries its answer as `digest` (up to 5000 chars), plus the run's artifacts and sources. A custom `TaskPipeline` returns `TaskResult(payload=..., context_patch=ContextPatch(task_id=..., digest=[...], facts={...}))`.
 
 ## Patterns
 
-### Pattern: parallel research, single report
+The model drives these through `tasks.*` tool calls with the same argument names. The service calls below are what those tools run.
+
+### Parallel research, one report
 ```python
-# planner spawns:
-tasks.spawn(mode="subagent", prompt="Research market segment A", group="market_q3")
-tasks.spawn(mode="subagent", prompt="Research market segment B", group="market_q3")
-tasks.spawn(mode="subagent", prompt="Research market segment C", group="market_q3")
-tasks.seal_group(group="market_q3")
+from penguiflow.sessions import MergeStrategy
 
-# later (or auto-merge with APPEND):
-tasks.apply_group(group="market_q3")
-# user sees: "Research complete on segments A, B, C. Key findings: ..."
+for segment in ("A", "B", "C"):
+    await task_service.spawn(
+        session_id="s1",
+        query=f"Research market segment {segment}",
+        merge_strategy=MergeStrategy.APPEND,
+        group="market_q3",
+        turn_id="turn-7",
+        group_sealed=segment == "C",   # seal on the last spawn
+    )
 ```
+With proactive reporting set up and the default report strategy `"all"`, the user gets one report when all three finish.
 
-### Pattern: variant generation, pick one
+### Human-gated bundle
 ```python
-# planner spawns three variants, gates with HUMAN_GATED:
-tasks.spawn(mode="subagent", prompt="Draft email v1 (formal)", group="email_v")
-tasks.spawn(mode="subagent", prompt="Draft email v2 (friendly)", group="email_v")
-tasks.spawn(mode="subagent", prompt="Draft email v3 (terse)", group="email_v")
-tasks.seal_group(group="email_v")
+from penguiflow.sessions import MergeStrategy
 
-# operator reviews each draft; picks v2:
-tasks.apply_group(group="email_v", merge_strategy="REPLACE")  # planner specifies which slice
+first = await task_service.spawn(
+    session_id="s1",
+    query="Draft email v1 (formal)",
+    group="email",
+    group_merge_strategy=MergeStrategy.HUMAN_GATED,
+)
+await task_service.spawn(session_id="s1", query="Draft email v2 (friendly)", group="email")
+await task_service.seal_group(session_id="s1", group_id=first.group_id)
+
+# after the group_approval checkpoint, on the user's decision:
+outcome = await task_service.apply_group(session_id="s1", group_id=first.group_id, action="apply")
 ```
+`apply_group` applies or rejects every patch. To keep only one draft, apply its patch with `apply_patch` and reject the others. `session.pending_patches[patch_id].task_id` tells you which task produced each patch.
 
-### Pattern: ETL with sealing gate
-```python
-# tasks.spawn(mode="job", tool_name="extract", group="etl_run_42")
-# tasks.spawn(mode="job", tool_name="transform", group="etl_run_42")
-# tasks.spawn(mode="job", tool_name="load", group="etl_run_42")
-
-# seal only after all 3 succeed:
-all_done = await wait_for_all_succeeded(group="etl_run_42")
-if all_done:
-    tasks.seal_group(group="etl_run_42")
-    tasks.apply_group(group="etl_run_42")  # writes a "run succeeded" summary
-```
+### Wait for the group in the same turn
+`tasks.spawn` args: `{"query": "...", "group": "etl", "merge_strategy": "append", "group_merge_strategy": "append", "retain_turn": true}`. The spawn seals the group and waits up to `retain_turn_timeout_s`. It then returns `retained=True` and a `group_completion` (status, completed and failed task ids, results). On timeout, `group_completion.timed_out` is true and a background continuation is scheduled (`background_continuation_max_hops`).
 
 ## Failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `apply_group` finds nothing to merge | Group wasn't sealed | Call `tasks.seal_group(...)` first |
-| Conflicting patches | Two tasks patched the same path | Use distinct paths; or `HUMAN_GATED` and let operator decide |
-| Group never auto-seals | `max_tasks_per_group` not reached; no explicit seal | Auto-seal when N spawn calls return; or set lower max |
-| Reports too verbose | Default summarizer is verbose; multiple grouped reports stack | Set `default_group_report=False`; or customize the summarizer prompt |
-| Operator backlog | HUMAN_GATED queue grows | Build the operator UI; consider downgrading some workflows to APPEND |
+| `apply_group` → `group_not_complete` | Not sealed, or tasks still running | Seal it; wait for completion |
+| `group_not_joinable` | `group_id` names a sealed or finished group | Start a new group |
+| Group never completes | Never sealed (direct `planner.run` doesn't auto-seal) | `group_sealed=True`, `tasks.seal_group`, or `session.on_foreground_yield()` |
+| Spawns join an old group | No `turn_id`, so every spawn is in the same turn | Pass `tool_context["turn_id"]` per user turn |
+| No group report | Proactive reporting not set up, report `"none"`, or a human-gated group | `setup_proactive_reporting(...)`; handle the `group_approval` checkpoint |
+| `retain_turn` rejected | Human-gated strategy | Use `append`/`replace` for retained groups |
+| Stale results | `context_diverged=True` | Show the flag; re-run if needed |
 
 ## Observability
 
-Track:
-- Groups created per session.
-- Time-to-seal (spawn → seal).
-- Time-to-apply (seal → apply).
-- Tasks per group (cardinality distribution).
-- Operator approval rate (HUMAN_GATED).
-- Conflict rate.
+Track groups per session, time from creation to seal and from seal to completion, tasks per group, the human-gated approval rate, and the divergence rate. The group telemetry events carry `group_name`, `task_count`, `completed_count` and `failed_count` in `extra`.

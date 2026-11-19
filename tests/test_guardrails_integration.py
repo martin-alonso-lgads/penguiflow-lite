@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -12,7 +13,7 @@ from typing_extensions import override
 
 from penguiflow.catalog import build_catalog
 from penguiflow.node import Node
-from penguiflow.planner import PlannerFinish, ReactPlanner
+from penguiflow.planner import PlannerFinish, PlannerPause, ReactPlanner
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
     GuardrailAction,
@@ -20,6 +21,7 @@ from penguiflow.planner.guardrails import (
     GuardrailEvent,
     GuardrailGateway,
     GuardrailSeverity,
+    PauseSpec,
     RuleCost,
     RuleRegistry,
     SecretRedactionRule,
@@ -217,3 +219,176 @@ async def test_guardrail_secret_redaction_on_tool_result() -> None:
     assert steps
     observation = steps[0].get("observation") or {}
     assert "OPENAI_KEY" in str(observation.get("result"))
+
+
+class _ApprovalRule(GuardrailRule):
+    rule_id = "approval"
+    version = "1"
+    enabled = True
+    cost = RuleCost.FAST
+    severity = GuardrailSeverity.HIGH
+
+    def __init__(self, event_type: str) -> None:
+        self.supports_event_types = frozenset({event_type})
+        self.events: list[str] = []
+
+    @override
+    async def evaluate(
+        self, event: GuardrailEvent, context_snapshot: object
+    ) -> GuardrailDecision | None:
+        self.events.append(event.event_type)
+        return GuardrailDecision(
+            action=GuardrailAction.PAUSE,
+            rule_id=self.rule_id,
+            reason="needs approval",
+            pause=PauseSpec(
+                approver_roles=("finance", "admin"),
+                prompt="Approve the demo call?",
+                timeout_s=60.0,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["tool_call_start", "tool_call_result"])
+async def test_guardrail_pause_payload_carries_pause_spec(
+    event_type: str,
+) -> None:
+    """A PAUSE decision pauses the run and carries its PauseSpec."""
+    registry = ModelRegistry()
+    registry.register("demo", ToolArgs, ToolOut)
+    catalog = build_catalog([Node(demo_tool, name="demo")], registry)
+
+    rule = _ApprovalRule(event_type)
+    guard_registry = RuleRegistry()
+    guard_registry.register(rule)
+    gateway = GuardrailGateway(
+        registry=guard_registry,
+        guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(guard_registry)),
+    )
+    planner = ReactPlanner(
+        llm_client=_StubClient(
+            [
+                {
+                    "thought": "call demo",
+                    "next_node": "demo",
+                    "args": {"value": "hi"},
+                }
+            ]
+        ),
+        catalog=catalog,
+        max_iters=2,
+        guardrail_gateway=gateway,
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerPause)
+    assert rule.events == [event_type]
+    guardrail = result.payload["guardrail"]
+    assert guardrail["action"] == "PAUSE"
+    assert guardrail["pause"] == {
+        "scope": "tool_call",
+        "approver_roles": ["finance", "admin"],
+        "prompt": "Approve the demo call?",
+        "timeout_s": 60.0,
+    }
+
+
+class _LateDangerRule(GuardrailRule):
+    rule_id = "late-danger"
+    version = "1"
+    supports_event_types = frozenset({"llm_before"})
+    enabled = True
+    cost = RuleCost.DEEP
+    severity = GuardrailSeverity.HIGH
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.run_ids: list[str] = []
+
+    @override
+    async def evaluate(
+        self, event: GuardrailEvent, context_snapshot: object
+    ) -> GuardrailDecision | None:
+        self.run_ids.append(event.run_id)
+        await asyncio.sleep(self.delay_s)
+        if "danger" not in (event.text_content or ""):
+            return None
+        return GuardrailDecision(
+            action=GuardrailAction.STOP,
+            rule_id=self.rule_id,
+            reason="late danger",
+        )
+
+
+async def slow_tool(args: ToolArgs, _ctx: object) -> ToolOut:
+    """Take long enough for a pending DEEP rule to finish."""
+    await asyncio.sleep(0.05)
+    return ToolOut(result=f"slow:{args.value}")
+
+
+def _late_danger_planner(
+    rule: _LateDangerRule, responses: list[dict[str, object]]
+) -> ReactPlanner:
+    registry = ModelRegistry()
+    registry.register("slow", ToolArgs, ToolOut)
+    catalog = build_catalog([Node(slow_tool, name="slow")], registry)
+    guard_registry = RuleRegistry()
+    guard_registry.register(rule)
+    gateway = GuardrailGateway(
+        registry=guard_registry,
+        guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(guard_registry)),
+    )
+    return ReactPlanner(
+        llm_client=_StubClient(responses),
+        catalog=catalog,
+        max_iters=3,
+        guardrail_gateway=gateway,
+    )
+
+
+_CALL_SLOW: dict[str, object] = {
+    "thought": "call",
+    "next_node": "slow",
+    "args": {"value": "x"},
+}
+
+
+def _answer(text: str) -> dict[str, object]:
+    return {
+        "thought": "answer",
+        "next_node": "final_response",
+        "args": {"answer": text},
+    }
+
+
+@pytest.mark.asyncio
+async def test_late_deep_stop_ends_the_run_that_triggered_it() -> None:
+    """A DEEP STOP that arrives after the wait stops the same run."""
+    rule = _LateDangerRule(delay_s=0.0)
+    planner = _late_danger_planner(rule, [_CALL_SLOW, _answer("done")])
+
+    result = await planner.run("danger ahead")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.metadata["guardrail"]["rule_id"] == "late-danger"
+
+
+@pytest.mark.asyncio
+async def test_late_deep_stop_never_reaches_the_next_run() -> None:
+    """Each run gets its own guardrail run id; late STOPs don't cross."""
+    rule = _LateDangerRule(delay_s=0.05)
+    planner = _late_danger_planner(
+        rule, [_answer("first"), _CALL_SLOW, _answer("second")]
+    )
+
+    first = await planner.run("danger ahead")
+    await asyncio.sleep(0.1)
+    second = await planner.run("all safe")
+
+    assert isinstance(first, PlannerFinish)
+    assert isinstance(second, PlannerFinish)
+    assert second.reason == "answer_complete"
+    assert "guardrail" not in second.metadata
+    assert len(set(rule.run_ids)) == 2

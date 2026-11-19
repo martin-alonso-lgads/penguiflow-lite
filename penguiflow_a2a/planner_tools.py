@@ -173,23 +173,6 @@ async def _save_conversation_binding(
     )
 
 
-async def _mark_conversation_binding_terminal(
-    ctx: ToolContext,
-    *,
-    binding: RemoteBinding | None,
-    task_id: str | None,
-) -> None:
-    store = _planner_state_store(ctx)
-    marker = getattr(store, "mark_binding_terminal", None)
-    if marker is None or binding is None or task_id is None:
-        return
-    await marker(
-        trace_id=binding.trace_id,
-        context_id=binding.context_id,
-        task_id=task_id,
-    )
-
-
 async def _pause_for_remote_state(
     ctx: ToolContext,
     *,

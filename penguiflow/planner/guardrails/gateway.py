@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import override
 
 if TYPE_CHECKING:
-    from penguiflow.steering.guard_inbox import SteeringGuardInbox
+    from penguiflow.steering.guard_inbox import (
+        SteeringGuardInbox,
+        SteeringGuardResponse,
+    )
 
     from .protocols import GuardrailRule, RiskRouter
     from .registry import RuleRegistry
@@ -30,10 +34,27 @@ from .models import (
 from .protocols import DecisionPolicy
 from .routing import DefaultRiskRouter, RiskRoutingDecision
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class GatewayConfig:
-    """Gateway configuration."""
+    """Gateway configuration.
+
+    Attributes:
+        mode: ``"enforce"`` applies decisions; ``"shadow"`` only
+            evaluates them.
+        sync_timeout_ms: Time limit for each FAST rule.
+        sync_parallel: Run FAST rules concurrently.
+        async_enabled: Submit events to the guard inbox for DEEP rules.
+        sync_fail_open: When a FAST rule errors or times out, skip it
+            (``True``) or STOP the run (``False``).
+        async_fail_open: When the guard inbox fails (``submit`` or
+            ``await_response`` raises, or a response reports an
+            ``error``), skip the async check (``True``) or STOP the run
+            (``False``). How long to wait, and what a timeout means, is
+            decided by the risk router (``async_wait_ms``, ``on_timeout``).
+    """
 
     mode: Literal["shadow", "enforce"] = "enforce"
     sync_timeout_ms: float = 15.0
@@ -108,7 +129,14 @@ class DefaultDecisionPolicy(DecisionPolicy):
 
 @dataclass
 class GuardrailGateway:
-    """Unified gateway with extensibility hooks."""
+    """Unified gateway with extensibility hooks.
+
+    DEEP rules run in the guard inbox. The gateway waits for them as long
+    as the risk router says (``async_wait_ms``). A STOP that arrives after
+    that wait is applied at the run's next guardrail check; late
+    decisions of other kinds are dropped, because the action they
+    reviewed has already happened.
+    """
 
     registry: RuleRegistry
     guard_inbox: SteeringGuardInbox
@@ -120,14 +148,20 @@ class GuardrailGateway:
     context_builder: ContextSnapshotBuilder = field(
         default_factory=ContextSnapshotBuilder
     )
+    _late_ids: dict[str, set[str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     async def evaluate(
         self, ctx: GuardrailContext, event: GuardrailEvent
     ) -> GuardrailDecision:
         """Evaluate ``event`` against the rules; return the final decision."""
         context_snapshot = self.context_builder.build(event, ctx)
-        routing = self.risk_router.route(event, context_snapshot)
+        late_stops = self._late_stops(event.run_id)
+        if late_stops:
+            return self._resolve(late_stops, event, context_snapshot, ctx)
 
+        routing = self.risk_router.route(event, context_snapshot)
         if routing.skip_evaluation:
             return GuardrailDecision(
                 action=GuardrailAction.ALLOW,
@@ -140,26 +174,11 @@ class GuardrailGateway:
             d for d in sync_decisions if d.action == GuardrailAction.STOP
         ]
         if sync_stops:
-            final = self.decision_policy.resolve(
-                sync_stops, event, context_snapshot
-            )
-            self._process_effects(final, ctx)
-            return final
+            return self._resolve(sync_stops, event, context_snapshot, ctx)
 
-        correlation_id: str | None = None
-        if self.config.async_enabled:
-            correlation_id = await self._submit_async(
-                event, context_snapshot, routing
-            )
-
-        async_decisions: list[GuardrailDecision] = []
-        if correlation_id and routing.async_wait_ms > 0:
-            async_decisions = await self._wait_for_async(
-                correlation_id,
-                timeout_ms=routing.async_wait_ms,
-                on_timeout=routing.on_timeout,
-            )
-
+        async_decisions = await self._collect_async_decisions(
+            event, context_snapshot, routing
+        )
         all_decisions = sync_decisions + async_decisions
         if not all_decisions:
             return GuardrailDecision(
@@ -167,12 +186,114 @@ class GuardrailGateway:
                 rule_id="__default__",
                 reason="No rules triggered",
             )
+        return self._resolve(all_decisions, event, context_snapshot, ctx)
 
+    def end_run(self, run_id: str) -> None:
+        """Forget the late async responses of a finished run.
+
+        The planner calls this when a run finishes, not when it pauses,
+        so a response that arrives after the run ended is discarded.
+        """
+        self._late_ids.pop(run_id, None)
+        self.guard_inbox.drain_responses(run_id)
+
+    def _resolve(
+        self,
+        decisions: list[GuardrailDecision],
+        event: GuardrailEvent,
+        context_snapshot: ContextSnapshotV1,
+        ctx: GuardrailContext,
+    ) -> GuardrailDecision:
         final = self.decision_policy.resolve(
-            all_decisions, event, context_snapshot
+            decisions, event, context_snapshot
         )
         self._process_effects(final, ctx)
         return final
+
+    def _late_stops(self, run_id: str) -> list[GuardrailDecision]:
+        """Return the STOPs that arrived late for ``run_id``."""
+        late_ids = self._late_ids.get(run_id)
+        if not late_ids:
+            return []
+        stops: list[GuardrailDecision] = []
+        for response in self.guard_inbox.drain_responses(run_id):
+            if response.correlation_id not in late_ids:
+                continue
+            late_ids.discard(response.correlation_id)
+            stops.extend(
+                decision
+                for decision in self._response_decisions(response, run_id)
+                if decision.action == GuardrailAction.STOP
+            )
+        if not late_ids:
+            self._late_ids.pop(run_id, None)
+        return stops
+
+    def _track_late(self, run_id: str, correlation_id: str) -> None:
+        self._late_ids.setdefault(run_id, set()).add(correlation_id)
+
+    async def _collect_async_decisions(
+        self,
+        event: GuardrailEvent,
+        context_snapshot: ContextSnapshotV1,
+        routing: RiskRoutingDecision,
+    ) -> list[GuardrailDecision]:
+        """Submit ``event`` to the inbox and wait as the router says."""
+        if not self.config.async_enabled:
+            return []
+        try:
+            correlation_id = await self._submit_async(
+                event, context_snapshot, routing
+            )
+        except Exception as exc:
+            return self._async_failure(
+                "guardrail_async_submit_failed",
+                event.run_id,
+                f"{type(exc).__name__}: {exc}",
+            )
+        if routing.async_wait_ms <= 0:
+            self._track_late(event.run_id, correlation_id)
+            return []
+        return await self._wait_for_async(
+            event.run_id,
+            correlation_id,
+            timeout_ms=routing.async_wait_ms,
+            on_timeout=routing.on_timeout,
+        )
+
+    def _response_decisions(
+        self, response: SteeringGuardResponse, run_id: str
+    ) -> list[GuardrailDecision]:
+        """Return a response's decisions, or the async failure decision."""
+        if response.error is not None:
+            return self._async_failure(
+                "guardrail_async_error", run_id, response.error
+            )
+        for decision in response.decisions:
+            decision.was_sync = False
+        return list(response.decisions)
+
+    def _async_failure(
+        self, log_event: str, run_id: str, detail: str
+    ) -> list[GuardrailDecision]:
+        """Apply ``async_fail_open`` to a guard inbox failure."""
+        if self.config.async_fail_open:
+            logger.warning(
+                log_event, extra={"run_id": run_id, "error": detail}
+            )
+            return []
+        return [
+            GuardrailDecision(
+                action=GuardrailAction.STOP,
+                rule_id="__async_error__",
+                reason="Async guardrail evaluation failed (fail-closed)",
+                severity=GuardrailSeverity.CRITICAL,
+                stop=StopSpec(
+                    error_code="GUARDRAIL_ASYNC_ERROR",
+                    internal_reason=detail,
+                ),
+            )
+        ]
 
     async def _evaluate_sync(
         self,
@@ -255,7 +376,9 @@ class GuardrailGateway:
 
     async def _wait_for_async(
         self,
+        run_id: str,
         correlation_id: str,
+        *,
         timeout_ms: float,
         on_timeout: Literal["allow", "pause", "stop"],
     ) -> list[GuardrailDecision]:
@@ -265,28 +388,15 @@ class GuardrailGateway:
                 timeout_s=timeout_ms / 1000,
             )
         except TimeoutError:
-            if on_timeout == "stop":
-                return [
-                    GuardrailDecision(
-                        action=GuardrailAction.STOP,
-                        rule_id="__timeout__",
-                        reason="Async evaluation timed out (fail-closed)",
-                        stop=StopSpec(error_code="GUARDRAIL_TIMEOUT"),
-                    )
-                ]
-            if on_timeout == "pause":
-                return [
-                    GuardrailDecision(
-                        action=GuardrailAction.PAUSE,
-                        rule_id="__timeout__",
-                        reason="Async evaluation timed out",
-                        pause=PauseSpec(prompt="Safety check timed out"),
-                    )
-                ]
-            return []
-        for decision in response.decisions:
-            decision.was_sync = False
-        return response.decisions
+            self._track_late(run_id, correlation_id)
+            return _timeout_decisions(on_timeout)
+        except Exception as exc:
+            return self._async_failure(
+                "guardrail_async_error",
+                run_id,
+                f"{type(exc).__name__}: {exc}",
+            )
+        return self._response_decisions(response, run_id)
 
     def _process_effects(
         self, decision: GuardrailDecision, ctx: GuardrailContext
@@ -299,6 +409,31 @@ class GuardrailGateway:
                 )
             elif effect == "flag_trajectory" or effect == "emit_alert":
                 pass
+
+
+def _timeout_decisions(
+    on_timeout: Literal["allow", "pause", "stop"],
+) -> list[GuardrailDecision]:
+    """Return the decision the router chose for an async timeout."""
+    if on_timeout == "stop":
+        return [
+            GuardrailDecision(
+                action=GuardrailAction.STOP,
+                rule_id="__timeout__",
+                reason="Async evaluation timed out (fail-closed)",
+                stop=StopSpec(error_code="GUARDRAIL_TIMEOUT"),
+            )
+        ]
+    if on_timeout == "pause":
+        return [
+            GuardrailDecision(
+                action=GuardrailAction.PAUSE,
+                rule_id="__timeout__",
+                reason="Async evaluation timed out",
+                pause=PauseSpec(prompt="Safety check timed out"),
+            )
+        ]
+    return []
 
 
 __all__ = ["DefaultDecisionPolicy", "GatewayConfig", "GuardrailGateway"]

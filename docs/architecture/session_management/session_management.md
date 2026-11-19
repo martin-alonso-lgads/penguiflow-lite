@@ -116,7 +116,7 @@ The subsystem implements a layered architecture that separates concerns between 
 
   - **Spawn Guard Integration**: Integrates with spawn guards to enforce policies around task creation. Spawn guards can implement business logic to determine whether particular tasks should be allowed based on factors like resource availability, cost considerations, or security policies.
 
-  - **Context Depth Management**: Manages the depth of context provided to background tasks through the context_depth parameter. This allows callers to control how much of the current session context is provided to background tasks, balancing between context availability and security/privacy considerations.
+  - **Context Depth Management**: Manages the depth of context provided to background tasks through the `context_depth` argument of `spawn` (`full`, `summary` or `none`); it is not a `BackgroundTasksConfig` field. This allows callers to control how much of the current session context is provided to background tasks, balancing between context availability and security/privacy considerations.
 
   - **Group Management**: Handles the creation and management of task groups for coordinated execution. The service resolves group names to specific group instances, manages group sealing, and coordinates group-level operations like collective approval of results.
 

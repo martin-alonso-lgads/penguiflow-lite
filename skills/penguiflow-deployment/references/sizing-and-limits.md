@@ -7,16 +7,15 @@ Concrete recipes for runtime knobs by workload type. All numbers are starting po
 | Knob | Scope | Purpose |
 |---|---|---|
 | `max_iters` | `ReactPlanner` | Max planning steps per run. |
-| `deadline_s` | `ReactPlanner` | Wall-clock budget per run (finishes with `budget_exhausted`). |
+| `deadline_s` | `ReactPlanner` | Wall-clock budget per run (finishes with `budget_exhausted`). One budget across pause/resume segments; paused time doesn't count. |
 | `hop_budget` | `ReactPlanner` | Max tool hops per run. |
-| `token_budget` | `ReactPlanner` | Prompt token budget (trajectory compression kicks in). |
+| `token_budget` | `ReactPlanner` | Prompt size that triggers trajectory compression. It never ends a run. |
 | `llm_timeout_s` / `llm_max_retries` | `ReactPlanner` | Per-LLM-call timeout and retries. |
 | `repair_attempts` / `max_consecutive_arg_failures` | `ReactPlanner` | Bound self-repair loops. |
 | `absolute_max_parallel` | `ReactPlanner` | Cap on parallel tool calls in one step. |
 | `ExternalToolConfig.timeout_s` / `max_concurrency` / `retry_policy` | per ToolNode | Bound remote tool latency, parallelism and retries. |
 | `asyncio.timeout(...)` inside local tools | per tool | Local tools have no runtime-enforced timeout. |
-| `BackgroundTasksConfig(max_concurrent_tasks, task_timeout_s, ...)` | planner | Bound background tasks. |
-| `SessionLimits(max_concurrent_tasks, max_task_runtime_s, update_queue_size, ...)` | sessions | Per-session concurrency, runtime and subscriber queues. |
+| `SessionLimits(max_tasks_per_session, max_background_tasks, max_concurrent_tasks, max_task_runtime_s, update_queue_size, ...)` | sessions | Per-session task counts (background included), concurrency, runtime and subscriber queues. |
 | `A2AAgentToolset(default_timeout_s=...)` / tool `timeout_s` | manager side | Bound remote agent calls. |
 | Queue visibility timeout | external queue | Time before redelivery. |
 | Worker concurrency | platform | Concurrent runs per worker process. |
@@ -73,15 +72,15 @@ High concurrency is fine — most of the time is spent awaiting the LLM or the c
 | `tool_visibility` | hide UI-only / rich-output tools |
 | Worker concurrency | 20-50 |
 
-Conversations are keyed by the A2A `contextId` (`session_id`): calls within one conversation are serialized, different conversations run in parallel. Size replicas for concurrent conversations, not requests.
+Conversations are keyed by the A2A `contextId` (`session_id`): calls within one conversation are serialized, different conversations run in parallel. Size replicas for concurrent conversations, not requests. A task that pauses (`input-required`) can only resume on the replica that paused it, so route by `contextId` if your specialist pauses.
 
 ## Recipe: HITL workflow (low traffic, long sessions)
 
 | Knob | Value |
 |---|---|
 | `pause_enabled` | True |
-| `deadline_s` | per active segment (the clock doesn't run while paused) |
-| `BackgroundTasksConfig.task_timeout_s` | 3600s |
+| `deadline_s` | the whole run's active time: one budget shared by all segments (the clock doesn't run while paused) |
+| `SessionLimits.max_task_runtime_s` | 3600s or more: a session task waits for approval inside its runtime |
 | Pause state TTL (StateStore) | 24h - 7d depending on UX |
 
 Long sessions need durable state (`save_planner_state` / `load_planner_state`). Don't set deadlines that race the user's attention span.

@@ -466,10 +466,10 @@ Continue Planning or Finish with Error
 - `error_recovery_config`: Configuration for error recovery strategies
 
 ### 6. Background Task Configuration
-- `background_tasks`: Configuration for background task spawning
-- `default_merge_strategy`: Default strategy for merging background results
-- `max_concurrent_tasks`: Maximum concurrent background tasks
-- `task_timeout_s`: Timeout for background tasks
+- `background_tasks`: `BackgroundTasksConfig` with prompt guidance (`enabled`, `include_prompt_guidance`), tool background (`allow_tool_background`) and task-group defaults
+- Merge strategies are per task (`tasks.spawn(merge_strategy=...)`)
+- Limits (`max_concurrent_tasks`, `max_task_runtime_s`, …) live in `SessionLimits` on `SessionManager(limits=...)`
+- Proactive reporting is set up with `setup_proactive_reporting()` / `StreamingSession.configure_proactive_reporting()`
 
 ### 7. Reflection Configuration
 - `reflection_config`: Quality assurance configuration

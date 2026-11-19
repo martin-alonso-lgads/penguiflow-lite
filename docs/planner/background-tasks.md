@@ -28,21 +28,22 @@ Enable background tasks by passing `BackgroundTasksConfig`:
 
 - `ReactPlanner(..., background_tasks=BackgroundTasksConfig(enabled=True, ...))`
 
-Key knobs (from `penguiflow.planner.models.BackgroundTasksConfig`):
+Fields (from `penguiflow.planner.models.BackgroundTasksConfig`, which rejects unknown fields):
 
-- enablement:
-  - `enabled`
+- prompt guidance:
+  - `enabled` (adds background-task guidance to the system prompt; it does not turn the `tasks.*` tools on or off)
   - `include_prompt_guidance`
 - tool-initiated background spawns:
-  - `allow_tool_background`
-  - `default_mode` (`subagent` vs `job`)
-  - `default_merge_strategy` (`HUMAN_GATED` / `APPEND` / `REPLACE`)
-- limits:
-  - `max_concurrent_tasks`, `max_tasks_per_session`, `task_timeout_s`
-- proactive reporting (auto-merge modes):
-  - `proactive_report_enabled`, `proactive_report_max_hops`, …
-- task groups:
-  - `default_group_merge_strategy`, `default_group_report`, `max_tasks_per_group`, …
+  - `allow_tool_background` (each tool's `extra["background"]` sets its `mode` and `default_merge_strategy`)
+- task groups (read by sessions from `StreamingSession.configure_background_tasks(...)` or `InProcessTaskService(background_config=...)`):
+  - `default_group_merge_strategy` (`APPEND` / `REPLACE` / `HUMAN_GATED`, any case), `default_group_report` (`all` / `any` / `none`)
+  - `auto_seal_groups_on_foreground_yield`, `retain_turn_timeout_s`, `background_continuation_max_hops`, `background_continuation_cooldown_s`
+
+Configured elsewhere:
+
+- limits: `SessionLimits` on `SessionManager(limits=...)` (`max_tasks_per_session`, `max_background_tasks`, `max_concurrent_tasks`, `max_task_runtime_s`, …)
+- proactive reporting (auto-merge modes): `setup_proactive_reporting(...)` or `StreamingSession.configure_proactive_reporting(...)` (`enabled`, `strategies`, `max_queued`, `timeout_s`, `max_hops`, `fallback_notification`)
+- per-task options: `tasks.spawn` arguments (`mode`, `merge_strategy`, `context_depth`, `propagate_on_cancel`)
 
 ### The tasks.* tool surface (foreground-only)
 
@@ -93,8 +94,8 @@ This is intended for “slow but safe” integrations (e.g., scraping, batch ETL
 - Start with:
   - `enabled=True`
   - `allow_tool_background=False` until you have strong idempotency + observability
-  - `default_merge_strategy="HUMAN_GATED"` (review before merging context)
-- Enforce ceilings (`max_concurrent_tasks`, `max_tasks_per_session`) and alert when hit.
+  - `merge_strategy="human_gated"` on spawns (the `tasks.spawn` default; review before merging context)
+- Enforce ceilings with `SessionLimits` (`max_tasks_per_session`, `max_background_tasks`, `max_concurrent_tasks`, `max_task_runtime_s`) and alert when hit.
 - Prefer task groups for multi-step background work so the user gets one coherent report instead of many partial updates.
 
 ## Failure modes & recovery
@@ -127,8 +128,8 @@ This is intended for “slow but safe” integrations (e.g., scraping, batch ETL
 
 **Fix**
 
-- enforce limits in `BackgroundTasksConfig`
-- keep `proactive_report_max_hops` small (default is 2)
+- enforce limits with `SessionLimits` on `SessionManager(limits=...)`
+- keep the proactive reporting `max_hops` small (`setup_proactive_reporting(..., max_hops=...)`; default is 2)
 - do not expose tasks.* tools to subagents
 
 ## Observability
@@ -142,7 +143,7 @@ Recommended signals:
 
 If you run session-backed tasks, emit structured updates and persist task state (see `penguiflow.sessions`).
 
-See **[Planner observability](observability.md)** and the ops guidance in **[Production deployment](../deployment/production-deployment.md)**.
+See **[Planner observability](observability.md)**.
 
 ## Security / multi-tenancy notes
 

@@ -60,6 +60,7 @@ from .models import (
     TaskType,
     UpdateType,
     _utc_now,
+    merge_strategy_from_name,
 )
 from .persistence import (
     InMemorySessionStateStore,
@@ -2011,12 +2012,17 @@ class StreamingSession:
                 ):
                     return grp
 
-        # Create new group
+        # Create new group; unset strategies come from the session's
+        # background task config.
+        config = self.get_background_task_config()
         new_group = TaskGroup(
             name=group_name or f"group_{secrets.token_hex(4)}",
             session_id=self.session_id,
-            merge_strategy=merge_strategy or MergeStrategy.APPEND,
-            report_strategy=report_strategy or "all",
+            merge_strategy=merge_strategy
+            or merge_strategy_from_name(
+                config.default_group_merge_strategy, MergeStrategy.APPEND
+            ),
+            report_strategy=report_strategy or config.default_group_report,
             retain_turn=retain_turn,
             turn_id=turn_id,
         )

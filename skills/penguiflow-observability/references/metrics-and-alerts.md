@@ -1,6 +1,6 @@
 # Metrics, Dashboards, and Alerts
 
-PenguiFlow doesn't ship a metrics exporter for the planner — you derive metrics from `PlannerEvent`s in an `event_callback` and from the returned `PlannerFinish`. LLM-level metrics can come from `penguiflow.llm.telemetry` (`create_prometheus_callback()`). This reference covers the recommended baseline.
+PenguiFlow doesn't ship a metrics exporter for the planner — you derive metrics from `PlannerEvent`s in an `event_callback` and from the returned `PlannerFinish` (including per-run LLM cost and call counts in `metadata["cost"]`). This reference covers the recommended baseline.
 
 ## Cardinality rules (read first)
 
@@ -25,7 +25,7 @@ Move correlation to logs, not metrics.
 |---|---|---|
 | `pf_runs_total` | `PlannerFinish.reason` (or `finish` event `extra["reason"]`); `PlannerPause` → `reason="paused"` | `reason` |
 | `pf_tool_calls_total` | `tool_call_start` | `tool` (`extra["tool_name"]`) |
-| `pf_tool_errors_total` | steps whose history entry has an `error` | `tool` |
+| `pf_tool_errors_total` | `tool_call_result` whose `result_json` has an `"error"` key (or steps whose history entry has an `error`) | `tool` |
 | `pf_args_invalid_total` | `planner_args_invalid` | `tool` (`extra["tool"]`) |
 | `pf_finish_repairs_total` | `finish_repair_success` / `finish_repair_failure` | `outcome` |
 | `pf_guardrail_retries_total` | `guardrail_retry` | — |
@@ -44,7 +44,10 @@ Move correlation to logs, not metrics.
 
 ```python
 import time
+
 from prometheus_client import Counter, Histogram
+
+from penguiflow.planner import PlannerEvent, PlannerFinish, ReactPlanner
 
 RUNS = Counter("pf_runs_total", "Planner runs", ["reason"])
 TOOL_CALLS = Counter("pf_tool_calls_total", "Tool calls", ["tool"])
@@ -54,13 +57,16 @@ STEP_LATENCY = Histogram(
 )
 RUN_DURATION = Histogram("pf_run_duration_s", "Run duration", ["reason"])
 
+
 def on_event(event: PlannerEvent) -> None:
     if event.event_type == "tool_call_start":
         TOOL_CALLS.labels(tool=event.extra.get("tool_name", "unknown")).inc()
     elif event.event_type == "step_complete" and event.latency_ms is not None:
-        STEP_LATENCY.labels(tool=event.node_name or "unknown").observe(event.latency_ms)
+        tool = event.node_name or "unknown"
+        STEP_LATENCY.labels(tool=tool).observe(event.latency_ms)
 
-async def run(planner, query, **kwargs):
+
+async def run(planner: ReactPlanner, query: str, **kwargs: object):
     started = time.monotonic()
     result = await planner.run(query, **kwargs)
     reason = result.reason if isinstance(result, PlannerFinish) else "paused"
@@ -79,22 +85,29 @@ from penguiflow.llm.telemetry import create_prometheus_callback, get_telemetry_h
 get_telemetry_hooks().register(create_prometheus_callback())
 ```
 
-Exports `llm_requests_total` (by provider/model/status), `llm_request_latency_seconds` and `llm_tokens_total` from `LLMEvent`s (`request_start`, `request_end`, `retry`, `error`). Requires `prometheus_client`. For spans with tokens and cost, set `PENGUIFLOW_LLM_TRACING=mlflow` (or `log`).
+Exports `llm_requests_total` (by provider/model/status), `llm_request_latency_seconds` and `llm_tokens_total` from `LLMEvent`s (`request_start`, `request_end`, `retry`, `error`). Requires `prometheus_client`. These events come only from the standalone `penguiflow.llm.LLMClient`; the planner's own LLM calls don't emit them.
+
+For planner LLM calls, use `PlannerFinish.metadata["cost"]` (`total_cost_usd`, `main_llm_calls`, ...) per run, or spans with tokens and cost: set `PENGUIFLOW_LLM_TRACING=mlflow` (or `log`) and build the planner with `use_native_llm=True` (the variable has no effect on the default LiteLLM client).
 
 ## OpenTelemetry recipe
 
 ```python
 from opentelemetry import metrics
+
+from penguiflow.planner import PlannerEvent
+
 meter = metrics.get_meter("penguiflow")
 
 step_latency = meter.create_histogram("pf.step.latency_ms", "ms")
 tool_calls = meter.create_counter("pf.tool.calls")
 
+
 def on_event(event: PlannerEvent) -> None:
     if event.event_type == "tool_call_start":
         tool_calls.add(1, {"tool": event.extra.get("tool_name", "unknown")})
     elif event.event_type == "step_complete" and event.latency_ms is not None:
-        step_latency.record(event.latency_ms, {"tool": event.node_name or "unknown"})
+        tool = event.node_name or "unknown"
+        step_latency.record(event.latency_ms, {"tool": tool})
 ```
 
 ## Dashboards (recommended)
@@ -106,7 +119,7 @@ def on_event(event: PlannerEvent) -> None:
 ### 2. Latency
 - Run duration p50/p95/p99.
 - Step latency per top-N tools.
-- LLM latency per model (from LLM telemetry).
+- LLM latency per model (from LLM tracing spans, native adapter only).
 
 ### 3. Quality
 - `planner_args_invalid`, finish repairs, guardrail retries per run.
@@ -114,7 +127,7 @@ def on_event(event: PlannerEvent) -> None:
 
 ### 4. Cost
 - Cost per run and per tenant (aggregate in logs if tenant is unbounded).
-- Tokens per model.
+- Tokens per model (from LLM tracing spans).
 
 ## Alerts (starter set)
 
@@ -124,7 +137,7 @@ def on_event(event: PlannerEvent) -> None:
 | Tool error spike | `rate(pf_tool_errors_total[5m])` by tool | above baseline + 3σ |
 | Repair storm | `rate(pf_args_invalid_total[5m]) / rate(pf_tool_calls_total[5m])` | >20% |
 | Latency regression | `pf_run_duration_s` p95 | above SLO for 15m |
-| LLM errors | LLM `error` events per model | above baseline |
+| LLM errors | LLM tracing spans with `error_type` set, per model | above baseline |
 | Cost surge | cost per run p95 | 2× baseline |
 
 Always combine with SLO-burn alerting for the user-visible SLIs (answer success rate, end-to-end latency p95).

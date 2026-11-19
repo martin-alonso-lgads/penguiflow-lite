@@ -49,7 +49,7 @@ Remote calls are modeled as (`penguiflow.remote`):
 
 Planners use transports through `A2AAgentToolset` / `A2ARouterToolset` tools, which persist and reuse `RemoteBinding`s.
 
-Key operational point: remote cancellation requires a durable `task_id` and a transport that supports cancellation.
+Key operational point: remote cancellation needs the remote `task_id` and a transport that supports cancellation. A streaming tool call cancels its remote task when the local call is cancelled (`cancel_on_cancel=True`, the default); anything else (a worker that died, a task to stop later) needs the `task_id` you persisted in a binding.
 
 ### 3) A2A bindings (`penguiflow_a2a`)
 
@@ -58,8 +58,8 @@ Key operational point: remote cancellation requires a durable `task_id` and a tr
 - planner/router client: `A2AAgentToolset` and `A2ARouterToolset`
 
 Persistence touchpoints:
-- **Server side** — with `A2AConfig(agent_url=...)` set, each task saves `RemoteBinding(trace_id=task_id, context_id, task_id, agent_url)` via `save_remote_binding` on the service's `state_store` (default: the planner's store). Paused tasks resume through the planner's `save_planner_state` / `load_planner_state`.
-- **Client side** — the toolset saves bindings after each call and looks them up with `find_binding` to continue a remote conversation.
+- **Server side** — with `A2AConfig(agent_url=...)` set, each task run saves `RemoteBinding(trace_id=task_id, context_id, task_id, agent_url)` via `save_remote_binding` on the service's `state_store` (default: the planner's `state_store`). This is best-effort: a failing save is logged (`a2a_remote_binding_save_failed`) and the task still runs. A2A paused tasks resume only in the same process: `A2AService` keeps the task-to-resume-token map in memory, so route follow-up messages for an `input-required` task to the process that paused it.
+- **Client side** — `A2AAgentToolset` (and `A2ARouterToolset`, which delegates through it) looks up `find_binding` before each call and saves a binding after it, when the run has `tool_context["session_id"]`. Bindings are conversation-scoped: the stored `context_id` is reused on every later call in that router session, the `task_id` only while the remote task awaits input or auth, and the toolset never marks a binding terminal. Store errors on this side propagate to the tool call.
 
 Install extras:
 
@@ -70,28 +70,28 @@ Install extras:
 ## Operational defaults (recommended)
 
 - Pass the same durable store to the planner (`ReactPlanner(state_store=...)`), sessions (`SessionManager(state_store=...)`) and, if separate, `A2AService(state_store=...)`.
-- Put `tenant`, `user_id` and `session_id` in `tool_context` on every run; bindings and memory are scoped by them.
+- Put `tenant_id`, `user_id`, `session_id` and `trace_id` in `tool_context` on every run. Memory and bindings are scoped by the first three; trajectories and planner events persist only with a `trace_id`. Memory isolation reads `tenant_id`, not `tenant`: with only `tenant`, two tenants that share a session id share memory. (`A2AAgentToolset` builds the outgoing message's `Headers(tenant=...)` from `tool_context["tenant"]`, default `"default"`, so set `tenant` too if remote agents route by tenant.)
 - Time-bound every remote boundary: tool `timeout_s` / `A2AAgentToolset(default_timeout_s=...)`, planner `deadline_s`.
 - For A2A router continuity, persist the additive `RemoteBinding` fields:
   - `router_session_id`, `remote_skill`, `tenant_id`, `user_id`, `last_remote_task_id`, `is_terminal`, `metadata`.
 - Implement optional conversation binding lookup when an `A2AAgentToolset` manager/router should reuse a specialist conversation:
   - `find_binding(router_session_id, agent_url, remote_skill, tenant_id=None, user_id=None)`,
   - `list_bindings(router_session_id=...)`,
-  - `mark_binding_terminal(trace_id, context_id, task_id)`.
+  - `mark_binding_terminal(trace_id, context_id, task_id)` (the library never calls it; call it when a conversation should stop reusing a specialist context).
 - Assume at-least-once delivery in the surrounding platform:
   - make remote calls idempotent where possible,
   - avoid side effects on retry without idempotency keys.
 
 ## Failure modes & recovery
 
-- **Remote tasks leak** (can't cancel): `task_id` bindings not persisted or the transport doesn't support cancel.
+- **Remote tasks leak** (can't cancel): the transport doesn't support cancel, `cancel_on_cancel=False`, or the worker died before cancelling and no `task_id` was persisted.
   - Fix: implement `save_remote_binding` and use a transport with cancellation; enforce deadlines so leaks are bounded.
-- **A2A specialist loses conversation continuity**: the store only saves legacy remote bindings, does not implement `find_binding`, or is not visible to `A2AAgentToolset` through `tool_context["state_store"]` / planner `_state_store`.
+- **A2A specialist loses conversation continuity**: the store only saves legacy remote bindings, does not implement `find_binding`, or is not visible to `A2AAgentToolset` through `tool_context["state_store"]` / the planner's `state_store`.
   - Fix: add nullable conversation binding columns, index active bindings by `(router_session_id, agent_url, remote_skill, tenant_id, user_id)`, return the newest non-terminal scoped binding, and ensure router tool context includes `session_id`.
-- **Pause resumes fail on another worker**: `save_planner_state` / `load_planner_state` missing, or records expire before the human answers.
-  - Fix: implement both with a TTL that matches your HITL UX.
-- **Cross-tenant leakage**: shared auth tokens or reused session ids across tenants.
-  - Fix: per-tenant credentials; include `tenant_id` and `user_id` in binding lookup so a remote context is not reused across tenants/users.
+- **Pause resumes fail on another worker**: `save_planner_state` / `load_planner_state` missing, or records expire before the human answers. For an A2A server, the follow-up message reached a process other than the one that paused the task.
+  - Fix: implement both with a TTL that matches your HITL UX; for A2A servers, route a paused task's follow-up messages to the process that paused it (sticky routing by task id).
+- **Cross-tenant leakage**: shared auth tokens, reused session ids across tenants, or `tenant` set instead of `tenant_id`.
+  - Fix: per-tenant credentials; set `tool_context["tenant_id"]` and `["user_id"]` so memory keys and binding lookups are scoped and a remote context is not reused across tenants/users.
 - **Retry storms**: transient remote failures trigger retries across multiple workers.
   - Fix: cap retries, add backoff, and add circuit-breaker behavior at the boundary.
 
@@ -123,5 +123,5 @@ Manager↔specialist and binding tests: `tests/a2a/test_a2a_planner_tools.py`, `
 - If a system "works locally" but fails distributed:
   - confirm `StateStore` durability and idempotency,
   - confirm queue/worker semantics (visibility timeout, retries),
-  - confirm every run carries `session_id` / `tenant` in `tool_context`,
+  - confirm every run carries `session_id`, `tenant_id`, `user_id` and `trace_id` in `tool_context`,
   - confirm the planner, sessions and A2A service share the same store.

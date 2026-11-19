@@ -70,11 +70,23 @@ from .resources import (
 )
 
 if TYPE_CHECKING:
-    from mcp.client.session import ClientSession
-    from mcp.types import InitializeResult
+    from mcp.client.session import ClientSession, MessageHandlerFnT
+    from mcp.shared.session import RequestResponder
+    from mcp.types import (
+        ClientResult,
+        InitializeResult,
+        ServerNotification,
+        ServerRequest,
+    )
 
     from penguiflow.planner.context import ToolContext
     from penguiflow.registry import ModelRegistry
+
+    _McpMessage = (
+        RequestResponder[ServerRequest, ClientResult]
+        | ServerNotification
+        | Exception
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +125,47 @@ def _container_set(
             parent[key] = value
     elif isinstance(key, int):
         parent[key] = value
+
+
+class _McpMessageRouter:
+    """MCP ``message_handler`` that lets a ToolNode see server messages.
+
+    Each message goes to ``ToolNode.handle_mcp_message`` first, then to
+    ``fallback``: the client's default handler, which fastmcp uses to
+    route task status notifications.
+    """
+
+    def __init__(self, node: ToolNode) -> None:
+        self._node = node
+        self.fallback: MessageHandlerFnT | None = None
+
+    async def __call__(self, message: _McpMessage) -> None:
+        self._node.handle_mcp_message(message)
+        if self.fallback is not None:
+            await self.fallback(message)
+
+
+def _resource_call(
+    method: Callable[..., object], *, any_url: bool
+) -> Callable[[str], Awaitable[object]]:
+    """Adapt a client's resource (un)subscribe method to take a URI.
+
+    ``mcp.ClientSession`` methods take the URI as an ``AnyUrl``
+    (``any_url=True``); other clients take a plain string.
+    """
+
+    async def call(uri: str) -> object:
+        arg: object = uri
+        if any_url:
+            from pydantic import AnyUrl
+
+            arg = AnyUrl(uri)
+        result = method(arg)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    return call
 
 
 # Private ``mcp.ClientSession`` field that ``ClientSession.initialize`` sets.
@@ -521,6 +574,7 @@ class ToolNode:
         """
         try:
             from fastmcp import Client as MCPClient
+            from fastmcp.client.tasks import TaskNotificationHandler
             from fastmcp.client.transports import (
                 SSETransport,
                 StdioTransport,
@@ -571,7 +625,12 @@ class ToolNode:
                         )
                 transport = StdioTransport(command=command, args=args, env=env)
 
-            self.mcp_client = MCPClient(transport, auto_initialize=False)
+            router = _McpMessageRouter(self)
+            self.mcp_client = MCPClient(
+                transport, auto_initialize=False, message_handler=router
+            )
+            # Keep fastmcp's default handler so task status still routes.
+            router.fallback = TaskNotificationHandler(self.mcp_client)
             await self.mcp_client.__aenter__()
             await self.initialize_mcp_client(self.mcp_client)
             mcp_tools = await self.mcp_client.list_tools()
@@ -2648,17 +2707,16 @@ class ToolNode:
         if self._subscription_manager is None:
             return False
 
-        subscribe_method = getattr(self.mcp_client, "subscribe_resource", None)
-        if not callable(subscribe_method):
-            subscribe_method = getattr(self.mcp_client, "subscribe", None)
-        if not callable(subscribe_method):
+        subscribe_method = self._mcp_resource_method(
+            "subscribe_resource", "subscribe"
+        )
+        if subscribe_method is None:
             logger.debug(
                 "MCP client for '%s' does not support resource subscriptions",
                 self.config.name,
             )
             return False
 
-        # Capture client for closure (preserves type narrowing)
         async def subscribe_fn(resource_uri: str) -> None:
             await subscribe_method(resource_uri)
 
@@ -2681,12 +2739,10 @@ class ToolNode:
         if self._subscription_manager is None:
             return False
 
-        unsubscribe_method = getattr(
-            self.mcp_client, "unsubscribe_resource", None
+        unsubscribe_method = self._mcp_resource_method(
+            "unsubscribe_resource", "unsubscribe"
         )
-        if not callable(unsubscribe_method):
-            unsubscribe_method = getattr(self.mcp_client, "unsubscribe", None)
-        if not callable(unsubscribe_method):
+        if unsubscribe_method is None:
             logger.debug(
                 "MCP client for '%s' does not support resource "
                 "unsubscriptions",
@@ -2694,13 +2750,48 @@ class ToolNode:
             )
             return False
 
-        # Capture client for closure (preserves type narrowing)
         async def unsubscribe_fn(resource_uri: str) -> None:
             await unsubscribe_method(resource_uri)
 
         return await self._subscription_manager.unsubscribe(
             uri, unsubscribe_fn
         )
+
+    def _mcp_resource_method(
+        self, name: str, alias: str
+    ) -> Callable[[str], Awaitable[object]] | None:
+        """Find the client's resource (un)subscribe method.
+
+        ``fastmcp.Client`` has no subscribe methods, so after any method
+        on the client itself this falls back to the underlying
+        ``mcp.ClientSession``, which takes the URI as an ``AnyUrl``.
+        """
+        client = self.mcp_client
+        for attr in (name, alias):
+            method = getattr(client, attr, None)
+            if callable(method):
+                return _resource_call(method, any_url=False)
+        session_method = getattr(getattr(client, "session", None), name, None)
+        if callable(session_method):
+            return _resource_call(session_method, any_url=True)
+        return None
+
+    def handle_mcp_message(self, message: object) -> None:
+        """Handle one message an MCP server sent to this client.
+
+        ``ToolNode`` installs itself as the fastmcp client's message
+        handler, so resource update notifications reach
+        ``handle_resource_updated``. Other messages are ignored here.
+
+        Args:
+            message: A message from the MCP session: a server
+                notification, a server request or an exception.
+        """
+        import mcp.types as mcp_types
+
+        root = getattr(message, "root", None)
+        if isinstance(root, mcp_types.ResourceUpdatedNotification):
+            self.handle_resource_updated(str(root.params.uri))
 
     def handle_resource_updated(self, uri: str) -> None:
         """Handle a resource updated notification from MCP server.

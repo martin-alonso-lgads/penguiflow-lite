@@ -821,6 +821,35 @@ class TestTaskGroups:
         assert group.status == "open"
         assert group.turn_id == "turn-1"
         assert len(group.task_ids) == 0
+        assert group.merge_strategy is MergeStrategy.APPEND
+        assert group.report_strategy == "all"
+
+    @pytest.mark.asyncio
+    async def test_new_group_uses_config_defaults(
+        self, session: StreamingSession
+    ) -> None:
+        """New groups take unset strategies from the background config."""
+        session.configure_background_tasks(
+            BackgroundTasksConfig(
+                default_group_merge_strategy="human_gated",
+                default_group_report="any",
+            )
+        )
+
+        configured = await session.resolve_or_create_group(
+            group_name="configured", turn_id="turn-1"
+        )
+        explicit = await session.resolve_or_create_group(
+            group_name="explicit",
+            turn_id="turn-1",
+            merge_strategy=MergeStrategy.REPLACE,
+            report_strategy="none",
+        )
+
+        assert configured.merge_strategy is MergeStrategy.HUMAN_GATED
+        assert configured.report_strategy == "any"
+        assert explicit.merge_strategy is MergeStrategy.REPLACE
+        assert explicit.report_strategy == "none"
 
     @pytest.mark.asyncio
     async def test_resolve_or_create_group_joins_existing(

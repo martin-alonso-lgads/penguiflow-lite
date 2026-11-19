@@ -35,7 +35,7 @@ Guardrails are **off by default**. Enable them by passing a gateway at construct
 When enabled, the planner can enforce these actions:
 
 - `STOP`: terminate (or force-safe finish) with a user-safe message
-- `PAUSE`: trigger HITL approval (planner pauses with `reason="approval_required"`)
+- `PAUSE`: trigger HITL approval at `tool_call_start` or `tool_call_result` (`run()` returns `PlannerPause(reason="approval_required")`)
 - `RETRY`: re-run the LLM call with corrective instructions
 - `REDACT`: redact text from streamed output and tool results
 - `ALLOW`: do nothing
@@ -59,7 +59,7 @@ Decisions include:
 - optional action-specific payloads:
   - `redactions: tuple[RedactionSpec, ...]`
   - `retry: RetrySpec(max_attempts, corrective_message)`
-  - `pause: PauseSpec(scope, approver_roles, prompt, timeout_s)`
+  - `pause: PauseSpec(scope, approver_roles, prompt, timeout_s)`, copied into `PlannerPause.payload["guardrail"]["pause"]` (`timeout_s` is informational; the planner does not enforce it)
   - `stop: StopSpec(error_code, user_message, internal_reason)`
 
 ### Modes: `shadow` vs `enforce`
@@ -77,13 +77,16 @@ Guardrail gateway config controls enforcement:
 Rules are classified by cost:
 
 - **FAST** rules are evaluated synchronously (on the request path)
-- **DEEP** rules can be evaluated asynchronously via a `SteeringGuardInbox`
+- **DEEP** rules are evaluated asynchronously via a `SteeringGuardInbox` (for example `InMemoryGuardInbox(AsyncRuleEvaluator(registry))`)
+
+The gateway waits for DEEP rules only as long as the risk router says (`async_wait_ms`; `DefaultRiskRouter` derives it from the tool risk tier and context signals). A DEEP `STOP` that arrives after that wait is applied at the same run's next guardrail check; late `PAUSE`, `REDACT` and `RETRY` decisions are dropped. Each `run()` has its own guardrail run id (kept across pause and resume), so a late decision never reaches another run.
 
 Gateway options you will tune:
 
 - `sync_timeout_ms` (default 15ms)
 - `sync_parallel` (run sync rules concurrently)
-- `sync_fail_open` / `async_fail_open` (availability vs safety tradeoff)
+- `sync_fail_open` (a sync rule that errors or times out: skip it, or STOP)
+- `async_fail_open` (the guard inbox fails — `submit`/`await_response` raises or a response reports an `error`: skip the async check, or STOP with `GUARDRAIL_ASYNC_ERROR`). Async timeouts are decided by the risk router's `on_timeout`, not by this flag.
 
 ### Observation size “guardrail” (reliability safety net)
 
@@ -154,7 +157,7 @@ Recommended signals:
 
 Useful places to look:
 
-- `PlannerEvent(event_type="tool_call_result").extra["result_json"]` may include a `failure.guardrail` payload on STOP/PAUSE.
+- `PlannerEvent(event_type="tool_call_result").extra["result_json"]` includes a `failure.guardrail` payload on a tool STOP. A guardrail PAUSE emits no tool result; its decision is in `PlannerPause.payload["guardrail"]`.
 - streamed output seen in `PlannerEvent(event_type="llm_stream_chunk")` is already post-redaction (when enforced).
 
 See **[Planner observability](observability.md)**.
