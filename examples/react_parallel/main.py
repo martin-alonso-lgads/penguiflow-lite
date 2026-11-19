@@ -134,7 +134,10 @@ async def main() -> None:
                 "thought": "finish",
                 "next_node": None,
                 "args": {
-                    "documents": ["penguins-primary", "penguins-secondary"]
+                    "answer": (
+                        "Merged documents: penguins-primary, "
+                        "penguins-secondary"
+                    )
                 },
             },
         ]

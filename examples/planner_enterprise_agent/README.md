@@ -33,10 +33,8 @@ This example demonstrates enterprise-grade patterns for building autonomous agen
 # Python 3.11+
 python --version
 
-# Install PenguiFlow with planner support
-pip install -e ".[planner]"
-# or with uv:
-uv pip install -e ".[planner]"
+# Install penguiflow-lite with planner support
+uv sync --extra planner
 ```
 
 ### 2. Configure Environment
@@ -57,7 +55,7 @@ cp .env.example .env
 ```bash
 # Load environment and run
 source .env  # or: export $(cat .env | xargs)
-python -m examples.planner_enterprise_agent_v2.main
+python -m examples.planner_enterprise_agent.main
 ```
 
 ### Auto-seq (v1, opt-in)
@@ -214,7 +212,7 @@ All configuration is driven by environment variables (see `.env.example`):
 The `AgentConfig` dataclass provides type-safe configuration:
 
 ```python
-from examples.planner_enterprise_agent_v2.config import AgentConfig
+from examples.planner_enterprise_agent.config import AgentConfig
 
 # Load from environment
 config = AgentConfig.from_env()
@@ -236,8 +234,8 @@ config = AgentConfig(
 
 ```python
 import asyncio
-from examples.planner_enterprise_agent_v2.main import EnterpriseAgentOrchestrator
-from examples.planner_enterprise_agent_v2.config import AgentConfig
+from examples.planner_enterprise_agent.main import EnterpriseAgentOrchestrator
+from examples.planner_enterprise_agent.config import AgentConfig
 
 async def main():
     config = AgentConfig.from_env()
@@ -258,7 +256,7 @@ asyncio.run(main())
 ### With Custom Telemetry
 
 ```python
-from examples.planner_enterprise_agent_v2.telemetry import AgentTelemetry
+from examples.planner_enterprise_agent.telemetry import AgentTelemetry
 
 # Create custom telemetry (e.g., for testing)
 telemetry = AgentTelemetry(config)
@@ -278,13 +276,13 @@ print(f"Cost: ${metrics['planner_cost_usd']:.4f}")
 
 ```bash
 # Run the example
-python -m examples.planner_enterprise_agent_v2.main
+python -m examples.planner_enterprise_agent.main
 
 # With debug logging
-LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent_v2.main
+LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent.main
 
 # With different model
-LLM_MODEL=gpt-4o python -m examples.planner_enterprise_agent_v2.main
+LLM_MODEL=gpt-4o python -m examples.planner_enterprise_agent.main
 ```
 
 ---
@@ -333,10 +331,10 @@ COPY pyproject.toml .
 RUN pip install -e ".[planner]"
 
 # Copy application
-COPY examples/planner_enterprise_agent_v2 ./examples/planner_enterprise_agent_v2
+COPY examples/planner_enterprise_agent ./examples/planner_enterprise_agent
 
 # Run agent
-CMD ["python", "-m", "examples.planner_enterprise_agent_v2.main"]
+CMD ["python", "-m", "examples.planner_enterprise_agent.main"]
 ```
 
 ### Kubernetes Deployment
@@ -631,9 +629,7 @@ See `main.py::_build_nodes()` and `nodes.py::analyze_documents_pipeline()` for f
 
 ```bash
 # Install planner dependencies
-pip install -e ".[planner]"
-# or
-uv pip install -e ".[planner]"
+uv sync --extra planner
 ```
 
 **❌ "LiteLLM returned empty content"**
@@ -668,10 +664,10 @@ Hit resource constraints. Solutions:
 
 ```bash
 # Enable debug logs
-LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent_v2.main
+LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent.main
 
 # See full LLM prompts/responses
-LOG_LEVEL=DEBUG PENGUIFLOW_LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent_v2.main
+LOG_LEVEL=DEBUG PENGUIFLOW_LOG_LEVEL=DEBUG python -m examples.planner_enterprise_agent.main
 ```
 
 ### Inspecting Telemetry
@@ -744,9 +740,9 @@ async def parse_doc(args: Args, ctx: Any) -> Result:
 
 ```python
 import pytest
-from examples.planner_enterprise_agent_v2.main import EnterpriseAgentOrchestrator
-from examples.planner_enterprise_agent_v2.config import AgentConfig
-from examples.planner_enterprise_agent_v2.telemetry import AgentTelemetry
+from examples.planner_enterprise_agent.main import EnterpriseAgentOrchestrator
+from examples.planner_enterprise_agent.config import AgentConfig
+from examples.planner_enterprise_agent.telemetry import AgentTelemetry
 
 @pytest.mark.asyncio
 async def test_document_workflow():

@@ -82,7 +82,7 @@ Chunks are previews. The `PlannerFinish` payload is the answer. If the planner r
 
 ## Worked examples
 - `examples/streaming_llm/stream_answer.py` — tool-level `ctx.emit_chunk` surfaced through `PlannerEvent` callbacks.
-- `examples/planner_enterprise_agent_v2/` — status updates and streaming in a larger agent (see its `STREAMING.md`).
+- `examples/planner_enterprise_agent/` — status updates and streaming in a larger agent (see its `STREAMING.md`).
 
 ## References (load only as needed)
 - `references/streamchunk-and-emit.md` — planner stream events, `ctx.emit_chunk` / `ctx.emit_artifact` semantics, ordering, channels.

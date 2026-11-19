@@ -6,13 +6,13 @@ The enterprise agent example now supports **real-time status streaming** via the
 
 ```bash
 # Run with real-time status updates
-uv run python examples/planner_enterprise_agent_v2/main.py --stream
+uv run python examples/planner_enterprise_agent/main.py --stream
 
 # Stream a custom query
-uv run python examples/planner_enterprise_agent_v2/main.py --stream --query "Analyze deployment logs"
+uv run python examples/planner_enterprise_agent/main.py --stream --query "Analyze deployment logs"
 
 # Run without streaming (default)
-uv run python examples/planner_enterprise_agent_v2/main.py
+uv run python examples/planner_enterprise_agent/main.py
 ```
 
 ## What It Does
@@ -144,4 +144,4 @@ class StatusUpdate(BaseModel):
 
 ## See Also
 
-- [examples/planner_enterprise_agent_v2/README.md](./README.md) - Enterprise agent overview
+- [examples/planner_enterprise_agent/README.md](./README.md) - Enterprise agent overview

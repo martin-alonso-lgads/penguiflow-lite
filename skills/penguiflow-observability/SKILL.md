@@ -85,7 +85,7 @@ Worked example: `examples/mlflow_llm_tracing/`.
 
 ## Worked examples
 - `examples/mlflow_llm_tracing/` — LLM tracing to MLflow.
-- `examples/planner_enterprise_agent_v2/telemetry.py` — planner-event telemetry collector.
+- `examples/planner_enterprise_agent/telemetry.py` — planner-event telemetry collector.
 - `examples/streaming_llm/stream_answer.py` — `event_callback` wiring.
 
 ## References (load only as needed)

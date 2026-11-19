@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from examples.planner_enterprise_agent_v2.config import AgentConfig
+    from examples.planner_enterprise_agent.config import AgentConfig
     from penguiflow.planner import PlannerEvent
 
 

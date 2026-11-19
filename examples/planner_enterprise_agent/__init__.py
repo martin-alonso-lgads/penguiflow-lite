@@ -10,7 +10,7 @@ Public API:
     - AgentTelemetry: Planner event telemetry
 
 Example:
-    >>> from examples.planner_enterprise_agent_v2 import (
+    >>> from examples.planner_enterprise_agent import (
     ...     EnterpriseAgentOrchestrator,
     ...     AgentConfig,
     ... )

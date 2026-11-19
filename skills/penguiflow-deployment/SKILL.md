@@ -120,7 +120,7 @@ On `SIGTERM`: stop accepting new work → push `SteeringEventType.CANCEL` into t
 - **One user DoSes the worker** — no `SessionLimits.max_concurrent_tasks` / per-tenant quotas.
 
 ## Worked examples
-- `examples/planner_enterprise_agent_v2/` — production-shaped planner agent (config, telemetry, streaming).
+- `examples/planner_enterprise_agent/` — production-shaped planner agent (config, telemetry, streaming).
 - `examples/a2a_grpc_server/main.py` — a planner served as an A2A specialist.
 - `examples/react_pause_resume/main.py` — pause/resume flow to adapt for durable workers.
 

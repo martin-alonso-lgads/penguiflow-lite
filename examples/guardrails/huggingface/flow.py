@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from typing_extensions import override
 
+from examples.guardrails.huggingface.rule import HuggingFaceJailbreakRule
 from penguiflow.catalog import build_catalog
 from penguiflow.node import Node
 from penguiflow.planner import ReactPlanner
@@ -20,8 +21,6 @@ from penguiflow.planner.guardrails import (
 from penguiflow.planner.models import JSONLLMClient
 from penguiflow.registry import ModelRegistry
 from penguiflow.steering import InMemoryGuardInbox
-
-from .rule import HuggingFaceJailbreakRule
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence

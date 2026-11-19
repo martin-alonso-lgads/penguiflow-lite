@@ -138,12 +138,16 @@ async def build_planner() -> ReactPlanner:
             "thought": "respond",
             "next_node": "respond",
             "args": {
-                "name": "Ava Agent",
-                "department": "eng",
+                "name": "Casey",
+                "department": "product",
                 "preferences": {"note": "tone=warm"},
             },
         },
-        {"thought": "finish", "next_node": None, "args": None},
+        {
+            "thought": "finish",
+            "next_node": None,
+            "args": {"answer": "Hello Casey! I will keep things tone=warm."},
+        },
     ]
 
     return ReactPlanner(

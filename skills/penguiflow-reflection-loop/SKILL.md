@@ -85,8 +85,8 @@ That can be the healthy case:
 
 - `docs/planner/reflection-loop.md` - shareable external-facing guide with code examples.
 - `tests/test_react_reflection.py` - best source for expected runtime behavior.
-- `examples/planner_enterprise_agent_v2/main.py` - production-style planner wiring.
-- `examples/planner_enterprise_agent_v2/config.py` - env-driven reflection settings.
+- `examples/planner_enterprise_agent/main.py` - production-style planner wiring.
+- `examples/planner_enterprise_agent/config.py` - env-driven reflection settings.
 - `penguiflow/planner/react_runtime.py` - reflection loop control flow.
 - `penguiflow/planner/llm.py` - critique, revision, and clarification generation.
 

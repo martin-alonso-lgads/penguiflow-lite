@@ -371,7 +371,7 @@ Check one or more of:
 ## Reference implementations in this repo
 
 - `tests/test_react_reflection.py` - pass, revise, fail-to-clarification, budget, and event coverage
-- `examples/planner_enterprise_agent_v2/main.py` - env-driven production pattern
-- `examples/planner_enterprise_agent_v2/config.py` - reflection-oriented config surface
+- `examples/planner_enterprise_agent/main.py` - env-driven production pattern
+- `examples/planner_enterprise_agent/config.py` - reflection-oriented config surface
 - `penguiflow/planner/react_runtime.py` - reflection loop runtime
 - `penguiflow/planner/llm.py` - critique, revision, and clarification helpers

@@ -21,8 +21,8 @@ from collections import defaultdict
 from typing import Any, assert_never
 from uuid import uuid4
 
-from examples.planner_enterprise_agent_v2.config import AgentConfig
-from examples.planner_enterprise_agent_v2.nodes import (
+from examples.planner_enterprise_agent.config import AgentConfig
+from examples.planner_enterprise_agent.nodes import (
     DocumentRouteDecision,
     FinalAnswer,
     StatusUpdate,
@@ -35,7 +35,7 @@ from examples.planner_enterprise_agent_v2.nodes import (
     run_diagnostics,  # Pattern B: Individual node
     triage_query,
 )
-from examples.planner_enterprise_agent_v2.telemetry import AgentTelemetry
+from examples.planner_enterprise_agent.telemetry import AgentTelemetry
 from penguiflow.catalog import build_catalog
 from penguiflow.node import Node
 from penguiflow.planner import (
@@ -168,7 +168,7 @@ class EnterpriseAgentOrchestrator:
         registry = ModelRegistry()
 
         # Import types
-        from examples.planner_enterprise_agent_v2.nodes import (
+        from examples.planner_enterprise_agent.nodes import (
             BugState,
             RouteDecision,
         )
@@ -196,10 +196,10 @@ class EnterpriseAgentOrchestrator:
         return registry
 
     def _build_planner(self) -> ReactPlanner:
-        """Build the ReactPlanner from the enterprise (v2) configuration.
+        """Build the ReactPlanner from the enterprise configuration.
 
-        V2 Enhancements:
-        - Reflection loop for answer quality assurance (FLAGSHIP)
+        Planner features:
+        - Reflection loop for answer quality assurance
         - Tool policy for runtime access control
         - Planning hints for workflow constraints
         - State store for durable pause/resume
@@ -231,7 +231,7 @@ class EnterpriseAgentOrchestrator:
                 extra={"model": self.config.llm_model},
             )
 
-        # V2: Configure reflection loop (FLAGSHIP FEATURE)
+        # Configure reflection loop
         reflection_config = None
         reflection_llm = None
         if self.config.reflection_enabled:
@@ -269,7 +269,7 @@ class EnterpriseAgentOrchestrator:
                 },
             )
 
-        # V2: Configure tool policy for runtime access control
+        # Configure tool policy for runtime access control
         tool_policy = None
         if self.config.tool_policy_enabled:
             tool_policy = ToolPolicy(
@@ -290,7 +290,7 @@ class EnterpriseAgentOrchestrator:
                 },
             )
 
-        # V2: Configure planning hints for workflow constraints
+        # Configure planning hints for workflow constraints
         planning_hints = None
         if self.config.planning_hints_enabled and self.config.planning_hints:
             planning_hints = self.config.planning_hints
@@ -299,7 +299,7 @@ class EnterpriseAgentOrchestrator:
                 extra={"hints": planning_hints},
             )
 
-        # V2: Configure state store for durable pause/resume
+        # Configure state store for durable pause/resume
         state_store = None
         if self.config.state_store_enabled:
             # In production, use Redis, SQLite, or other durable backend For
@@ -350,7 +350,7 @@ When context is provided, use it appropriately to enhance your responses.
             repair_attempts=self.config.planner_repair_attempts,
             auto_seq_enabled=True,
             auto_seq_execute=True,
-            # V2: New features
+            # Reflection, tool policy, planning hints and state store
             reflection_config=reflection_config,
             reflection_llm=reflection_llm,
             tool_policy=tool_policy,
@@ -361,7 +361,7 @@ When context is provided, use it appropriately to enhance your responses.
         )
 
         self.telemetry.logger.info(
-            "planner_configured_v2",
+            "planner_configured",
             extra={
                 "model": self.config.llm_model,
                 "max_iters": self.config.planner_max_iters,

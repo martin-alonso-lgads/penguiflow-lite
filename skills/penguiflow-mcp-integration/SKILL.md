@@ -97,7 +97,7 @@ Pass `tool_node.get_tools()` (a list of `NodeSpec`) into your planner catalog. T
 - **Cross-tenant token reuse** — use composite key `tenant:user_id` in your TokenStore.
 
 ## Worked examples
-- `examples/toolnode_presets/flow.py` and `examples/toolnode_utcp_echo/flow.py` — runnable wiring patterns. Inspect the directory for preset templates.
+- `examples/toolnode_presets/flow.py` — runnable preset wiring pattern. Inspect the directory for preset templates.
 
 ## References (load only as needed)
 - `references/external-tool-config.md` — every `ExternalToolConfig` field, transport semantics, resilience knobs, namespacing rules.

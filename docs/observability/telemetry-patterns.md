@@ -96,7 +96,7 @@ This maps to remediation playbooks:
 
 ```bash
 uv run python examples/streaming_llm/stream_answer.py
-uv run python examples/planner_enterprise_agent_v2/main.py
+uv run python examples/planner_enterprise_agent/main.py
 ```
 
 ## Troubleshooting checklist

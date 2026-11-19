@@ -50,9 +50,9 @@ def _env_choice(
 
 @dataclass(frozen=True)
 class AgentConfig:
-    """Production-grade agent configuration (v2 - Enhanced).
+    """Production-grade agent configuration.
 
-    This v2 configuration demonstrates ALL ReactPlanner capabilities including
+    This configuration demonstrates ALL ReactPlanner capabilities including
     reflection loops, tool policies, planning hints, and advanced features.
 
     All settings can be configured via environment variables with sensible
@@ -77,24 +77,24 @@ class AgentConfig:
     # Summarizer LLM (cheaper model for trajectory compression)
     summarizer_model: str | None
 
-    # Reflection Configuration (v2 FLAGSHIP FEATURE)
+    # Reflection Configuration
     reflection_enabled: bool
     reflection_llm: str | None
     reflection_quality_threshold: float
     reflection_max_revisions: int
     reflection_use_separate_llm: bool
 
-    # Tool Policy Configuration (v2 NEW)
+    # Tool Policy Configuration
     tool_policy_enabled: bool
     tool_policy_allowed_tools: set[str] | None
     tool_policy_denied_tools: set[str]
     tool_policy_require_tags: set[str]
 
-    # Planning Hints Configuration (v2 NEW)
+    # Planning Hints Configuration
     planning_hints_enabled: bool
     planning_hints: dict[str, object] | None
 
-    # State Store Configuration (v2 NEW)
+    # State Store Configuration
     state_store_enabled: bool
     state_store_backend: StateStoreBackend | None
 
@@ -125,7 +125,7 @@ class AgentConfig:
         - ENABLE_TELEMETRY (default: true)
         - LOG_LEVEL (default: INFO)
 
-        V2 New Options:
+        Planner feature options:
         - REFLECTION_ENABLED (default: true) - Enable answer quality loop
         - REFLECTION_LLM (default: gpt-4o-mini) - Separate LLM for critique
         - TOOL_POLICY_ENABLED (default: false) - Enable tool filtering
@@ -158,7 +158,7 @@ class AgentConfig:
             ),
             # Summarizer
             summarizer_model=os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini"),
-            # Reflection (v2 FLAGSHIP)
+            # Reflection
             reflection_enabled=os.getenv("REFLECTION_ENABLED", "true").lower()
             == "true",
             reflection_llm=os.getenv("REFLECTION_LLM", "gpt-4o-mini"),
@@ -172,7 +172,7 @@ class AgentConfig:
                 "REFLECTION_USE_SEPARATE_LLM", "false"
             ).lower()
             == "true",
-            # Tool Policy (v2)
+            # Tool Policy
             tool_policy_enabled=os.getenv(
                 "TOOL_POLICY_ENABLED", "false"
             ).lower()
@@ -186,13 +186,13 @@ class AgentConfig:
             tool_policy_require_tags=_parse_tool_set(
                 os.getenv("TOOL_POLICY_REQUIRE_TAGS", "")
             ),
-            # Planning Hints (v2)
+            # Planning Hints
             planning_hints_enabled=os.getenv(
                 "PLANNING_HINTS_ENABLED", "false"
             ).lower()
             == "true",
             planning_hints=_parse_planning_hints(os.getenv("PLANNING_HINTS")),
-            # State Store (v2)
+            # State Store
             state_store_enabled=os.getenv(
                 "STATE_STORE_ENABLED", "false"
             ).lower()
@@ -215,7 +215,7 @@ class AgentConfig:
             environment=_env_choice(
                 "AGENT_ENVIRONMENT", "development", _ENVIRONMENTS
             ),
-            agent_name=os.getenv("AGENT_NAME", "enterprise_agent_v2"),
+            agent_name=os.getenv("AGENT_NAME", "enterprise_agent"),
         )
 
 

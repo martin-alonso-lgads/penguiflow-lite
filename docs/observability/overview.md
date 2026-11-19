@@ -162,7 +162,7 @@ This is the closest thing to a "wire the whole system" reference pattern that ex
 
 You can see these patterns in:
 
-- `examples/planner_enterprise_agent_v2/telemetry.py`
+- `examples/planner_enterprise_agent/telemetry.py`
 
 Minimal combined example:
 

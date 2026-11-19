@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 from typing_extensions import override
 
+from examples.guardrails.scope_classifier.rule import ScopeClassifierRule
 from penguiflow.catalog import build_catalog
 from penguiflow.node import Node
 from penguiflow.planner import ReactPlanner
@@ -21,8 +22,6 @@ from penguiflow.planner.guardrails import (
 from penguiflow.planner.models import JSONLLMClient
 from penguiflow.registry import ModelRegistry
 from penguiflow.steering import InMemoryGuardInbox
-
-from .rule import ScopeClassifierRule
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -65,9 +64,7 @@ async def main() -> None:
     rule_registry = RuleRegistry()
     rule_registry.register(
         ScopeClassifierRule(
-            model_path=Path(
-                "examples/guardrails/scope_classifier/scope_model.joblib"
-            )
+            model_path=Path(__file__).with_name("scope_model.joblib")
         )
     )
 
