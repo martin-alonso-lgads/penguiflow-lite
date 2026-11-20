@@ -1,6 +1,6 @@
 """Guardrail modules for the React planner."""
 
-from .async_eval import AsyncRuleEvaluator
+from .async_eval import AsyncRuleEvaluationError, AsyncRuleEvaluator
 from .config import GuardrailPolicyPack, apply_policy_config, load_policy_pack
 from .context import (
     ContextSnapshotBuilder,
@@ -33,9 +33,8 @@ from .rules import (
 )
 
 __all__ = [
+    "AsyncRuleEvaluationError",
     "AsyncRuleEvaluator",
-    "GuardrailPolicyPack",
-    "apply_policy_config",
     "ContextSnapshotBuilder",
     "ContextSnapshotV1",
     "DecisionPolicy",
@@ -47,8 +46,11 @@ __all__ = [
     "GuardrailDecision",
     "GuardrailEvent",
     "GuardrailGateway",
+    "GuardrailPolicyPack",
     "GuardrailRule",
     "GuardrailSeverity",
+    "InjectionPatternRule",
+    "JailbreakIntent",
     "PauseSpec",
     "RedactionSpec",
     "RetrySpec",
@@ -58,11 +60,10 @@ __all__ = [
     "RuleRegistry",
     "SecretRedactionRule",
     "StopSpec",
+    "ToolAllowlistRule",
     "ToolRiskInfo",
     "ToolRiskTier",
-    "ToolAllowlistRule",
     "TrustBoundary",
-    "InjectionPatternRule",
-    "JailbreakIntent",
+    "apply_policy_config",
     "load_policy_pack",
 ]

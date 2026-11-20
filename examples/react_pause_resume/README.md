@@ -1,6 +1,6 @@
 # React Planner — Pause & Resume Demo
 
-This example showcases the Phase B features of the PenguiFlow ReactPlanner:
+This example showcases these PenguiFlow ReactPlanner features:
 
 - **Trajectory summarisation** keeps prompts within a small token budget.
 - **Pause/Resume** uses the planner's `PlannerPause` contract to wait for a human approval step.

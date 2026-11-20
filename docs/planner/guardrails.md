@@ -34,11 +34,13 @@ Guardrails are **off by default**. Enable them by passing a gateway at construct
 
 When enabled, the planner can enforce these actions:
 
-- `STOP`: terminate (or force-safe finish) with a user-safe message
-- `PAUSE`: trigger HITL approval (planner pauses with `reason="approval_required"`)
+- `STOP`: end the run with a user-safe message. Every STOP (before the LLM call, on a stream chunk or on a tool) finishes with `reason="no_path"`, the message as `raw_answer` and the decision in `metadata["guardrail"]`
+- `PAUSE`: trigger HITL approval at `tool_call_start` or `tool_call_result` (`run()` returns `PlannerPause(reason="approval_required")`). On a planner built with `pause_enabled=False` it becomes a STOP: `metadata["guardrail"]` has `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`, and `raw_answer` is the `PauseSpec` prompt (or a default message)
 - `RETRY`: re-run the LLM call with corrective instructions
-- `REDACT`: redact text from streamed output and tool results
+- `REDACT`: redact text from streamed output and tool results. If a tool result is no longer JSON after redaction, the LLM sees `{"result": "<redacted text>"}`, never the original
 - `ALLOW`: do nothing
+
+Guardrails apply the same way in native tool-calling mode (`tool_call_mode="native"`).
 
 ### Guardrail events and decisions
 
@@ -59,31 +61,36 @@ Decisions include:
 - optional action-specific payloads:
   - `redactions: tuple[RedactionSpec, ...]`
   - `retry: RetrySpec(max_attempts, corrective_message)`
-  - `pause: PauseSpec(scope, approver_roles, prompt, timeout_s)`
+  - `pause: PauseSpec(scope, approver_roles, prompt, timeout_s)`, copied into `PlannerPause.payload["guardrail"]["pause"]` (`timeout_s` is informational; the planner does not enforce it)
   - `stop: StopSpec(error_code, user_message, internal_reason)`
 
 ### Modes: `shadow` vs `enforce`
 
 Guardrail gateway config controls enforcement:
 
-- `GatewayConfig(mode="shadow")`: evaluate and log decisions, but do not block execution
+- `GatewayConfig(mode="shadow")`: evaluate every event (streamed chunks included) and log decisions, but never change a chunk or the run
 - `GatewayConfig(mode="enforce")`: apply STOP/PAUSE/RETRY/REDACT behavior
 
-!!! tip
-    Start in `shadow` mode in production to measure rule hit rates, then roll to `enforce`.
+In both modes the planner logs every rule decision as `guardrail_decision` on the `penguiflow.planner` logger, with `event_type`, `run_id`, `action`, `rule_id`, `reason` and `enforced`. In shadow mode, a decision other than `ALLOW` is also logged as `guardrail_decision_shadow`.
+
+> [!TIP]
+> Start in `shadow` mode in production to measure rule hit rates, then roll to `enforce`.
 
 ### Sync vs async rules (latency control)
 
 Rules are classified by cost:
 
 - **FAST** rules are evaluated synchronously (on the request path)
-- **DEEP** rules can be evaluated asynchronously via a `SteeringGuardInbox`
+- **DEEP** rules are evaluated asynchronously via a `SteeringGuardInbox` (for example `InMemoryGuardInbox(AsyncRuleEvaluator(registry))`)
+
+Every DEEP rule registered for the event type runs. The gateway waits for them only as long as the risk router says (`async_wait_ms`; `DefaultRiskRouter` derives it from the tool risk tier and context signals). `DefaultRiskRouter(llm_before_wait_ms=...)` (default `0`) sets the least wait before each LLM call; with the default, a DEEP decision on the user input arrives late. A DEEP `STOP` that arrives after the wait is applied at the same run's next guardrail check; late `PAUSE`, `REDACT` and `RETRY` decisions are dropped. Each `run()` has its own guardrail run id (kept across pause and resume), so neither a late decision nor a strike (the context snapshot's `previous_violations`) reaches another run.
 
 Gateway options you will tune:
 
 - `sync_timeout_ms` (default 15ms)
 - `sync_parallel` (run sync rules concurrently)
-- `sync_fail_open` / `async_fail_open` (availability vs safety tradeoff)
+- `sync_fail_open` (a sync rule that errors or times out: skip it, or STOP)
+- `async_fail_open` (the guard inbox fails — `submit`/`await_response` raises, or a response reports an `error`, as it does when a DEEP rule raises: log it and keep the other decisions, or STOP with `GUARDRAIL_ASYNC_ERROR`). Async timeouts are decided by the risk router's `on_timeout`, not by this flag.
 
 ### Observation size “guardrail” (reliability safety net)
 
@@ -118,18 +125,19 @@ Tradeoff guidance:
 
 **Symptoms**
 
-- planner finishes early with a generic safe message, or tool calls return `guardrail_stop:*`
+- planner finishes early (`reason="no_path"`) with a generic safe message, or tool calls return `guardrail_stop:*`
 
 **Fix**
 
-- check which rule triggered (`rule_id`) and whether you are in `shadow` or `enforce`
+- check which rule triggered (`metadata["guardrail"]["rule_id"]`) and whether you are in `shadow` or `enforce`
+- `stop.error_code="GUARDRAIL_PAUSE_DISABLED"` means a PAUSE fired on a planner with `pause_enabled=False`
 - verify your allowlist/denylist config (especially when catalogs are tenant-scoped)
 
 ### Redaction doesn’t apply to streamed output
 
 **Likely causes**
 
-- `stream_final_response=False` (no LLM streaming path)
+- `stream_final_response=False` (no LLM streaming path), or no `event_callback`
 - guardrails aren’t enabled (no `guardrail_gateway`)
 - gateway is in `shadow` mode (decision logged but not applied)
 
@@ -148,13 +156,15 @@ Tradeoff guidance:
 
 Recommended signals:
 
-- log guardrail decisions (action, rule_id, severity, confidence) **without raw content**
+- count the planner's `guardrail_decision` log records (INFO; `event_type`, `run_id`, `action`, `rule_id`, `reason`, `enforced`, no raw content) by rule and action; no record is written when no rule decided
+- watch the WARNING records `guardrail_async_error`, `guardrail_async_submit_failed` and `guardrail_required_rule_missing` (DEEP rule or inbox failures, and router-requested rules that aren't registered)
 - record `PlannerEvent(event_type="guardrail_retry")` counts (retries can hide a failing model/prompt)
 - alert on repeated `guardrail_stop:*` outcomes for a tenant (misconfig or abuse)
 
 Useful places to look:
 
-- `PlannerEvent(event_type="tool_call_result").extra["result_json"]` may include a `failure.guardrail` payload on STOP/PAUSE.
+- `PlannerFinish.metadata["guardrail"]` holds the decision of any STOP that ended the run.
+- `PlannerEvent(event_type="tool_call_result").extra["result_json"]` includes a `failure.guardrail` payload on a tool STOP. A guardrail PAUSE emits no tool result; its decision is in `PlannerPause.payload["guardrail"]`.
 - streamed output seen in `PlannerEvent(event_type="llm_stream_chunk")` is already post-redaction (when enforced).
 
 See **[Planner observability](observability.md)**.
@@ -178,5 +188,6 @@ Guardrails examples exist under `examples/guardrails/`:
 - Is `GatewayConfig.mode` set to `enforce` when you expect blocking/redaction?
 - Do your rules list the correct `supports_event_types` for the events you care about?
 - Are timeouts too aggressive (`sync_timeout_ms`) causing unexpected STOP (fail-closed) behavior?
+- Does a DEEP rule on `llm_before` get a wait (`DefaultRiskRouter(llm_before_wait_ms=...)`)? Without one, only its STOP applies, at the run's next check.
 - Are you confusing policy guardrails with the observation clamp (`ObservationGuardrailConfig`)?
 

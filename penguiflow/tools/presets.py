@@ -3,7 +3,8 @@
 IMPORTANT: These are convenience presets for local development and learning.
 They use `npx -y` which requires Node.js to be installed on your system.
 
-For production deployments or containerized environments, consider these alternatives:
+For production deployments or containerized environments, consider these
+alternatives:
 
 1. **Run MCP servers as separate services**: Deploy MCP servers as standalone
    processes or containers and connect via SSE/HTTP URLs instead of stdio.
@@ -11,15 +12,24 @@ For production deployments or containerized environments, consider these alterna
 2. **Use UTCP transport**: For direct API access without MCP protocol overhead,
    configure tools to use UTCP transport (see UTCP_INTEGRATION_ANALYSIS.md).
 
-3. **Include Node.js in container**: If you need to use these presets in Docker,
-   ensure your container image includes Node.js (e.g., use node:alpine as base).
+3. **Include Node.js in container**: If you need to use these presets in
+   Docker, ensure your container image includes Node.js (e.g., use
+   node:alpine as base).
+
+Stdio servers get no HTTP headers, so presets pass credentials to the
+subprocess through ``env`` (``${VAR}`` placeholders are read from the host
+environment) with ``auth_type=NONE``. Per-user OAuth (``OAUTH2_USER``) needs
+an MCP server reached over a URL.
+
+The github, slack and brave-search presets run the reference servers from
+``@modelcontextprotocol``, which npm marks as deprecated.
 
 Example for production:
     # Instead of using the preset
     config = ExternalToolConfig(
         name="github",
         transport=TransportType.MCP,
-        connection="http://mcp-github-service:8080/sse",  # Separate service
+        connection="http://mcp-github-service:8080/mcp",  # Separate service
         auth_type=AuthType.OAUTH2_USER,
     )
 """
@@ -39,14 +49,20 @@ from .config import (
 )
 
 POPULAR_MCP_SERVERS = {
-    # NOTE: All presets use `npx -y` for quick local development.
-    # These require Node.js installed. For production, see module docstring above.
+    # NOTE: All presets use `npx -y` for quick local development. These require
+    # Node.js installed. For production, see module docstring above.
     "github": ExternalToolConfig(
         name="github",
         transport=TransportType.MCP,
         connection="npx -y @modelcontextprotocol/server-github",
-        auth_type=AuthType.OAUTH2_USER,
-        description="GitHub repositories, issues, pull requests",
+        env={
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+        },
+        auth_type=AuthType.NONE,  # Token passed via env, not auth_config
+        description=(
+            "GitHub repositories, issues, pull requests (requires "
+            "GITHUB_PERSONAL_ACCESS_TOKEN env var)"
+        ),
     ),
     "filesystem": ExternalToolConfig(
         name="filesystem",
@@ -67,15 +83,15 @@ POPULAR_MCP_SERVERS = {
         name="slack",
         transport=TransportType.MCP,
         connection="npx -y @modelcontextprotocol/server-slack",
-        auth_type=AuthType.OAUTH2_USER,
-        description="Slack channels, messages, users",
-    ),
-    "google-drive": ExternalToolConfig(
-        name="google-drive",
-        transport=TransportType.MCP,
-        connection="npx -y @anthropic/mcp-server-google-drive",
-        auth_type=AuthType.OAUTH2_USER,
-        description="Google Drive files and folders",
+        env={
+            "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}",
+            "SLACK_TEAM_ID": "${SLACK_TEAM_ID}",
+        },
+        auth_type=AuthType.NONE,  # Token passed via env, not auth_config
+        description=(
+            "Slack channels, messages, users (requires SLACK_BOT_TOKEN and "
+            "SLACK_TEAM_ID env vars)"
+        ),
     ),
     "duckduckgo": ExternalToolConfig(
         name="duckduckgo",
@@ -87,10 +103,12 @@ POPULAR_MCP_SERVERS = {
     "brave-search": ExternalToolConfig(
         name="brave-search",
         transport=TransportType.MCP,
-        connection="npx -y @anthropic/mcp-server-brave-search",
+        connection="npx -y @modelcontextprotocol/server-brave-search",
         env={"BRAVE_API_KEY": "${BRAVE_API_KEY}"},
         auth_type=AuthType.NONE,  # Key passed via env, not auth_config
-        description="Web search via Brave Search API (requires BRAVE_API_KEY env var)",
+        description=(
+            "Web search via Brave Search API (requires BRAVE_API_KEY env var)"
+        ),
     ),
     # NOTE: Redis MCP server is Python-based (uvx), not Node.js (npx)
     "redis": ExternalToolConfig(
@@ -122,7 +140,11 @@ def get_preset(name: str) -> ExternalToolConfig:
         ValueError: If ``name`` is not a known preset.
     """
     if name not in POPULAR_MCP_SERVERS:
-        raise ValueError(f"Unknown preset: {name}. Available: {list(POPULAR_MCP_SERVERS.keys())}")
+        msg = (
+            f"Unknown preset: {name}. Available: "
+            f"{list(POPULAR_MCP_SERVERS.keys())}"
+        )
+        raise ValueError(msg)
     return POPULAR_MCP_SERVERS[name]
 
 
@@ -140,7 +162,6 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=0,  # Never auto-read large resources
         inline_text_if_under_chars=5_000,
         cache_reads_to_artifacts=True,
     ),
@@ -150,7 +171,10 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="pdf",
                 mime_type="application/pdf",
-                summary_template="Downloaded workbook '{name}' as PDF ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Downloaded workbook '{name}' as PDF ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
         "get_view_as_pdf": [
@@ -158,7 +182,10 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="pdf_data",
                 content_type="pdf",
                 mime_type="application/pdf",
-                summary_template="Exported view '{view_name}' as PDF ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Exported view '{view_name}' as PDF ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
         "get_view_as_image": [
@@ -166,7 +193,10 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="image_data",
                 content_type="image",
                 mime_type="image/png",
-                summary_template="Exported view '{view_name}' as image ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Exported view '{view_name}' as image ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
         "export_dashboard": [
@@ -174,11 +204,17 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="pdf",
                 mime_type="application/pdf",
-                summary_template="Exported dashboard '{name}' ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Exported dashboard '{name}' ({size} bytes). Artifact "
+                    "ID: {artifact_id}"
+                ),
             ),
         ],
     },
-    default_binary_summary="Tableau content stored as artifact ({mime_type}, {size} bytes). Artifact ID: {artifact_id}",
+    default_binary_summary=(
+        "Tableau content stored as artifact ({mime_type}, {size} bytes). "
+        "Artifact ID: {artifact_id}"
+    ),
 )
 
 
@@ -192,7 +228,6 @@ GITHUB_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=50_000,  # Auto-read small files
         inline_text_if_under_chars=10_000,
         cache_reads_to_artifacts=True,
     ),
@@ -202,7 +237,10 @@ GITHUB_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="binary",
                 mime_type=None,  # Auto-detect
-                summary_template="Retrieved file '{path}' ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Retrieved file '{path}' ({size} bytes). Artifact ID: "
+                    "{artifact_id}"
+                ),
             ),
         ],
         "download_artifact": [
@@ -210,7 +248,10 @@ GITHUB_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="data",
                 content_type="binary",
                 mime_type="application/zip",
-                summary_template="Downloaded artifact '{name}' ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Downloaded artifact '{name}' ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
         "get_release_asset": [
@@ -218,11 +259,17 @@ GITHUB_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="binary",
                 mime_type=None,
-                summary_template="Downloaded release asset '{name}' ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Downloaded release asset '{name}' ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
     },
-    default_binary_summary="GitHub content stored as artifact ({mime_type}, {size} bytes). Artifact ID: {artifact_id}",
+    default_binary_summary=(
+        "GitHub content stored as artifact ({mime_type}, {size} bytes). "
+        "Artifact ID: {artifact_id}"
+    ),
 )
 
 
@@ -236,7 +283,6 @@ FILESYSTEM_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=100_000,  # Auto-read small files
         inline_text_if_under_chars=50_000,
         cache_reads_to_artifacts=True,
     ),
@@ -246,12 +292,21 @@ FILESYSTEM_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="binary",
                 mime_type=None,  # Auto-detect from filename
-                summary_template="Read file '{path}' ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Read file '{path}' ({size} bytes). Artifact ID: "
+                    "{artifact_id}"
+                ),
             ),
         ],
     },
-    default_binary_summary="File content stored as artifact ({mime_type}, {size} bytes). Artifact ID: {artifact_id}",
-    default_text_summary="Large text file stored as artifact ({size} chars). Artifact ID: {artifact_id}",
+    default_binary_summary=(
+        "File content stored as artifact ({mime_type}, {size} bytes). "
+        "Artifact ID: {artifact_id}"
+    ),
+    default_text_summary=(
+        "Large text file stored as artifact ({size} chars). Artifact ID: "
+        "{artifact_id}"
+    ),
 )
 
 
@@ -265,7 +320,6 @@ GOOGLE_DRIVE_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=100_000,
         inline_text_if_under_chars=10_000,
         cache_reads_to_artifacts=True,
     ),
@@ -275,7 +329,10 @@ GOOGLE_DRIVE_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="binary",
                 mime_type=None,
-                summary_template="Downloaded '{name}' from Google Drive ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Downloaded '{name}' from Google Drive ({size} "
+                    "bytes). Artifact ID: {artifact_id}"
+                ),
             ),
         ],
         "export_document": [
@@ -283,7 +340,10 @@ GOOGLE_DRIVE_ARTIFACT_PRESET = ArtifactExtractionConfig(
                 field_path="content",
                 content_type="pdf",
                 mime_type="application/pdf",
-                summary_template="Exported document '{name}' as PDF ({size} bytes). Artifact ID: {artifact_id}",
+                summary_template=(
+                    "Exported document '{name}' as PDF ({size} bytes). "
+                    "Artifact ID: {artifact_id}"
+                ),
             ),
         ],
     },
@@ -319,21 +379,21 @@ def get_artifact_preset(name: str) -> ArtifactExtractionConfig:
         from penguiflow.tools.presets import get_artifact_preset
 
         config = ExternalToolConfig(
-            name="tableau",
-            transport=TransportType.MCP,
+            name="tableau", transport=TransportType.MCP,
             connection="http://tableau-mcp:8080/sse",
             artifact_extraction=get_artifact_preset("tableau"),
         )
     """
     if name not in ARTIFACT_PRESETS:
         available = ", ".join(sorted(ARTIFACT_PRESETS.keys()))
-        raise KeyError(f"Unknown artifact preset '{name}'. Available: {available}")
+        msg = f"Unknown artifact preset '{name}'. Available: {available}"
+        raise KeyError(msg)
     return ARTIFACT_PRESETS[name]
 
 
 def get_artifact_preset_with_overrides(
     name: str,
-    **overrides: Any,
+    **overrides: object,
 ) -> ArtifactExtractionConfig:
     """Get an artifact preset with field overrides.
 
@@ -346,8 +406,7 @@ def get_artifact_preset_with_overrides(
 
     Example:
         config = get_artifact_preset_with_overrides(
-            "tableau",
-            max_inline_size=2000,
+            "tableau", max_inline_size=2000,
         )
     """
     base = get_artifact_preset(name)
@@ -424,18 +483,18 @@ def get_artifact_preset_info(name: str) -> dict[str, Any]:
 
 
 __all__ = [
-    # Connection presets
-    "POPULAR_MCP_SERVERS",
-    "get_preset",
     # Artifact extraction presets
     "ARTIFACT_PRESETS",
-    "TABLEAU_ARTIFACT_PRESET",
-    "GITHUB_ARTIFACT_PRESET",
     "FILESYSTEM_ARTIFACT_PRESET",
+    "GITHUB_ARTIFACT_PRESET",
     "GOOGLE_DRIVE_ARTIFACT_PRESET",
+    # Connection presets
+    "POPULAR_MCP_SERVERS",
+    "TABLEAU_ARTIFACT_PRESET",
     "get_artifact_preset",
-    "get_artifact_preset_with_overrides",
-    "merge_artifact_preset",
-    "list_artifact_presets",
     "get_artifact_preset_info",
+    "get_artifact_preset_with_overrides",
+    "get_preset",
+    "list_artifact_presets",
+    "merge_artifact_preset",
 ]

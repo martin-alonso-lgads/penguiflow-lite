@@ -1,13 +1,13 @@
 """Enterprise agent example with ReactPlanner.
 
-This package provides a gold-standard implementation for production
-agent deployments using PenguiFlow's ReactPlanner with comprehensive
-observability, error handling, and configuration management.
+This package provides a gold-standard implementation for production agent
+deployments using PenguiFlow's ReactPlanner with comprehensive observability,
+error handling, and configuration management.
 
 Public API:
     - EnterpriseAgentOrchestrator: Main agent orchestrator
     - AgentConfig: Type-safe configuration
-    - AgentTelemetry: Observability middleware
+    - AgentTelemetry: Planner event telemetry
 
 Example:
     >>> from examples.planner_enterprise_agent import (

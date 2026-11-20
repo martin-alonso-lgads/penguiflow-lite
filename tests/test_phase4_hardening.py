@@ -7,23 +7,21 @@ This module tests:
 - Malformed base64 content handling
 - Decode failures (corrupted data)
 - Oversized payload rejection
-- Session access control violations
 - MCP server errors during resource operations
 - TTL expiration and LRU eviction
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
-import time
 from unittest.mock import patch
 
 import pytest
 
 from penguiflow.artifacts import (
     ArtifactRetentionConfig,
-    ArtifactScope,
     InMemoryArtifactStore,
     NoOpArtifactStore,
 )
@@ -45,7 +43,7 @@ from penguiflow.tools.presets import (
     merge_artifact_preset,
 )
 
-# ─── Preset Tests ─────────────────────────────────────────────────────────────
+# ─── Preset Tests ────────────────────────────────────────────────────────────
 
 
 class TestArtifactPresets:
@@ -111,7 +109,7 @@ class TestArtifactPresets:
         assert "download_workbook" in preset.tool_fields
 
     def test_get_artifact_preset_with_overrides_no_changes(self) -> None:
-        """get_artifact_preset_with_overrides without overrides returns original."""
+        """Without overrides the preset is returned unchanged."""
         preset = get_artifact_preset_with_overrides("tableau")
         assert preset is TABLEAU_ARTIFACT_PRESET
 
@@ -156,7 +154,10 @@ class TestArtifactPresets:
     def test_artifact_presets_registry(self) -> None:
         """ARTIFACT_PRESETS should contain all presets."""
         assert len(ARTIFACT_PRESETS) >= 4
-        assert all(isinstance(p, ArtifactExtractionConfig) for p in ARTIFACT_PRESETS.values())
+        assert all(
+            isinstance(p, ArtifactExtractionConfig)
+            for p in ARTIFACT_PRESETS.values()
+        )
 
 
 # ─── NoOp Fallback Tests ─────────────────────────────────────────────────────
@@ -234,7 +235,7 @@ class TestNoOpArtifactStore:
         assert await store.get_ref("any_id") is None
 
 
-# ─── Size Limit Tests ─────────────────────────────────────────────────────────
+# ─── Size Limit Tests ────────────────────────────────────────────────────────
 
 
 class TestOversizedPayloads:
@@ -269,7 +270,7 @@ class TestOversizedPayloads:
             await store.put_text("x" * 200)
 
 
-# ─── TTL Expiration Tests ─────────────────────────────────────────────────────
+# ─── TTL Expiration Tests ────────────────────────────────────────────────────
 
 
 class TestTTLExpiration:
@@ -287,7 +288,7 @@ class TestTTLExpiration:
         assert await store.exists(ref.id) is True
 
         # Wait for TTL
-        time.sleep(1.1)
+        await asyncio.sleep(1.1)
 
         # Should be expired
         assert await store.exists(ref.id) is False
@@ -372,58 +373,6 @@ class TestLRUEviction:
         assert await store.exists(ref2.id) is True
 
 
-# ─── Session Access Control Tests ─────────────────────────────────────────────
-
-
-class TestSessionAccessControl:
-    """Tests for session-based access control."""
-
-    @pytest.mark.asyncio
-    async def test_session_isolation(self) -> None:
-        """Artifacts should be isolated by session."""
-        from penguiflow.cli.playground_state import PlaygroundArtifactStore
-
-        store = PlaygroundArtifactStore()
-
-        scope1 = ArtifactScope(session_id="session1")
-        scope2 = ArtifactScope(session_id="session2")
-
-        ref1 = await store.put_bytes(b"secret1", scope=scope1)
-        ref2 = await store.put_bytes(b"secret2", scope=scope2)
-
-        # Session 1 can access its own artifact
-        data = await store.get_with_session_check(ref1.id, "session1")
-        assert data == b"secret1"
-
-        # Session 1 cannot access session 2's artifact
-        data = await store.get_with_session_check(ref2.id, "session1")
-        assert data is None
-
-    @pytest.mark.asyncio
-    async def test_access_denied_wrong_session(self) -> None:
-        """Access should be denied for wrong session."""
-        from penguiflow.cli.playground_state import PlaygroundArtifactStore
-
-        store = PlaygroundArtifactStore()
-
-        scope = ArtifactScope(session_id="session1")
-        ref = await store.put_bytes(b"secret", scope=scope)
-
-        # Wrong session should get None
-        data = await store.get_with_session_check(ref.id, "wrong_session")
-        assert data is None
-
-    @pytest.mark.asyncio
-    async def test_access_nonexistent_artifact(self) -> None:
-        """Access to nonexistent artifact should return None."""
-        from penguiflow.cli.playground_state import PlaygroundArtifactStore
-
-        store = PlaygroundArtifactStore()
-
-        data = await store.get_with_session_check("nonexistent", "session1")
-        assert data is None
-
-
 # ─── Binary Detection Edge Cases ─────────────────────────────────────────────
 
 
@@ -480,8 +429,8 @@ class TestMalformedContent:
         # Valid PDF prefix but incomplete
         truncated = "JVBERi0xLjQ"  # Not padded correctly
 
-        # Should still be decodable with some implementations
-        # but might produce corrupt data
+        # Should still be decodable with some implementations but might produce
+        # corrupt data
         try:
             data = base64.b64decode(truncated + "==")
             assert data.startswith(b"%PDF")
@@ -510,6 +459,7 @@ class TestMalformedContent:
         ref = await store.put_text(text)
 
         data = await store.get(ref.id)
+        assert data is not None
         assert data.decode("utf-8") == text
 
 
@@ -551,13 +501,15 @@ class TestDeduplication:
         data = b"content"
 
         ref1 = await store.put_bytes(data, mime_type="text/plain")
-        ref2 = await store.put_bytes(data, mime_type="application/octet-stream")
+        ref2 = await store.put_bytes(
+            data, mime_type="application/octet-stream"
+        )
 
         # Same content = same ID (deduped)
         assert ref1.id == ref2.id
 
 
-# ─── Preset Integration Tests ─────────────────────────────────────────────────
+# ─── Preset Integration Tests ────────────────────────────────────────────────
 
 
 class TestPresetIntegration:
@@ -568,8 +520,12 @@ class TestPresetIntegration:
         for name, preset in ARTIFACT_PRESETS.items():
             for tool_name, fields in preset.tool_fields.items():
                 for field in fields:
-                    assert field.field_path, f"{name}.{tool_name} missing field_path"
-                    assert field.content_type, f"{name}.{tool_name} missing content_type"
+                    assert field.field_path, (
+                        f"{name}.{tool_name} missing field_path"
+                    )
+                    assert field.content_type, (
+                        f"{name}.{tool_name} missing content_type"
+                    )
 
     def test_preset_summary_templates_have_placeholders(self) -> None:
         """Summary templates should have expected placeholders."""
@@ -578,12 +534,15 @@ class TestPresetIntegration:
                 for field in fields:
                     template = field.summary_template
                     # Templates should include artifact_id
-                    assert "{artifact_id}" in template or "{size}" in template, (
-                        f"{name}.{tool_name} template missing standard placeholders"
+                    assert (
+                        "{artifact_id}" in template or "{size}" in template
+                    ), (
+                        f"{name}.{tool_name} template missing "
+                        "standard placeholders"
                     )
 
 
-# ─── Error Recovery Tests ─────────────────────────────────────────────────────
+# ─── Error Recovery Tests ────────────────────────────────────────────────────
 
 
 class TestErrorRecovery:

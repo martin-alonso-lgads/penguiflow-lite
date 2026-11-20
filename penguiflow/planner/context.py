@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from _collections_abc import Awaitable, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from penguiflow.artifacts import ArtifactStore, ScopedArtifacts
+    from collections.abc import Awaitable, Mapping, MutableMapping
 
-try:
-    # Optional import to help tools that share signatures with flow Context
-    from penguiflow.core import Context as FlowContext
-except Exception:  # pragma: no cover - defensive import
-    FlowContext = object  # type: ignore[misc,assignment]
+    from penguiflow.artifacts import ArtifactStore, ScopedArtifacts
 
 PlannerPauseReason = Literal[
     "approval_required",
@@ -25,17 +20,29 @@ KVScope = Literal["session", "task"]
 
 
 class SessionKV(Protocol):
-    async def get(self, key: str, *, scope: KVScope = "session", namespace: str | None = None) -> Any | None: ...
+    """Durable key/value storage scoped to a session or a task."""
+
+    async def get(
+        self,
+        key: str,
+        *,
+        scope: KVScope = "session",
+        namespace: str | None = None,
+    ) -> object:
+        """Return the value stored under ``key``, or ``None``."""
+        ...
 
     async def set(
         self,
         key: str,
-        value: Any,
+        value: object,
         *,
         scope: KVScope = "session",
         namespace: str | None = None,
         emit_update: bool = True,
-    ) -> Any: ...
+    ) -> object:
+        """Store ``value`` under ``key`` and return it."""
+        ...
 
     async def patch(
         self,
@@ -45,17 +52,21 @@ class SessionKV(Protocol):
         scope: KVScope = "session",
         namespace: str | None = None,
         emit_update: bool = True,
-    ) -> Any: ...
+    ) -> object:
+        """Merge ``patch`` into the mapping under ``key`` and return it."""
+        ...
 
     async def get_or_init(
         self,
         key: str,
-        default: Any,
+        default: object,
         *,
         scope: KVScope = "session",
         namespace: str | None = None,
         emit_update: bool = True,
-    ) -> Any: ...
+    ) -> object:
+        """Return the value under ``key``, storing ``default`` if unset."""
+        ...
 
     async def delete(
         self,
@@ -64,7 +75,9 @@ class SessionKV(Protocol):
         scope: KVScope = "session",
         namespace: str | None = None,
         emit_update: bool = True,
-    ) -> bool: ...
+    ) -> bool:
+        """Delete ``key`` and return whether it existed."""
+        ...
 
 
 class ToolContext(Protocol):
@@ -100,6 +113,17 @@ class ToolContext(Protocol):
         """
 
     @property
+    def run_state(self) -> MutableMapping[str, Any]:
+        """Mutable state shared by every tool call of the current run.
+
+        Unlike ``tool_context``, which each call gets as its own copy,
+        writes here are seen by the run's later tool calls and survive
+        pause and resume. Values must be JSON-serializable. Contexts outside
+        a planner run fall back to ``tool_context``.
+        """
+        return self.tool_context
+
+    @property
     def kv(self) -> SessionKV:
         """Durable session key/value facade.
 
@@ -129,7 +153,7 @@ class ToolContext(Protocol):
     def emit_artifact(
         self,
         stream_id: str,
-        chunk: Any,
+        chunk: object,
         *,
         done: bool = False,
         artifact_type: str | None = None,
@@ -138,5 +162,5 @@ class ToolContext(Protocol):
         """Emit a streaming artifact chunk (e.g., partial chart config)."""
 
 
-# Helper alias for tools that can accept either planner ToolContext or flow Context
-AnyContext = ToolContext | FlowContext
+# Backwards-compatible alias; tools only ever receive a planner ToolContext.
+AnyContext = ToolContext

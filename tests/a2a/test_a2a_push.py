@@ -1,11 +1,12 @@
-import asyncio
-from typing import Any
+"""Tests for A2A push."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from penguiflow import Message as FlowMessage
-from penguiflow import Node, NodePolicy, create
 from penguiflow_a2a import A2AConfig, A2AService, create_a2a_http_app
 from penguiflow_a2a.models import (
     AgentCapabilities,
@@ -22,12 +23,28 @@ from penguiflow_a2a.models import (
 )
 from penguiflow_a2a.push import is_safe_webhook_url
 
+from .planner_doubles import (
+    ScriptedPlanner,
+    ScriptedRun,
+    echo_planner,
+    slow_planner,
+)
+
+if TYPE_CHECKING:
+    from penguiflow_a2a.models import StreamResponse
+
 
 class FakePushSender:
+    """Push sender that records what it would send."""
+
     def __init__(self) -> None:
+        """Start with no recorded state."""
         self.events: list[tuple[PushNotificationConfig, Any]] = []
 
-    async def send(self, config: PushNotificationConfig, event: Any) -> None:
+    async def send(
+        self, config: PushNotificationConfig, event: StreamResponse
+    ) -> None:
+        """Record ``event`` for the push ``config``."""
         self.events.append((config, event))
 
 
@@ -36,7 +53,11 @@ def _agent_card(*, push_notifications: bool) -> AgentCard:
         protocol_versions=["0.3"],
         name="Test Agent",
         description="Test",
-        supported_interfaces=[AgentInterface(url="https://example.com/a2a", protocol_binding="HTTP+JSON")],
+        supported_interfaces=[
+            AgentInterface(
+                url="https://example.com/a2a", protocol_binding="HTTP+JSON"
+            )
+        ],
         version="1.0.0",
         capabilities=AgentCapabilities(
             streaming=True,
@@ -46,29 +67,34 @@ def _agent_card(*, push_notifications: bool) -> AgentCard:
         ),
         default_input_modes=["application/json"],
         default_output_modes=["application/json"],
-        skills=[AgentSkill(id="echo", name="Echo", description="Echo", tags=["test"])],
+        skills=[
+            AgentSkill(
+                id="echo", name="Echo", description="Echo", tags=["test"]
+            )
+        ],
     )
 
 
 def _build_client(*, push_notifications: bool) -> TestClient:
-    async def echo(message: FlowMessage, _ctx) -> str:
-        return f"echo:{message.payload}"
-
-    node = Node(echo, name="echo", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(push_notifications=push_notifications), config=A2AConfig())
+    planner = echo_planner()
+    service = A2AService(
+        planner,
+        agent_card=_agent_card(push_notifications=push_notifications),
+        config=A2AConfig(),
+    )
     app = create_a2a_http_app(service, include_docs=False)
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _build_slow_client(*, push_notifications: bool, delay: float = 0.4) -> TestClient:
-    async def slow(message: FlowMessage, _ctx) -> str:
-        await asyncio.sleep(delay)
-        return f"slow:{message.payload}"
-
-    node = Node(slow, name="slow", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(push_notifications=push_notifications), config=A2AConfig())
+def _build_slow_client(
+    *, push_notifications: bool, delay: float = 0.4
+) -> TestClient:
+    planner = slow_planner(delay)
+    service = A2AService(
+        planner,
+        agent_card=_agent_card(push_notifications=push_notifications),
+        config=A2AConfig(),
+    )
     app = create_a2a_http_app(service, include_docs=False)
     return TestClient(app, raise_server_exceptions=False)
 
@@ -89,16 +115,20 @@ def _message_payload(text: str, *, blocking: bool = True) -> dict[str, Any]:
 
 
 def test_push_config_endpoints_require_capability() -> None:
+    """Push config endpoints require capability."""
     with _build_client(push_notifications=False) as client:
         response = client.get(
             "/tasks/task-1/pushNotificationConfigs",
             headers=_base_headers(),
         )
         assert response.status_code == 400
-        assert response.json()["type"].endswith("push-notification-not-supported")
+        assert response.json()["type"].endswith(
+            "push-notification-not-supported"
+        )
 
 
 def test_push_config_crud() -> None:
+    """Push config crud."""
     with _build_slow_client(push_notifications=True) as client:
         response = client.post(
             "/message:send",
@@ -110,7 +140,10 @@ def test_push_config_crud() -> None:
             "pushNotificationConfig": {
                 "url": "https://example.com/webhook",
                 "token": "tok",
-                "authentication": {"schemes": ["Bearer"], "credentials": "secret"},
+                "authentication": {
+                    "schemes": ["Bearer"],
+                    "credentials": "secret",
+                },
             }
         }
         response = client.post(
@@ -148,15 +181,16 @@ def test_push_config_crud() -> None:
 
 @pytest.mark.asyncio
 async def test_push_delivery_receives_status_and_artifacts() -> None:
-    async def streamer(message: FlowMessage, ctx) -> str:
-        await ctx.emit_chunk(parent=message, text="hi", done=True)
+    """Push delivery receives status and artifacts."""
+
+    async def streamer(run: ScriptedRun) -> str:
+        run.emit_chunk("hi", done=True)
         return "hi"
 
-    node = Node(streamer, name="streamer", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
+    planner = ScriptedPlanner(streamer)
     sender = FakePushSender()
     service = A2AService(
-        flow,
+        planner,
         agent_card=_agent_card(push_notifications=True),
         config=A2AConfig(),
         push_sender=sender,
@@ -173,20 +207,92 @@ async def test_push_delivery_receives_status_and_artifacts() -> None:
                 blocking=True,
                 push_notification_config=PushNotificationConfig(
                     url="https://example.com/webhook",
-                    authentication=AuthenticationInfo(schemes=["Bearer"], credentials="token"),
+                    authentication=AuthenticationInfo(
+                        schemes=["Bearer"], credentials="token"
+                    ),
                 ),
             ),
         )
-        await service.send_message(request, tenant=None, requested_extensions=[])
-        status_events = [event for _config, event in sender.events if event.status_update]
-        artifact_events = [event for _config, event in sender.events if event.artifact_update]
+        await service.send_message(
+            request, tenant=None, requested_extensions=[]
+        )
+        status_events = [
+            event for _config, event in sender.events if event.status_update
+        ]
+        artifact_events = [
+            event for _config, event in sender.events if event.artifact_update
+        ]
         assert artifact_events
         assert any(event.status_update.final for event in status_events)
     finally:
         await service.stop()
 
 
+class FailingPushSender(FakePushSender):
+    """Push sender that rejects every delivery, like an unsafe webhook."""
+
+    async def send(
+        self, config: PushNotificationConfig, event: StreamResponse
+    ) -> None:
+        """Record ``event``, then refuse to deliver it."""
+        await super().send(config, event)
+        msg = "Webhook URL is not allowed"
+        raise ValueError(msg)
+
+
+@pytest.mark.asyncio
+async def test_push_delivery_failure_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed push delivery is logged without the webhook URL or token."""
+    sender = FailingPushSender()
+    service = A2AService(
+        echo_planner(),
+        agent_card=_agent_card(push_notifications=True),
+        config=A2AConfig(),
+        push_sender=sender,
+    )
+    await service.start()
+    try:
+        request = SendMessageRequest(
+            message=Message(
+                message_id="msg-1",
+                role=Role.USER,
+                parts=[Part(text="hello")],
+            ),
+            configuration=SendMessageConfiguration(
+                blocking=True,
+                push_notification_config=PushNotificationConfig(
+                    id="cfg-1",
+                    url="http://127.0.0.1/webhook",
+                    token="secret-token",
+                ),
+            ),
+        )
+        with caplog.at_level("WARNING", logger="penguiflow_a2a"):
+            await service.send_message(
+                request, tenant=None, requested_extensions=[]
+            )
+    finally:
+        await service.stop()
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "a2a_push_delivery_failed"
+    ]
+    assert sender.events
+    assert failures
+    assert all(record.__dict__["config_id"] == "cfg-1" for record in failures)
+    assert all(
+        record.__dict__["error_type"] == "ValueError" for record in failures
+    )
+    assert "secret-token" not in caplog.text
+    assert "127.0.0.1" not in caplog.text
+
+
 def test_webhook_url_ssrf_checks() -> None:
+    """Webhook URL ssrf checks."""
     assert not is_safe_webhook_url("http://localhost:8000")
     assert not is_safe_webhook_url("http://127.0.0.1:8000")
     assert not is_safe_webhook_url("http://10.0.0.1")

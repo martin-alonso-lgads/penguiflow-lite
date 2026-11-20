@@ -1,115 +1,114 @@
-# Interactive HITL Tools: `ui_form`, `ui_confirm`, `ui_select_option`
+# Interactive Tools: `ui_form`, `ui_confirm`, `ui_select_option`
 
-These rich-output tools double as **pause tools** — they emit a UI component **and** pause the planner waiting for user input.
+These tools pause the run so a person can answer. They emit **no** `artifact_chunk` and return no `artifact_ref`. The component reaches your app as the pause payload, and the answer comes back through `planner.resume(token, user_input=...)`. Source: `penguiflow/rich_output/nodes.py`; the general pause and resume contract lives in [[penguiflow-hitl-pause-resume]].
 
-This reference covers the rich-output side of the contract. The general pause/resume mechanics are covered in [[penguiflow-hitl-pause-resume]].
+## What a call does
 
-## How they're different from `render_*`
+1. It validates the arguments (`UIFormArgs`, `UIConfirmArgs` or `UISelectOptionArgs`; all `extra="forbid"`).
+2. It dumps them to camelCase props, without `None` values, and checks them against the `form`, `confirm` or `select_option` registry schema. The component must be in `RichOutputConfig.allowlist`.
+3. It calls `ctx.pause("await_input", {"tool": ..., "component": ..., "props": ..., "registry_version": ...})`.
 
-| | `render_*` | `ui_form` / `ui_confirm` / `ui_select_option` |
-|---|---|---|
-| Emits `artifact_chunk` | Yes | Yes |
-| Pauses planner | No | Yes (`reason="await_input"`) |
-| Returns `artifact_ref` | Yes | N/A (run pauses before return) |
-| Reads user response | N/A | Yes (via `tool_context` on resume) |
-
-## `ui_form` (`UIFormArgs`)
-
-Render a form built from typed `FormField` entries, pause for the user to submit.
+`run()` (or `resume()`) then returns:
 
 ```python
-from penguiflow.rich_output.tools import FormField, UIFormArgs
+from penguiflow.planner import PlannerPause
 
-ui_form(UIFormArgs(
+pause = PlannerPause(
+    reason="await_input",
+    payload={
+        "tool": "ui_confirm",
+        "component": "confirm",
+        "props": {"message": "Ship it?", "confirmLabel": "Confirm", "cancelLabel": "Cancel", "variant": "warning"},
+        "registry_version": "2025-12-24",
+    },
+    resume_token="...",
+)
+```
+
+The planner also emits a `tool_call_result` event whose `result_json` is `{"pause": "await_input", "payload": {...}}`.
+
+## Arguments
+
+```python
+from penguiflow.rich_output.tools import (
+    FormField,
+    SelectOptionItem,
+    UIConfirmArgs,
+    UIFormArgs,
+    UISelectOptionArgs,
+)
+
+form = UIFormArgs(
     title="Send email",
     description="Compose and confirm",
     fields=[
-        FormField(name="recipient", type="email", label="To", required=True),
+        FormField(name="to", type="email", label="To", required=True),
         FormField(name="subject", type="text", label="Subject", required=True),
-        FormField(name="body", type="textarea", label="Body"),
+        FormField(name="body", type="textarea", label="Body", help_text="Plain text"),
+        FormField(name="priority", type="select", options=["low", "high"], default="low", width="half"),
     ],
-    submit_label="Send",                # aliases as `submitLabel` over the wire
-    cancel_label="Cancel",              # aliases as `cancelLabel`
-    layout="vertical",                  # vertical | horizontal | inline
-))
-```
+    submit_label="Send",          # alias submitLabel; default "Submit"
+    cancel_label="Cancel",        # alias cancelLabel; default None
+    layout="vertical",            # vertical | horizontal | inline
+)
 
-`FormField.type` is a `Literal[...]` from the actual library: `text`, `number`, `email`, `password`, `url`, `tel`, `textarea`, `select`, `multiselect`, `checkbox`, `radio`, `switch`, `date`, `datetime`, `time`, `file`, `range`, `color`. There is no `schema`/`initial_values`/`input_key` field — the form is defined via fields, defaults via `FormField.default`, and the user's response arrives in `tool_context` keyed by the artifact id or your application's convention.
-
-Pause payload mirrors the args plus the artifact_ref the planner emitted. On resume, pass the submitted form values back through `tool_context` (your app picks the key — there is no library-mandated `input_key`). See [[penguiflow-hitl-pause-resume]] for the resume contract.
-
-## `ui_confirm` (`UIConfirmArgs`)
-
-Yes/no confirmation gate.
-
-```python
-from penguiflow.rich_output.tools import UIConfirmArgs
-
-ui_confirm(UIConfirmArgs(
+confirm = UIConfirmArgs(
     title="Delete this record?",
-    message="This action cannot be undone.",
-    confirm_label="Delete",              # aliases as `confirmLabel`
-    cancel_label="Keep",                 # aliases as `cancelLabel`
-    variant="danger",                    # info | warning | danger | success
+    message="This action cannot be undone.",   # required
+    confirm_label="Delete",       # default "Confirm"
+    cancel_label="Keep",          # default "Cancel"
+    variant="danger",             # info | warning | danger | success
     details="Affects 3 child rows.",
-))
+)
+
+select = UISelectOptionArgs(
+    title="Target environment",
+    options=[
+        SelectOptionItem(value="prod", label="Production", description="Live traffic"),
+        SelectOptionItem(value="staging", label="Staging"),
+    ],
+    multiple=False,
+    min_selections=1,             # alias minSelections
+    max_selections=None,          # alias maxSelections
+    layout="list",                # list | grid | cards
+    searchable=False,
+)
 ```
 
-`variant` (not `danger: bool`) is the visual emphasis knob — pick `"danger"` for destructive intent. On resume, communicate the decision via `tool_context` (boolean/string of your choice; not a library-mandated `input_key`).
+- `FormField.type`: `text`, `number`, `email`, `password`, `url`, `tel`, `textarea`, `select`, `multiselect`, `checkbox`, `radio`, `switch`, `date`, `datetime`, `time`, `file`, `range` or `color`.
+- `FormField` also takes `placeholder`, `disabled`, `validation` (`FormFieldValidation(min, max, min_length, max_length, pattern, message)`) and `options` (strings or `FormFieldOption(value, label)`).
+- `SelectOptionItem` also takes `icon`, `disabled` and `metadata`.
 
-## `ui_select_option` (`UISelectOptionArgs`)
-
-Pick one (or many) from a list of `SelectOptionItem`s.
+## Rendering and resuming
 
 ```python
-ui_select_option(
-    title="Select target environment",
-    options=[
-        SelectOptionItem(value="prod", label="Production"),
-        SelectOptionItem(value="staging", label="Staging"),
-        SelectOptionItem(value="dev", label="Development"),
-    ],
-    multiple=False,                       # not `multi_select`
-    min_selections=1,                     # aliases as `minSelections`; default 1
-    max_selections=None,                  # aliases as `maxSelections`
-    layout="list",                        # list | grid | cards
-    searchable=False,
-))
+import json
+
+from penguiflow.planner import PlannerPause
+
+result = await planner.run("Email the Q3 summary to finance", tool_context={"session_id": "s1"})
+while isinstance(result, PlannerPause) and result.reason == "await_input":
+    component = result.payload["component"]  # "form" | "confirm" | "select_option"
+    props = result.payload["props"]
+    answer: dict[str, object] = ...  # your UI renders component/props and collects the answer
+    result = await planner.resume(result.resume_token, user_input=json.dumps(answer))
 ```
 
-`SelectOptionItem` supports `value`, `label`, optional `description`, `icon`, `disabled`, and `metadata`. The args expose `multiple` (boolean) and selection counts — not `multi_select`/`default`/`input_key`. The user's selection comes back through `tool_context` (your app's choice of key) along with `UIInteractionResult.ok`.
+- `user_input` is a string. The planner adds it to the next prompt as a user message, `Resume input: <text>`. JSON-encode structured answers, and include a cancel signal if the UI offers one (for example `{"cancelled": true}`).
+- The `ui_*` tool is not run again. Its step's observation stays `{"pause": "await_input", "payload": ...}`, and the LLM continues from the resume input.
+- `tool_context=` on `resume()` replaces the stored tool context, so pass the session identity again if you override it. Don't put the answer there: the LLM never sees `tool_context`.
+- `resume()` removes the in-memory pause record, so a token works once in the process that paused. For resumes in another process, configure a `StateStore` with planner-state support ([[penguiflow-hitl-pause-resume]]).
 
 ## Wiring requirements
 
-1. `pause_enabled=True` on the planner (default).
-2. `RichOutputConfig(enabled=True, allowlist=[..., "form", "confirm", "select_option", ...])` — the interactive components are part of the allowlist set, not a separate switch.
-3. The frontend renders the components AND knows how to call `planner.resume(...)` (typically via your host API).
-4. For durable resume across workers: `StateStore` implementing `SupportsPlannerState` — see [[penguiflow-hitl-pause-resume]].
+1. `pause_enabled=True` on the planner (the default). With pauses disabled, the call fails with `Pause/resume is disabled for this planner`, and the LLM sees that as a tool error.
+2. `form`, `confirm` and `select_option` in `RichOutputConfig.allowlist` (they are in `DEFAULT_ALLOWLIST`). The three tools are registered either way, but a call for a component that isn't allowlisted fails validation.
+3. A frontend that renders the pause payload and calls back into your host API, which then calls `resume()`.
 
-## Why not just `ctx.pause(...)` directly?
+## When to use `ctx.pause(...)` directly
 
-You could pause directly in any tool. The interactive HITL tools have advantages:
-- **Structured payload schema.** The frontend can render any `ui_form` / `ui_confirm` / `ui_select_option` consistently.
-- **Validation.** Form schemas are JSON-validated server-side.
-- **Tool-call lifecycle events.** Tool-call telemetry tracks the pause as a tool invocation, not a freeform raise.
-- **AG-UI compatibility.** AG-UI maps these to standard interactive events.
-
-Use `ctx.pause(...)` directly for ad-hoc / non-standard pauses. Use the interactive tools for any UI gating.
-
-## Anti-patterns
-
-- **Embedding side effects before the pause.** The tool body returns when `ctx.pause` raises, but anything **before** the pause already happened. Don't write to a DB and then ask for confirmation — split into a plan tool and a commit tool.
-- **Picking a shared response key by accident.** When you decide where the user's submission lands in `tool_context`, pick a unique key per artifact (e.g., the artifact_ref) — colliding keys overwrite earlier responses.
-- **Long-running prompts.** Pauses can sit waiting for hours. Set TTL on the StateStore record.
-- **Using a `danger` boolean.** The library uses `variant: Literal["info","warning","danger","success"]` instead — `variant="danger"` is the destructive emphasis.
-
-## Operational defaults
-
-- `confirm_label`/`cancel_label` should describe the actual action ("Delete" not "OK").
-- Use `variant="danger"` only for destructive confirmations.
-- Keep `FormField` lists short and use typed `FormFieldType`s — the planner validates the schema before pause.
-- Multi-select with many options: turn on `searchable=True` and keep `layout="list"` (or switch to `"cards"`/`"grid"` for visual selection).
+In your own tool, use `ctx.pause("approval_required", {...})` when the pause belongs to that tool's side effect, such as approving a write. Use the `ui_*` tools when the LLM itself needs structured input from the person. Either way, nothing after the pause runs in that tool call, and anything before it has already happened.
 
 ## Cross-channel rules
 
-For A2A specialists serving downstream agents (not humans), **hide these tools** via `ToolVisibilityPolicy` and set `tool_context["delivery_channel"]="a2a"`. Downstream agents can't render forms; emitting them is lossy. See [[penguiflow-reactplanner-config]] step 9.
+Downstream agents can't render forms. For A2A serving, hide `ui_form`, `ui_confirm` and `ui_select_option` with a `ToolVisibilityPolicy` (see [[penguiflow-reactplanner-config]] step 9). `A2AService` sets `tool_context["delivery_channel"] = "a2a"`, and your prompt guidance can key on it.

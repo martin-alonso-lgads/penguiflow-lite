@@ -23,12 +23,22 @@ Enable user OAuth with:
 
 - `ExternalToolConfig(auth_type=AuthType.OAUTH2_USER)`
 
+It works only for an MCP server reached over a URL: a stdio command or a UTCP/HTTP/CLI transport fails validation. One ToolNode serves every user:
+
+- it keeps one MCP session per user, keyed by `(tool_context["tenant_id"], tool_context["user_id"])` and opened with that user's token, each with its own resource cache and subscriptions;
+- `connect(ctx)` opens the first session and discovers tools, prompts and resource templates on it (`connect()` without a context raises `ToolAuthError`); other users' sessions open on their first call;
+- a new token opens a new session for that user, and a `401` from the server closes it so the next call reopens it;
+- `ExternalToolConfig.session_pool` (`SessionPoolConfig(max_sessions=64, idle_timeout_s=900.0)`) closes the least recently used idle sessions past `max_sessions` and sessions idle for `idle_timeout_s`; `max_concurrency` is shared by all users.
+
+Because tools are discovered once, a server that filters tools per user exposes the first user's tool list. Connect as a user who has every tool, and hide tools per user with a `ToolVisibilityPolicy`.
+
 ### `tool_context` requirements
 
 ToolNode requires:
 
 - `ctx.tool_context["user_id"]` (required)
 - `ctx.tool_context["trace_id"]` (optional but recommended for correlation)
+- `ctx.tool_context["tenant_id"]` (optional; part of the MCP session key)
 
 ### OAuth manager
 
@@ -61,8 +71,8 @@ See **[Pause/resume (HITL)](../planner/pause-resume-hitl.md)** for the planner-l
 - Treat `user_id` as an identity key and ensure it is tenant-scoped in multi-tenant systems.
 - Use HTTPS for callback endpoints and validate OAuth `state` values.
 
-!!! note
-    `OAuthManager` expires pending OAuth `state` after ~10 minutes. If your UX requires longer, implement your own auth manager.
+> [!NOTE]
+> `OAuthManager` expires pending OAuth `state` after ~10 minutes. If your UX requires longer, implement your own auth manager.
 
 ## Failure modes & recovery
 

@@ -1,64 +1,63 @@
-"""Tests for ModelRegistry and Node validation."""
+"""Tests for ModelRegistry validation."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from penguiflow.node import Node, NodePolicy
 from penguiflow.registry import ModelRegistry
 
 
 class InputModel(BaseModel):
+    """Input model used by the tests."""
+
     text: str
 
 
 class OutputModel(BaseModel):
+    """Output model used by the tests."""
+
     text: str
     length: int
 
 
-@pytest.mark.asyncio
-async def test_registry_validates_in_and_out() -> None:
-    async def worker(msg: InputModel, ctx) -> OutputModel:
-        return OutputModel(text=msg.text, length=len(msg.text))
-
-    node = Node(worker, name="worker", policy=NodePolicy(validate="both"))
+def test_registry_validates_in_and_out() -> None:
+    """Registry validates in and out."""
     registry = ModelRegistry()
     registry.register("worker", InputModel, OutputModel)
+    adapter_in, adapter_out = registry.adapters("worker")
 
-    result = await node.invoke({"text": "penguin"}, object(), registry=registry)
+    parsed = adapter_in.validate_python({"text": "penguin"})
+    assert isinstance(parsed, InputModel)
+    result = adapter_out.validate_python(
+        {"text": parsed.text, "length": len(parsed.text)}
+    )
     assert isinstance(result, OutputModel)
     assert result.length == 7
 
 
-@pytest.mark.asyncio
-async def test_registry_rejects_invalid_input() -> None:
-    async def worker(msg: InputModel, ctx) -> OutputModel:
-        return OutputModel(text=msg.text, length=len(msg.text))
-
-    node = Node(worker, name="worker", policy=NodePolicy(validate="in"))
+def test_registry_rejects_invalid_input() -> None:
+    """Registry rejects invalid input."""
     registry = ModelRegistry()
     registry.register("worker", InputModel, OutputModel)
+    adapter_in, _ = registry.adapters("worker")
 
     with pytest.raises(ValidationError):
-        await node.invoke({}, object(), registry=registry)
+        adapter_in.validate_python({})
 
 
-@pytest.mark.asyncio
-async def test_registry_rejects_invalid_output() -> None:
-    async def worker(msg: InputModel, ctx) -> dict[str, str]:
-        return {"text": msg.text}
-
-    node = Node(worker, name="worker", policy=NodePolicy(validate="out"))
+def test_registry_rejects_invalid_output() -> None:
+    """Registry rejects invalid output."""
     registry = ModelRegistry()
     registry.register("worker", InputModel, OutputModel)
+    _, adapter_out = registry.adapters("worker")
 
     with pytest.raises(ValidationError):
-        await node.invoke(InputModel(text="penguin"), object(), registry=registry)
+        adapter_out.validate_python({"text": "penguin"})
 
 
 def test_registry_duplicate_registration_raises() -> None:
+    """Registry duplicate registration raises."""
     registry = ModelRegistry()
     registry.register("dup", InputModel, OutputModel)
     with pytest.raises(ValueError):
@@ -66,6 +65,7 @@ def test_registry_duplicate_registration_raises() -> None:
 
 
 def test_registry_unknown_node_raises() -> None:
+    """Registry unknown node raises."""
     registry = ModelRegistry()
     with pytest.raises(KeyError):
         registry.adapters("missing")

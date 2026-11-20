@@ -1,13 +1,22 @@
-import asyncio
+"""Tests for A2A JSON-RPC."""
+
+from __future__ import annotations
+
 import json
 from typing import Any
 
 from fastapi.testclient import TestClient
 
-from penguiflow import Message as FlowMessage
-from penguiflow import Node, NodePolicy, create
 from penguiflow_a2a import A2AConfig, A2AService, create_a2a_http_app
-from penguiflow_a2a.models import AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TaskState
+from penguiflow_a2a.models import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+    TaskState,
+)
+
+from .planner_doubles import echo_planner, slow_planner, streaming_planner
 
 
 def _agent_card() -> AgentCard:
@@ -15,7 +24,11 @@ def _agent_card() -> AgentCard:
         protocol_versions=["0.3"],
         name="Test Agent",
         description="Test",
-        supported_interfaces=[AgentInterface(url="https://example.com/a2a", protocol_binding="HTTP+JSON")],
+        supported_interfaces=[
+            AgentInterface(
+                url="https://example.com/a2a", protocol_binding="HTTP+JSON"
+            )
+        ],
         version="1.0.0",
         capabilities=AgentCapabilities(
             streaming=True,
@@ -25,43 +38,31 @@ def _agent_card() -> AgentCard:
         ),
         default_input_modes=["application/json"],
         default_output_modes=["application/json"],
-        skills=[AgentSkill(id="echo", name="Echo", description="Echo", tags=["test"])],
+        skills=[
+            AgentSkill(
+                id="echo", name="Echo", description="Echo", tags=["test"]
+            )
+        ],
     )
 
 
 def _build_client() -> TestClient:
-    async def echo(message: FlowMessage, _ctx) -> str:
-        return f"echo:{message.payload}"
-
-    node = Node(echo, name="echo", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(), config=A2AConfig())
+    planner = echo_planner()
+    service = A2AService(planner, agent_card=_agent_card(), config=A2AConfig())
     app = create_a2a_http_app(service, include_docs=False)
     return TestClient(app, raise_server_exceptions=False)
 
 
 def _build_stream_client() -> TestClient:
-    async def streamer(message: FlowMessage, ctx) -> str:
-        words = str(message.payload).split()
-        for idx, word in enumerate(words):
-            await ctx.emit_chunk(parent=message, text=word, done=idx == len(words) - 1)
-        return " ".join(words)
-
-    node = Node(streamer, name="streamer", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(), config=A2AConfig())
+    planner = streaming_planner()
+    service = A2AService(planner, agent_card=_agent_card(), config=A2AConfig())
     app = create_a2a_http_app(service, include_docs=False)
     return TestClient(app, raise_server_exceptions=False)
 
 
 def _build_slow_client(delay: float = 0.4) -> TestClient:
-    async def slow(message: FlowMessage, _ctx) -> str:
-        await asyncio.sleep(delay)
-        return f"slow:{message.payload}"
-
-    node = Node(slow, name="slow", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(), config=A2AConfig())
+    planner = slow_planner(delay)
+    service = A2AService(planner, agent_card=_agent_card(), config=A2AConfig())
     app = create_a2a_http_app(service, include_docs=False)
     return TestClient(app, raise_server_exceptions=False)
 
@@ -82,10 +83,16 @@ def _send_params(text: str, *, blocking: bool = True) -> dict[str, Any]:
 
 
 def test_jsonrpc_send_message_get_task_and_list() -> None:
+    """JSON-RPC send message get task and list."""
     with _build_client() as client:
         response = client.post(
             "/rpc",
-            json={"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": _send_params("hello")},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "SendMessage",
+                "params": _send_params("hello"),
+            },
             headers=_base_headers(),
         )
         assert response.status_code == 200
@@ -95,20 +102,31 @@ def test_jsonrpc_send_message_get_task_and_list() -> None:
         task_id = task["id"]
         response = client.post(
             "/rpc",
-            json={"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}},
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "GetTask",
+                "params": {"id": task_id},
+            },
             headers=_base_headers(),
         )
         assert response.json()["result"]["id"] == task_id
 
         response = client.post(
             "/rpc",
-            json={"jsonrpc": "2.0", "id": 3, "method": "ListTasks", "params": {"pageSize": 1}},
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "ListTasks",
+                "params": {"pageSize": 1},
+            },
             headers=_base_headers(),
         )
         assert response.json()["result"]["tasks"]
 
 
 def test_jsonrpc_send_streaming_message() -> None:
+    """JSON-RPC send streaming message."""
     with _build_stream_client() as client:
         events: list[dict[str, Any]] = []
         with client.stream(
@@ -129,12 +147,15 @@ def test_jsonrpc_send_streaming_message() -> None:
                     events.append(payload)
         assert events
         assert events[0]["result"]["id"]
-        final_events = [event for event in events if "final" in event["result"]]
+        final_events = [
+            event for event in events if "final" in event["result"]
+        ]
         assert final_events
         assert final_events[-1]["result"]["final"] is True
 
 
 def test_jsonrpc_subscribe_task() -> None:
+    """JSON-RPC subscribe task."""
     with _build_slow_client() as client:
         response = client.post(
             "/rpc",
@@ -166,15 +187,23 @@ def test_jsonrpc_subscribe_task() -> None:
                     events.append(payload)
         assert events
         assert events[0]["result"]["id"] == task_id
-        final_events = [event for event in events if "final" in event["result"]]
+        final_events = [
+            event for event in events if "final" in event["result"]
+        ]
         assert final_events[-1]["result"]["final"] is True
 
 
 def test_jsonrpc_error_mapping_task_not_found() -> None:
+    """JSON-RPC error mapping task not found."""
     with _build_client() as client:
         response = client.post(
             "/rpc",
-            json={"jsonrpc": "2.0", "id": 99, "method": "CancelTask", "params": {"id": "missing"}},
+            json={
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "CancelTask",
+                "params": {"id": "missing"},
+            },
             headers=_base_headers(),
         )
         assert response.status_code == 200

@@ -1,8 +1,9 @@
-"""Public package surface for PenguiFlow."""
+"""Public package surface for PenguiFlow (ReactPlanner agents)."""
 
 from __future__ import annotations
 
-from . import testkit
+import importlib.metadata as _metadata
+
 from .artifacts import (
     ArtifactRef,
     ArtifactRetentionConfig,
@@ -12,23 +13,16 @@ from .artifacts import (
     NoOpArtifactStore,
     discover_artifact_store,
 )
-from .bus import BusEnvelope, MessageBus
-from .catalog import NodeSpec, SideEffect, ToolInputExample, ToolLoadingMode, build_catalog, tool
-from .core import (
-    DEFAULT_QUEUE_MAXSIZE,
-    Context,
-    CycleError,
-    PenguiFlow,
-    call_playbook,
-    create,
+from .catalog import (
+    NodeSpec,
+    SideEffect,
+    ToolInputExample,
+    ToolLoadingMode,
+    build_catalog,
+    tool,
 )
-from .debug import format_flow_event
-from .errors import FlowError, FlowErrorCode
 from .logging import ExtraFormatter, StructuredFormatter, configure_logging
-from .metrics import FlowEvent
-from .middlewares import LatencyCallback, Middleware, log_flow_events
 from .node import Node, NodePolicy
-from .patterns import join_k, map_concurrent, predicate_router, union_router
 from .planner import (
     PlannerAction,
     PlannerFinish,
@@ -48,13 +42,11 @@ from .planner import (
     Trajectory,
     TrajectoryStep,
 )
-from .policies import DictRoutingPolicy, RoutingPolicy, RoutingRequest
 from .registry import ModelRegistry
 from .remote import (
     REMOTE_TERMINAL_TASK_STATES,
     RemoteCallRequest,
     RemoteCallResult,
-    RemoteNode,
     RemotePushNotificationBinding,
     RemoteStreamEvent,
     RemoteTaskAuthRequired,
@@ -82,7 +74,12 @@ from .sessions.persistence import (
     StateStoreSessionAdapter,
 )
 from .sessions.planner import PlannerTaskPipeline
-from .sessions.scheduler import JobDefinition, JobScheduler, JobSchedulerRunner, ScheduleConfig
+from .sessions.scheduler import (
+    JobDefinition,
+    JobScheduler,
+    JobSchedulerRunner,
+    ScheduleConfig,
+)
 from .sessions.session import (
     PendingContextPatch,
     SessionLimits,
@@ -92,108 +89,48 @@ from .sessions.session import (
     TaskRuntime,
 )
 from .sessions.transport import SessionConnection, Transport
-from .state import RemoteBinding, StateStore, StoredEvent, SupportsConversationBindings
-from .steering import SteeringCancelled, SteeringEvent, SteeringEventType, SteeringInbox
-from .streaming import (
-    chunk_to_ws_json,
-    emit_stream_events,
-    format_sse_event,
-    stream_flow,
+from .state import (
+    RemoteBinding,
+    StateStore,
+    StoredEvent,
+    SupportsConversationBindings,
 )
-from .types import WM, FinalAnswer, Headers, Message, PlanStep, StreamChunk, Thought
-from .viz import flow_to_dot, flow_to_mermaid
+from .steering import (
+    SteeringCancelled,
+    SteeringEvent,
+    SteeringEventType,
+    SteeringInbox,
+)
+from .types import Headers, Message
 
 __all__ = [
-    "__version__",
+    "REMOTE_TERMINAL_TASK_STATES",
     # Artifacts
     "ArtifactRef",
     "ArtifactRetentionConfig",
     "ArtifactScope",
     "ArtifactStore",
-    "InMemoryArtifactStore",
-    "NoOpArtifactStore",
-    "discover_artifact_store",
-    # Logging
-    "configure_logging",
-    "ExtraFormatter",
-    "StructuredFormatter",
-    "Context",
-    "CycleError",
-    "PenguiFlow",
-    "DEFAULT_QUEUE_MAXSIZE",
-    "Node",
-    "NodePolicy",
-    "ModelRegistry",
-    "NodeSpec",
-    "SideEffect",
-    "ToolInputExample",
-    "ToolLoadingMode",
-    "build_catalog",
-    "tool",
-    "Middleware",
-    "log_flow_events",
-    "LatencyCallback",
-    "FlowEvent",
-    "format_flow_event",
-    "FlowError",
-    "FlowErrorCode",
-    "MessageBus",
-    "BusEnvelope",
-    "call_playbook",
-    "Headers",
-    "Message",
-    "StreamChunk",
-    "PlanStep",
-    "Thought",
-    "WM",
-    "FinalAnswer",
-    "map_concurrent",
-    "join_k",
-    "predicate_router",
-    "union_router",
-    "DictRoutingPolicy",
-    "RoutingPolicy",
-    "RoutingRequest",
-    "format_sse_event",
-    "chunk_to_ws_json",
-    "stream_flow",
-    "emit_stream_events",
-    "flow_to_mermaid",
-    "flow_to_dot",
-    "create",
-    "testkit",
-    "SteeringCancelled",
-    "SteeringEvent",
-    "SteeringEventType",
-    "SteeringInbox",
     "ContextPatch",
-    "NotificationAction",
-    "StateUpdate",
-    "TaskContextSnapshot",
-    "TaskStatus",
-    "TaskType",
-    "UpdateType",
-    "PlannerTaskPipeline",
+    "ExtraFormatter",
+    "Headers",
+    "InMemoryArtifactStore",
     "InMemorySessionStateStore",
     "JobDefinition",
     "JobScheduler",
     "JobSchedulerRunner",
-    "ScheduleConfig",
+    "Message",
+    "ModelRegistry",
+    "NoOpArtifactStore",
+    "Node",
+    "NodePolicy",
+    "NodeSpec",
+    "NotificationAction",
     "PendingContextPatch",
-    "SessionConnection",
-    "SessionLimits",
-    "SessionManager",
-    "SessionStateStore",
-    "StateStoreSessionAdapter",
-    "StreamingSession",
-    "TaskResult",
-    "TaskRuntime",
-    "Transport",
-    "StateStore",
-    "StoredEvent",
-    "SupportsConversationBindings",
+    "PlannerAction",
+    "PlannerFinish",
+    "PlannerTaskPipeline",
+    "ReactPlanner",
     "RemoteBinding",
-    "RemoteTransport",
     "RemoteCallRequest",
     "RemoteCallResult",
     "RemotePushNotificationBinding",
@@ -205,12 +142,13 @@ __all__ = [
     "RemoteTaskSnapshot",
     "RemoteTaskState",
     "RemoteTaskStatus",
-    "RemoteNode",
-    "REMOTE_TERMINAL_TASK_STATES",
-    "SupportsRemoteTasks",
-    "ReactPlanner",
-    "PlannerAction",
-    "PlannerFinish",
+    "RemoteTransport",
+    "ScheduleConfig",
+    "SessionConnection",
+    "SessionLimits",
+    "SessionManager",
+    "SessionStateStore",
+    "SideEffect",
     "SkillCapabilityContext",
     "SkillPackConfig",
     "SkillProposalConfig",
@@ -221,10 +159,42 @@ __all__ = [
     "SkillProviderFactory",
     "SkillsConfig",
     "SkillsDirectoryConfig",
+    "StateStore",
+    "StateStoreSessionAdapter",
+    "StateUpdate",
+    "SteeringCancelled",
+    "SteeringEvent",
+    "SteeringEventType",
+    "SteeringInbox",
+    "StoredEvent",
+    "StreamingSession",
+    "StructuredFormatter",
+    "SupportsConversationBindings",
+    "SupportsRemoteTasks",
+    "TaskContextSnapshot",
+    "TaskResult",
+    "TaskRuntime",
+    "TaskStatus",
+    "TaskType",
     "ToolExamplesConfig",
+    "ToolInputExample",
+    "ToolLoadingMode",
     "ToolSearchConfig",
     "Trajectory",
     "TrajectoryStep",
+    "Transport",
+    "UpdateType",
+    "__version__",
+    "build_catalog",
+    # Logging
+    "configure_logging",
+    "discover_artifact_store",
+    "tool",
 ]
 
-__version__ = "3.11.2"
+try:
+    __version__ = _metadata.version("penguiflow-lite")
+except (
+    _metadata.PackageNotFoundError
+):  # imported from a source tree that is not installed
+    __version__ = "0.0.0"

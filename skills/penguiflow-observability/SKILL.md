@@ -1,110 +1,108 @@
 ---
 name: penguiflow-observability
-description: Add structured observability to a PenguiFlow runtime — turn on JSON logging with `configure_logging(structured=True)`, attach `log_flow_events` middleware to capture `FlowEvent` lifecycle (`node_start`/`node_success`/`node_error`/`node_timeout`/`node_retry`/`node_failed`/`deadline_skip`/`trace_cancel_*`), derive counters/histograms/gauges via `FlowEvent.metric_samples()`/`tag_values()` while obeying cardinality rules (never tag by `trace_id`), wire `FlowError`/`FlowErrorCode` for traceable failures, and export topology with `flow_to_mermaid`/`flow_to_dot`. Use when a user says "add observability", "logging", "metrics", "alerts", "trace this flow", "visualize", or asks how to monitor a production worker fleet.
+description: Add structured observability to a ReactPlanner deployment — turn on JSON logging with `configure_logging(structured=True)` (plus a separate call for the `penguiflow_a2a` logger), consume `PlannerEvent`s (`step_start`/`step_complete`/`tool_call_*`/`finish`/`planner_args_invalid`/`guardrail_*`/...) through `event_callback` or the `penguiflow.planner` logger, derive counters/histograms with safe cardinality (never tag by `trace_id`/`session_id`), trace native-adapter LLM calls with `PENGUIFLOW_LLM_TRACING`/`LLMTraceSink` (requires `use_native_llm=True`), record task lifecycle with a `TaskTelemetrySink`, read run cost/steps from `PlannerFinish.metadata`, and inspect session history persisted through `StateStoreSessionAdapter` with `penguiflow-admin`. Use when a user says "add observability", "logging", "metrics", "alerts", "trace this agent", "LLM tracing", "cost tracking", or asks how to monitor a production planner fleet.
 ---
 
 # PenguiFlow Observability
 
 ## When to use
-- Wiring structured logging into a production deployment.
-- Defining the metric/alert baseline for a worker fleet.
-- Debugging by visualizing graph topology.
-- Surfacing traceable errors (`FlowError`) to logs and dashboards.
+- Wiring structured logging into a production planner deployment.
+- Defining the metric/alert baseline for planner workers.
+- Tracing LLM calls (latency, tokens, cost) to logs or MLflow.
+- Investigating a run after the fact (steps, errors, persisted history).
 
 ## When NOT to use
-- Planner-internal events (`PlannerEvent`, tool-call lifecycle) → use [[penguiflow-reactplanner-config]] for the planner observability surface.
-- AG-UI events to frontend clients → use [[penguiflow-agui-events]].
-- StateStore-backed audit log → use [[penguiflow-statestore]] (events get persisted via `save_event`).
-- Streaming chunk metrics → use [[penguiflow-streaming]] for time-to-first-chunk instrumentation.
+- Shipping events to frontend clients → use [[penguiflow-streaming]].
+- Planner configuration (which features emit which events) → use [[penguiflow-reactplanner-config]].
+- StateStore backends for durable history → use [[penguiflow-statestore]].
+- Guardrail decision auditing in depth → use [[penguiflow-guardrails]].
 
 ## Hard boundaries
-This skill is the **runtime observability surface**: logs, `FlowEvent`, middleware-derived metrics, topology export. Planner-side observability (`PlannerEvent`) is the planner skill's job. Frontend event protocols (AG-UI) live in their own skill.
+This skill is the **operator observability surface**: logs, planner events as metrics, LLM tracing, task telemetry, cost, and offline inspection. Client-facing event delivery lives in [[penguiflow-streaming]].
 
 ## Workflow
 
 ### 1) Turn on structured logging
 ```python
 from penguiflow import configure_logging
+
 configure_logging(level="INFO", structured=True)
+configure_logging(level="INFO", structured=True, logger_name="penguiflow_a2a")
 ```
-Configures the `penguiflow` logger to emit JSON lines. For human-readable output during dev: `configure_logging(structured=False, include_extras=True)`. The `penguiflow.core` logger receives `FlowEvent` payloads when middleware is attached.
+The first call configures the `penguiflow` logger tree to emit JSON lines (`structured=False, include_extras=True` for readable dev output). Useful sub-loggers: `penguiflow.planner` (every planner event), `penguiflow.llm.telemetry` / `penguiflow.llm.tracing` (LLM calls), `penguiflow.tools.node` (ToolNode/MCP), `penguiflow.sessions.*` (sessions and task telemetry). The A2A server logs on its own `penguiflow_a2a` logger, outside that tree, so it needs the second call (or your own handler). `configure_logging` sets `propagate=False`, so your root handlers stop seeing those records.
 
-### 2) Attach `log_flow_events` middleware
+### 2) Know what the planner already logs
+Every `PlannerEvent` is logged on `penguiflow.planner` with `event.to_payload()` as `extra` — `llm_stream_chunk` at DEBUG, everything else at INFO. Lower that logger to WARNING in production if volume is a problem, and use step 3 for metrics.
+
+### 3) Hook `event_callback` for metrics
 ```python
-import logging
-from penguiflow import create, log_flow_events
+from prometheus_client import Counter, Histogram
 
-flow = create(
-    ...,
-    middlewares=[log_flow_events(logging.getLogger("penguiflow.flow"))],
-)
+from penguiflow.planner import PlannerEvent, ReactPlanner
+
+STEP_LATENCY = Histogram("pf_step_latency_s", "Tool step latency", ["tool"])
+FINISH = Counter("pf_finish_total", "Finished runs", ["reason"])
+
+
+def on_event(event: PlannerEvent) -> None:  # synchronous, keep it cheap
+    if event.event_type == "step_complete":
+        tool = event.node_name or "unknown"
+        STEP_LATENCY.labels(tool=tool).observe((event.latency_ms or 0) / 1000)
+    elif event.event_type == "finish":
+        FINISH.labels(reason=event.extra.get("reason", "unknown")).inc()
+
+
+planner = ReactPlanner(llm="gpt-4o-mini", catalog=..., event_callback=on_event)
 ```
-The middleware logs `node_start`/`node_success`/`node_error` only (defaults: INFO/INFO/ERROR; configurable via `start_level`/`success_level`/`error_level`). Payload is `event.to_payload()`; `node_error` also injects `error_payload`. All other event types (timeouts, retries, deadline skips, cancellations) pass through silently — wire a sibling middleware to log them.
-
-### 3) Know your `FlowEvent` catalog
-| `event_type` | When |
-|---|---|
-| `node_start` | Worker picked up a message for this node. |
-| `node_success` | Node returned normally. |
-| `node_error` | Node raised (will retry if budget allows). |
-| `node_timeout` | `NodePolicy.timeout_s` fired. |
-| `node_retry` | Retry scheduled with backoff. |
-| `node_failed` | Retries exhausted; `FlowError` materialized. |
-| `deadline_skip` | Expired `Message(deadline_s=...)` skipped. |
-| `trace_cancel_start` | `flow.cancel(trace_id)` invoked. |
-| `trace_cancel_drop` | Runtime dropped queued messages for the trace. |
-| `node_trace_cancelled` | In-flight node was cancelled. |
-
-Each `FlowEvent` carries: `event_type`, `ts`, `node_name`, `node_id`, `trace_id`, `attempt`, `latency_ms`, `queue_depth_in`, `queue_depth_out`, `outgoing_edges`, `queue_maxsize`, `trace_pending`, `trace_inflight`, `trace_cancelled`, `extra`. `queue_depth_total` is a **computed property**, not a field. Use `event.to_payload()` for logging (it renames `event_type`→`event`, depth keys to `q_depth_*`, and merges `extra` flat), `event.metric_samples()` + `event.tag_values()` for metrics, and `event.error_payload` for structured `FlowError` data on `node_error`.
+Event catalog and fields in `references/planner-events-and-logging.md`.
 
 ### 4) Derive metrics with the right cardinality
-**Critical rule: never tag metrics by `trace_id`.** It's unbounded. Safe tags: `event_type`, `node_name`, `env`, `service`. `tenant` only if bounded. `error_class` only if bounded.
+**Never tag metrics by `trace_id`, `session_id`, `task_id` or `user_id`.** Safe tags: `event_type`, tool name (bounded by your catalog), finish `reason`, `env`, `service`. A tenant tag only if the tenant count is bounded.
 
 Recommended baseline:
-- **Counters**: `node_success_total`, `node_error_total`, `node_timeout_total`, `node_retry_total`, `node_failed_total`, `trace_cancel_start_total`, `trace_cancel_finish_total`, `deadline_skip_total`.
-- **Histograms**: node latency (ms) by `node_name` + outcome.
-- **Gauges**: `queue_depth_in`, `queue_depth_out`, `queue_depth_total`, `trace_inflight`.
+- **Counters**: runs by finish reason (`answer_complete` / `no_path` / `budget_exhausted`), tool calls and tool errors by tool, `planner_args_invalid`, `finish_repair_*`, `guardrail_retry`, pauses.
+- **Histograms**: `step_complete.latency_ms` by tool; run duration; steps per run (`PlannerFinish.metadata["step_count"]`).
+- **Cost**: `PlannerFinish.metadata["cost"]["total_cost_usd"]` (also `finish` event `extra["cost"]`) per run.
 
-Recipes for Prometheus / StatsD / OpenTelemetry adapters in `references/metrics-and-alerts.md`.
+Recipes in `references/metrics-and-alerts.md`.
 
-### 5) Wire alerts on the right SLIs
-Starter alert set: error rate spike, retry storm, timeout spike, queue saturation (`queue_depth_total` trending up), `node_failed` accumulation, `deadline_skip` spike. Specific thresholds + dashboards in `references/metrics-and-alerts.md`.
+### 5) Trace LLM calls
+Tracing covers the **native LLM adapter only**: `ReactPlanner(use_native_llm=True, ...)` (the default is `False`, the LiteLLM client) or an adapter you build with `create_native_adapter(...)` and pass as `llm_client=`.
+- Zero-code: `export PENGUIFLOW_LLM_TRACING=mlflow` (or `log`) — every native-adapter completion becomes a span with provider, model, tokens, cost and latency (never message contents). Without `use_native_llm=True` the variable does nothing.
+- Explicit: pass `trace_sink=MlflowLLMTraceSink()` / `LoggingLLMTraceSink()` (from `penguiflow.llm.tracing`) to `create_native_adapter(...)`.
+- Raw LLM events (`request_start`/`request_end`/`retry`/`error`): `get_telemetry_hooks().register(callback)` from `penguiflow.llm.telemetry`, with ready-made `create_mlflow_callback()` / `create_prometheus_callback()`. They fire for the standalone `penguiflow.llm.LLMClient` and for the planner's own LLM calls (native adapter and LiteLLM client; `mode` is the output mode, or `native_tools` for native tool calling).
 
-### 6) Use `FlowError` for terminal failures
-When retries exhaust, runtime builds a `FlowError(trace_id, node_name, node_id, code, message, original_exc, ...)`. Code values from `FlowErrorCode` (e.g., `NODE_EXCEPTION`, `NODE_TIMEOUT`). To surface to callers via `fetch()`: `create(..., emit_errors_to_rookery=True)` — but only if `FlowError.message` is safe to expose.
+Worked example: `examples/mlflow_llm_tracing/`.
 
-For audit persistence, attach a `StateStore` — every `FlowEvent` gets a `save_event(StoredEvent(...))` call (best-effort). See [[penguiflow-statestore]].
+### 6) Task lifecycle with sessions
+`StreamingSession` / `SessionManager` accept `telemetry_sink=` — a `TaskTelemetrySink` receiving `TaskTelemetryEvent`s (`task_spawned`/`task_completed`/`task_failed`/`task_cancelled`, `task_group_completed`/`task_group_failed`, with `duration_ms`, task type and mode). `LoggingTaskTelemetrySink` (in `penguiflow.sessions.telemetry`) logs them. See [[penguiflow-background-tasks]].
 
-### 7) Export topology with `flow_to_mermaid` / `flow_to_dot`
-```python
-from penguiflow import flow_to_mermaid, flow_to_dot
-print(flow_to_mermaid(flow, direction="LR"))
-print(flow_to_dot(flow, rankdir="TB"))
-```
-Mermaid for docs and PR reviews; DOT when you want Graphviz post-processing. Topology only — no runtime state.
+### 7) Inspect runs after the fact
+- `PlannerFinish.metadata` carries `steps` (the full trajectory with observations/errors), `step_count`, `cost`, `sources`, `artifacts`, `llm_context`, `tool_context`, and repair counters.
+- Persisted session history: `penguiflow-admin history session:<session_id> --state-store module:factory` (or `replay ... --delay 0.2`) prints the `StoredEvent`s that `StateStoreSessionAdapter` saved for that session (tasks, updates, steering). A bare `planner.run()` doesn't write `StoredEvent`s; with a `state_store` and `trace_id` in `tool_context` it saves through `save_trajectory`/`save_planner_event`, which the CLI doesn't read.
+- Export the tool catalog for reviews: `[spec.to_tool_record() for spec in catalog]` — see `references/tool-catalog-export.md`.
 
 ### 8) Don't leak secrets into logs/metrics
-- Avoid logging raw payloads — use ids and summaries.
-- Don't put secrets in `Message.meta` if events are persisted or logged.
-- Strip exception representations of URLs/headers/tokens at a middleware boundary if you can't trust upstream code.
+- Planner event payloads can include tool args (`tool_call_start.extra["args_json"]`) and observations — redact before shipping logs off-host.
+- Keep secrets in `tool_context` (never sent to the LLM), not `llm_context`. Both are still returned in `PlannerFinish.metadata` and persisted with trajectories, so don't log those wholesale.
+- Sanitize exception messages raised by tools; they surface in `tool_call_result` / step errors.
 
 ## Troubleshooting (fast checks)
-- **No `FlowEvent` in logs** — `log_flow_events` middleware not attached; pass it in `create(..., middlewares=[...])`.
-- **Duplicate logs** — both root handlers and `configure_logging` configured; pick one entrypoint.
-- **Logs missing `trace_id`** — payload-only flow; switch to `Message` envelopes.
-- **Metric backend OOMs** — you tagged by `trace_id` or other unbounded label; demote to a log field.
-- **Latency histograms missing** — you're sampling `node_success` only; some events have no latency (`node_start`); guard for `None`.
-- **Topology export shows anonymous labels** — nodes lack `name=`; always set it.
-- **`FlowError` doesn't reach callers** — `emit_errors_to_rookery=False` (default); enable if safe.
-- **Sensitive data in logs** — raw payloads or `repr(exc)` containing URLs/tokens; redact at middleware boundary.
+- **No planner events in logs** — `configure_logging` not called, or the `penguiflow.planner` logger level is above INFO.
+- **No A2A server logs** — `penguiflow_a2a` isn't under `penguiflow`; configure it separately.
+- **penguiflow logs missing from your root handlers** — `configure_logging` sets `propagate=False`; either use its handler or skip it and configure the `penguiflow` logger yourself.
+- **`event_callback` metrics missing under load** — one shared planner instance with a per-request callback overwritten by another request; set a process-wide metrics callback, or build planners from a factory.
+- **Metric backend OOMs** — tagged by `trace_id`/`session_id`; demote to a log field.
+- **No LLM spans** — `use_native_llm` is False (the default), `PENGUIFLOW_LLM_TRACING` unset or misspelled (a warning is logged), or MLflow not installed.
+- **`penguiflow-admin` prints nothing** — the trace id isn't `session:<session_id>`, the store isn't the one behind `StateStoreSessionAdapter`, or the history came from a bare `planner.run()` (not readable by the CLI).
+- **Sensitive data in logs** — tool args or observations logged verbatim; redact via a logging filter.
 
 ## Worked examples
-- `examples/visualizer/flow.py` — Mermaid/DOT export.
-- `examples/mlflow_metrics/flow.py` — MLflow exporter pattern.
-- `examples/traceable_errors/flow.py` — `FlowError` to Rookery and through events.
-- `examples/reliability_middleware/flow.py` — custom middleware on top of `log_flow_events`.
+- `examples/mlflow_llm_tracing/` — LLM tracing to MLflow.
+- `examples/planner_enterprise_agent/telemetry.py` — planner-event telemetry collector.
+- `examples/streaming_llm/stream_answer.py` — `event_callback` wiring.
 
 ## References (load only as needed)
-- `references/flow-events-and-logging.md` — full `FlowEvent` catalog, `configure_logging` options, custom middleware patterns, redaction.
-- `references/metrics-and-alerts.md` — counters/histograms/gauges, cardinality rules, Prometheus/StatsD recipes, dashboards, alerts.
-- `references/topology-export.md` — `flow_to_mermaid`/`flow_to_dot` knobs, CI integration, "as-built" docs pattern.
+- `references/planner-events-and-logging.md` — `configure_logging` options, `PlannerEvent` catalog and fields, logging volume, redaction.
+- `references/metrics-and-alerts.md` — counters/histograms, cardinality rules, Prometheus/OpenTelemetry recipes, dashboards, alerts.
+- `references/tool-catalog-export.md` — exporting the tool catalog (`to_tool_record`) for docs, reviews and CI diffs.

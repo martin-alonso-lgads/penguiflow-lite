@@ -6,7 +6,7 @@ Deterministic. No LLM dependency.
 
 Behavior:
 - Keeps the most recent `full_zone_turns` turns.
-- Drops older turns when over budget.
+- Then drops the oldest turns while the payload is over `total_max_tokens`.
 - Health is always `healthy`.
 
 Use when:
@@ -17,7 +17,7 @@ Use when:
 What the LLM sees:
 ```json
 "conversation_memory": {
-  "recent_turns": [{"user": "...", "assistant": "..."}, ...]
+  "recent_turns": [{"user": "...", "assistant": "..."}]
 }
 ```
 
@@ -28,96 +28,106 @@ No `summary`, no `pending_turns`.
 LLM-maintained summary + recent turns.
 
 Behavior:
-- New turns enter `pending_turns`.
-- When `pending_turns` is large enough, the summarizer model rolls them into the `summary`.
-- The summary is bounded by `summary_max_tokens`.
-- If the summarizer fails repeatedly, memory enters `degraded` and silently falls back to truncation behavior.
+- When there are more than `full_zone_turns` turns, the oldest move to `pending_turns`, and a background summarization starts right away.
+- The summarizer gets the previous summary plus the pending turns and returns a new summary, which replaces the old one; the pending turns are then cleared.
+- The summary is clipped to `summary_max_tokens` (keeping its end).
+- If the summarizer keeps failing, memory becomes `degraded` and shows recent turns only.
 
-What the LLM sees (healthy):
+What the LLM sees (healthy, summary in flight or done):
 ```json
 "conversation_memory": {
-  "recent_turns": [{"user": "...", "assistant": "..."}, ...],
-  "summary": "User's name is Alice. Prefers terse responses. Asked about ...",
-  "pending_turns": []
+  "recent_turns": [{"user": "...", "assistant": "..."}],
+  "summary": "<session_summary>\nUser's name is Alice. Prefers terse responses.\n</session_summary>",
+  "pending_turns": [{"user": "...", "assistant": "..."}]
 }
 ```
+
+`summary` and `pending_turns` appear only when non-empty. The planner's summarizer wraps its output in `<session_summary>` tags.
 
 What the LLM sees (degraded):
 ```json
 "conversation_memory": {
-  "recent_turns": [...]
+  "recent_turns": [{"user": "...", "assistant": "..."}]
 }
 ```
 
-(Summary may be stale and pending_turns absent — fallback to truncation-style.)
+The summary is hidden while degraded; older turns wait in a backlog for recovery.
 
 ## `MemoryHealth` lifecycle
 
 States (the `MemoryHealth` enum):
-- `HEALTHY` (`"healthy"`) — Summarizer works; rolling summary is fresh.
-- `RETRY` (`"retry"`) — Last summarizer call failed; another retry is pending under `retry_attempts`/`retry_backoff_base_s`.
-- `DEGRADED` (`"degraded"`) — Retry budget exhausted; memory falls back to truncation behavior while a slower recovery loop continues (`degraded_retry_interval_s`).
-- `RECOVERING` (`"recovering"`) — A retry succeeded after degradation; transient state before returning to `HEALTHY`.
+- `HEALTHY` (`"healthy"`) — The last summarization succeeded (or none has failed yet).
+- `RETRY` (`"retry"`) — A summarization failed; it is retried in the background after `retry_backoff_base_s * 2 ** (failures - 1)` seconds.
+- `DEGRADED` (`"degraded"`) — More than `retry_attempts` consecutive failures. Pending turns move to a backlog, and the prompt shows recent turns only.
+- `RECOVERING` (`"recovering"`) — A recovery attempt on the backlog is in flight.
 
-Transitions emit `on_health_changed(old, new)`. Wire this to your metrics sink to alert on summarizer reliability.
+Transitions fire `on_health_changed(old, new)`. Wire this to your metrics sink to alert on summarizer reliability.
 
 ### Recovery loop
 
 When degraded:
-1. The planner retries the summarizer on each turn, up to `retry_attempts`.
-2. Failures trigger exponential backoff (`retry_backoff_base_s`).
-3. Persistent failure: state stays `degraded`; retries continue at `degraded_retry_interval_s`.
-4. A successful retry transitions back to `recovering`, then `healthy`.
-
-`recovery_backlog_limit` caps how many pending turns the recovery loop will try to incorporate at once.
+1. Each new turn keeps only the last `full_zone_turns` turns; older ones go to the backlog, which holds at most `recovery_backlog_limit` turns (the oldest are dropped).
+2. A recovery attempt starts on `add_turn` if at least `degraded_retry_interval_s` seconds passed since the last one. Health becomes `recovering` while it runs.
+3. Success replaces the summary, clears the backlog and returns to `healthy`.
+4. Failure returns to `degraded`, and the next attempt waits for the interval again.
 
 ## Trajectory digests
 
-When `include_trajectory_digest=True`, each turn carries a `TrajectoryDigest`:
+When `include_trajectory_digest=True` (the default), the planner builds a `TrajectoryDigest` for each finished run that made at least one successful tool call:
 
 ```python
+from penguiflow.planner.memory import TrajectoryDigest
+
 TrajectoryDigest(
-    tools_invoked=["search.web", "search.docs"],
-    observations_summary="Found 5 results. Top: ...",
-    reasoning_summary="Decided to combine both search backends because...",
-    artifacts_refs=["artifact://abc123"],
+    tools_invoked=["search_web", "search_docs"],
+    observations_summary=(
+        '- search_web: {"hits": 5}\n- search_docs: {"hits": 2}'
+    ),
+    reasoning_summary="Combined both search backends.",
+    artifacts_refs=[],
 )
 ```
 
-The planner builds the digest from the turn's trajectory after the run completes.
+- `tools_invoked`: the successful tool calls, in order.
+- `observations_summary`: one `- <tool>: <observation JSON>` line per call, each cut to 400 characters.
+- `reasoning_summary`: the final step's `thought`.
+- `artifacts_refs`: left empty by the planner.
 
 Trade-off:
-- **On** — the model sees what tools were used and why; better continuity for multi-turn debugging.
-- **Off** — smaller prompts; cheaper. Default.
+- **On** (default) — the model sees what tools were used; better continuity for multi-turn debugging.
+- **Off** — smaller prompts; cheaper.
 
-Turn it on for high-value sessions (support escalations, debugging). Leave it off for high-throughput chat.
+Keep it on for high-value sessions (support escalations, debugging). Turn it off for high-throughput chat.
 
 ## Choosing a summarizer model
 
 Production criteria:
-- **Cheap** — summarizer runs once per turn. Cost compounds.
-- **Fast** — affects perceived latency of multi-turn sessions.
+- **Cheap** — a summarization runs each time turns leave the full zone, so roughly once per turn once the zone is full. Cost compounds.
+- **Fast** — it runs in the background, but a slow summarizer leaves more `pending_turns` in the prompt.
 - **Reliable** — failures cause health degradation; uptime matters.
 - **Good at compression** — small models that summarize crisply.
 
-Reasonable choices:
-- `gpt-4.1-mini`, `gpt-4o-mini`
-- `claude-haiku` (latest)
-- `gemini-flash` (latest)
+Reasonable choices: `gpt-4o-mini`, `gpt-4.1-mini`, or the small fast model of your provider (it is built with the same LLM backend as the planner). With `summarizer_model=None`, the planner's own LLM summarizes.
 
 Avoid the same model as your main planner unless prompt cost is negligible.
 
 ## Token estimator
 
-Default heuristic counts characters / 4 (rough English approximation). For production:
+The default heuristic is `len(text) // 4 + 1` (rough English approximation). For production:
 
 ```python
 import tiktoken
-enc = tiktoken.encoding_for_model("gpt-4")
-stm = ShortTermMemoryConfig(..., token_estimator=lambda s: len(enc.encode(s)))
+
+from penguiflow.planner.memory import ShortTermMemoryConfig
+
+enc = tiktoken.encoding_for_model("gpt-4o")
+stm = ShortTermMemoryConfig(
+    strategy="truncation",
+    token_estimator=lambda text: len(enc.encode(text)),
+)
 ```
 
-Real tokenizers give accurate budget enforcement. Worth the cost if you're optimizing prompts tightly.
+Real tokenizers give accurate budget enforcement. Worth the cost if you're optimizing prompts tightly. `tiktoken` is not a PenguiFlow dependency; install it yourself.
 
 ## Operational defaults by workload
 
@@ -129,7 +139,7 @@ Real tokenizers give accurate budget enforcement. Worth the cost if you're optim
 - `overflow_policy="truncate_oldest"`
 - `include_trajectory_digest=False`
 - `summarizer_model="gpt-4o-mini"`
-- `require_explicit_key=True`
+- `require_explicit_key=True`, plus an explicit `MemoryKey` per call
 
 ### Single-user assistant
 - `strategy="truncation"`
@@ -140,18 +150,19 @@ Real tokenizers give accurate budget enforcement. Worth the cost if you're optim
 ### Debugging / support tool
 - `strategy="rolling_summary"`
 - `full_zone_turns=8`
-- `include_trajectory_digest=True`   # keep tool history visible
+- `include_trajectory_digest=True` (the default; keeps tool history visible)
 - `summarizer_model="gpt-4o-mini"`
 
-### Hard-budget compliance flow
+### Hard token cap
 - `strategy="truncation"`
 - `total_max_tokens=4000`
-- `overflow_policy="error"`           # fail loudly if over budget
+- `overflow_policy="truncate_oldest"` (under the planner, `"error"` only logs `memory_add_turn_failed`; it doesn't fail the run)
 
 ## Anti-patterns
 
 - **Long-term memory** — STM is bounded; don't use it as a knowledge base. Build retrieval separately.
-- **Storing secrets** — anything in STM enters `llm_context`. Treat it as LLM-visible.
-- **Anonymous keys in production** — `require_explicit_key=False` + no `tool_context` keys = single global session shared across users. Catastrophic in multi-tenant.
-- **Tight budgets with `error` overflow** — user-facing flows will randomly raise. Use truncation policies for UX.
+- **Storing secrets** — anything in STM enters the prompt. Treat it as LLM-visible.
+- **Anonymous keys in production** — `require_explicit_key=False` + no `tool_context` keys = one anonymous session shared by every keyless call on the planner. Catastrophic in multi-tenant.
+- **Session id without tenant** — a derived key from `session_id` alone lands under tenant `"default"`, so tenants that reuse session ids share memory.
+- **Relying on `error` overflow under the planner** — it logs instead of raising, so it enforces nothing. Use a truncation policy.
 - **Heavy hooks** — hooks are fire-and-forget but they still consume the event loop. Don't do DB writes there; use a `StateStore`.

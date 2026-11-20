@@ -1,109 +1,53 @@
-# `ObservationGuardrailConfig` — Context Overflow Safety Net
+# `ObservationGuardrailConfig`: Context-Overflow Safety Net
 
-This is a **reliability guardrail**, not a policy guardrail. It prevents one bad tool output from blowing the planner's context window. It's enabled by default and lives on a different axis from the `GuardrailGateway`.
+This is a reliability clamp, not a policy decision. It keeps one oversized tool result from flooding the next prompt. It is always on and independent of `GuardrailGateway`. Source: `_clamp_observation` in `penguiflow/planner/payload_builders.py`.
 
-## What it does
-
-When a tool returns an observation (its result), the planner has to embed it in the next LLM prompt. A 50 MB tool output would explode the prompt.
-
-The observation clamp:
-1. Measures the observation's size.
-2. If under the configured thresholds → pass through unchanged.
-3. If over threshold:
-   - If `auto_artifact_threshold > 0` and an `ArtifactStore` is available → store the observation, return an artifact ref + preview.
-   - Otherwise → truncate by field (`max_field_chars`), preserving structure when possible, with `truncation_suffix` appended.
-
-The LLM sees either the full observation, an artifact ref it can dereference, or a structure-preserved truncated version.
-
-## Config (actual fields)
+## Config
 
 ```python
+from penguiflow.planner import ReactPlanner
 from penguiflow.planner.models import ObservationGuardrailConfig
 
 planner = ReactPlanner(
     ...,
     observation_guardrail=ObservationGuardrailConfig(
-        max_observation_chars=50_000,        # default; size threshold for triggering the clamp (>= 1000)
-        max_field_chars=10_000,              # default; max chars per field when truncating (>= 100)
+        max_observation_chars=50_000,   # >= 1000; the clamp triggers above this
+        max_field_chars=10_000,         # >= 100; per-string cap when truncating
         truncation_suffix="\n... [truncated: {truncated_chars} chars]",
-        preserve_structure=True,             # default; keep JSON structure (only truncate values)
-        auto_artifact_threshold=20_000,      # default; store as artifact if larger (0 disables artifact path)
-        preview_length=500,                  # default; preview length included in truncated refs (>= 0)
+        preserve_structure=True,
+        auto_artifact_threshold=20_000, # >= 0; 0 disables the artifact path
+        preview_length=500,             # >= 0
     ),
 )
 ```
 
-There is no `enabled` flag. The clamp is active whenever an `ObservationGuardrailConfig` is present on `ReactPlanner`; pass `observation_guardrail=None` to opt out (or accept the default by omitting the kwarg — `ReactPlanner` instantiates one for you). Don't disable in production: even "small" tools can occasionally return huge outputs (an MCP server hiccup, an unintended query result).
+The values shown are the defaults. There is no `enabled` flag. `observation_guardrail=None` (or omitting it) gives the default config; it does **not** disable the clamp. To effectively turn it off, raise `max_observation_chars` above any output you expect.
 
-## Why it's separate from policy guardrails
+## What happens to a tool result
 
-Different concerns:
-- **Policy guardrails** decide *whether* to allow content based on rules. Output: decision.
-- **Observation clamp** decides *how* to fit content into the prompt without overflow. Output: transformed content.
+The planner serializes the tool's output model to JSON and measures its length in characters.
 
-The policy gateway never sees the artifact ref — by the time it inspects `tool_call_result`, the observation has already been clamped. If you have a rule that needs to inspect the full content, do so server-side before the result reaches the planner (e.g., inside the tool itself).
+1. **At or under `max_observation_chars`:** unchanged. `max_field_chars` plays no part here; a 15,000-char field passes through.
+2. **Over it, with `auto_artifact_threshold > 0` and the size at least that threshold:** the JSON is stored with `artifact_store.put_text(..., namespace="observation.<tool>")`. The observation becomes `{"artifact": <ArtifactRef dump>, "summary": "Large observation stored as artifact (... chars). Artifact ID: ...", "preview": <first preview_length chars>...}`. With the defaults, every clamped observation takes this path, because the 20,000 threshold is below the 50,000 cap.
+3. **Otherwise, or if `put_text` raises:** the observation is truncated.
+   - With `preserve_structure=True`: every string longer than `max_field_chars` is cut and gets the suffix, nested dicts are handled the same way, and lists longer than 20 items keep 20 plus `"... [N more items]"`. If the result is still over the cap, the largest **top-level** strings are cut to `preview_length`. The result is not guaranteed to fit.
+   - With `preserve_structure=False`: the observation becomes `{"truncated_observation": <the first chars of the JSON>, "truncation_note": <suffix>}`.
 
-## Artifact path
+Each clamp emits a planner event, `observation_clamped`, with `extra={"original_size", "clamped_size", "method": "artifact"|"truncate", "reduction_pct"}`, and logs `observation_clamped`.
 
-When `auto_artifact_threshold > 0` and an `ArtifactStore` is available, observations larger than that threshold are uploaded; the planner sees a reference plus a short preview (length controlled by `preview_length`).
+The clamped value replaces the observation everywhere: in the trajectory, in what the LLM sees, and in the `tool_call_result` guardrail event, which runs after the clamp. Only the artifact keeps the full content.
 
-Benefits:
-- Full data preserved.
-- LLM can request specific slices via artifact-reading tools.
-- Audit trail (artifact stored durably if your store is durable).
+## The artifact store matters
 
-Requirements:
-- `ArtifactStore` configured ([[penguiflow-statestore]] covers backends).
-- Planner tool catalog includes artifact-reading tools (the rich-output `list_artifacts` is one example, but you may want a generic `read_artifact_slice(ref, offset, length)`).
+Without a real store the planner uses `NoOpArtifactStore`. Its `put_text` succeeds and returns a ref, but stores nothing: the ref's `source` says `"Content truncated (no ArtifactStore configured)"`. The LLM gets a ref and a preview, and the full output is gone. Pass `ReactPlanner(artifact_store=...)`, or a `state_store` that exposes one (see [[penguiflow-statestore]]), if the content must survive.
 
-Set `auto_artifact_threshold=0` to disable the artifact path; the clamp will then always truncate.
+The scope of a stored observation comes from `tool_context` (`session_id`, `tenant_id`, `user_id`, `trace_id`). It is scoped only when `session_id` is set.
 
-## Truncation path
+No built-in tool reads an artifact back into the prompt. If the LLM needs slices of a stored observation, add a tool that calls `ctx.artifacts.download(artifact_id)` and returns the part it needs. The rich-output `list_artifacts` tool only lists artifacts.
 
-When the artifact path is unavailable or disabled:
+## Tuning
 
-1. Observation exceeds `max_observation_chars` (or any single field exceeds `max_field_chars`).
-2. Truncate field-by-field to `max_field_chars`.
-3. Append `truncation_suffix`. The format string supports `{truncated_chars}` interpolation.
-4. If `preserve_structure=True` (default) and the observation parses as JSON, drop or stub the largest leaf values first while keeping the tree intact.
-
-This loses data. Use only when you can't run an `ArtifactStore`.
-
-## Structure-preserving truncation
-
-`preserve_structure=True` makes the clamp:
-- Parse the observation as JSON when possible.
-- Walk the tree; sort fields by size.
-- Truncate or stub the largest leaf values first.
-- Stop when the serialized form fits.
-
-The LLM gets a valid-JSON observation it can reason about, even if some leaf values are stubbed. Better than blunt char-level truncation that breaks the structure.
-
-## Tuning `max_observation_chars`
-
-| Use case | Suggested value |
-|---|---|
-| GPT-4o (128k context) | 30,000 - 60,000 |
-| Long-context Claude/Opus (200k+) | 50,000 - 100,000 |
-| Small model (32k context) | 4,000 - 8,000 |
-
-Balance: too low triggers the clamp on legitimate outputs (artifact refs everywhere); too high allows context bloat. Measure observation size distribution in your workload.
-
-`max_field_chars` is a finer knob: even with a high observation cap, individual fields will be truncated if they exceed `max_field_chars`. Useful when one giant field overshadows the rest.
-
-## Monitoring
-
-Track:
-- Observation clamp activation rate (clamps per tool call).
-- Per-tool clamp rate — identifies tools with consistently large outputs (candidates for native artifact return).
-- Artifact path vs truncation path ratio — should be near 100% artifact in production.
-- Size distribution of clamped observations.
-
-A persistent clamp rate >5% on a specific tool means the tool itself should return artifact refs natively, not raw blobs.
-
-## Anti-patterns
-
-- **Setting `observation_guardrail=None`** in production — saves one line of config, costs you a context-overflow incident.
-- **Truncation-only mode** (`auto_artifact_threshold=0` without a store) — lossy by design.
-- **Tools that paginate to evade the clamp** — they leak to the LLM as N small calls. Better: one call that returns an artifact ref + offset/length.
-- **`max_observation_chars` too low** — every observation becomes an artifact; the LLM thrashes calling `read_artifact`.
+- Size `max_observation_chars` from the model's context window and your other prompt content. About 4 characters per token is a rough guide.
+- Watch `observation_clamped` per tool. A tool that clamps often should return less, or store its own artifact and return a ref.
+- Set `auto_artifact_threshold=0` only if a lossy, truncated observation is acceptable.
+- Setting `max_observation_chars` too low turns ordinary results into refs and previews, which the LLM can't read further.

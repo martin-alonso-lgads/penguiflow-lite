@@ -17,28 +17,30 @@ The `ReactPlanner` serves as the central orchestrator for both foreground and ba
 
 ### 2. Background Tasks Configuration
 
-The `BackgroundTasksConfig` model defines all configurable aspects of background task execution:
+The `BackgroundTasksConfig` model holds the planner's background options and the defaults for new task groups. It rejects unknown fields. Limits and proactive reporting are configured elsewhere:
 
 #### Core Enablement
-- `enabled`: Master switch for background task capabilities
+- `enabled`: Adds background task guidance to the system prompt (it does not turn the `tasks.*` tools on or off)
 - `include_prompt_guidance`: Whether to inject background task guidance into system prompts
-- `allow_tool_background`: Allows tools marked with `background=True` to spawn async tasks
+- `allow_tool_background`: Allows tools with `extra["background"]["enabled"]` to spawn async tasks
 
-#### Execution Modes
-- `default_mode`: Default execution mode ('subagent' for full reasoning or 'job' for single tool)
-- `default_merge_strategy`: How task results merge into context (HUMAN_GATED, APPEND, REPLACE)
-- `context_depth`: Context snapshot depth for spawned tasks (full, summary, minimal)
+#### Execution Modes (per task)
+- Mode (`subagent` or `job`), merge strategy (`human_gated`, `append`, `replace`), context depth (`full`, `summary`, `none`) and cancel propagation are `tasks.spawn` arguments (`mode`, `merge_strategy`, `context_depth`, `propagate_on_cancel`), or a tool's `extra["background"]` (`mode`, `default_merge_strategy`)
 
-#### Resource Limits
-- `max_concurrent_tasks`: Maximum concurrent tasks per session (default: 5)
-- `max_tasks_per_session`: Maximum total tasks per session (default: 50)
-- `task_timeout_s`: Task timeout in seconds (default: 3600)
-- `max_pending_steering`: Maximum queued steering messages per task (default: 2)
+#### Resource Limits (`SessionLimits`, on `SessionManager(limits=...)`)
+- `max_tasks_per_session`: Maximum non-terminal tasks per session (default: 8)
+- `max_background_tasks`: Maximum non-terminal background tasks per session (default: 4)
+- `max_concurrent_tasks`: Maximum tasks running at once (default: 3)
+- `max_task_runtime_s`: Task timeout in seconds (default: 900)
+- `steering_queue_size`: Maximum queued steering events per task (default: 200)
 
 #### Task Groups (RFC_TASK_GROUPS)
-- `default_group_merge_strategy`: Default merge strategy for task groups
-- `max_tasks_per_group`: Maximum tasks allowed in a single group (default: 10)
-- `group_timeout_s`: Timeout for group completion (default: 600s)
+- `default_group_merge_strategy`: Merge strategy of new task groups (default: APPEND)
+- `default_group_report`: Report strategy of new task groups (default: all)
+- `auto_seal_groups_on_foreground_yield`, `retain_turn_timeout_s`, `background_continuation_max_hops`, `background_continuation_cooldown_s`: Sealing and retained-turn waits
+
+#### Proactive Reporting
+- Configured with `setup_proactive_reporting()` or `StreamingSession.configure_proactive_reporting()` (`enabled`, `strategies`, `max_queued`, `timeout_s`, `max_hops`, `fallback_notification`)
 
 ### 3. Steering System
 
@@ -108,7 +110,7 @@ The `StreamingSession` manages the lifecycle of tasks and provides the execution
 
 #### Task Spawning Process
 1. **Action Recognition**: When the planner encounters a `task.subagent` or `task.tool` action
-2. **Validation**: Checks against `BackgroundTasksConfig` and spawn guards
+2. **Validation**: Checks the spawn guard and the session's `SessionLimits`
 3. **Context Snapshot**: Creates a snapshot of the current session context
 4. **Planner Forking**: Creates a new `ReactPlanner` instance using the `fork()` method
 5. **Task Creation**: Registers the task with the session manager
@@ -135,8 +137,10 @@ The `StreamingSession` manages the lifecycle of tasks and provides the execution
 
 #### Merge Strategies
 - **HUMAN_GATED**: Results require human approval before merging
-- **APPEND**: Results are appended to existing context
-- **REPLACE**: Results replace existing context
+- **APPEND**: Results are merged as soon as the task completes (latest result per task)
+- **REPLACE**: Currently the same as APPEND
+
+Merged results are shown to the foreground LLM as a read-only `<read_only_background_results>` system message until acknowledged.
 
 ## Data Flow and Interactions
 
@@ -145,7 +149,7 @@ The `StreamingSession` manages the lifecycle of tasks and provides the execution
 [ReactPlanner] 
     ↓ (detects task.subagent/task.tool action)
 [Action Processing] 
-    ↓ (validates against BackgroundTasksConfig)
+    ↓ (checks the spawn guard and SessionLimits)
 [Context Snapshot] 
     ↓ (captures current session state)
 [Fork Planner] 
@@ -466,12 +470,14 @@ The `StreamingSession` manages the lifecycle of tasks and provides the execution
 ### Basic Background Task Setup
 ```python
 from penguiflow.planner import ReactPlanner, BackgroundTasksConfig
+from penguiflow.sessions import SessionLimits, SessionManager
 
 config = BackgroundTasksConfig(
     enabled=True,
-    max_concurrent_tasks=3,
-    task_timeout_s=1800,
-    default_merge_strategy="HUMAN_GATED"
+    default_group_merge_strategy="HUMAN_GATED",
+)
+sessions = SessionManager(
+    limits=SessionLimits(max_concurrent_tasks=3, max_task_runtime_s=1800),
 )
 
 planner = ReactPlanner(

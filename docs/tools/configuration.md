@@ -53,8 +53,8 @@ Behavior:
 
 This is intentional: missing credentials should fail at startup/connect time, not later during agent execution.
 
-!!! note
-    Implementation detail: substitution uses a regex replace (`re.sub`) over `${...}` patterns, so multiple variables per string are supported.
+> [!NOTE]
+> Implementation detail: substitution uses a regex replace (`re.sub`) over `${...}` patterns, so multiple variables per string are supported.
 
 ### Auth modes (what they do)
 
@@ -62,12 +62,18 @@ This is intentional: missing credentials should fail at startup/connect time, no
 - `AuthType.BEARER`: sends `Authorization: Bearer <token>` using `auth_config["token"]`
 - `AuthType.API_KEY`: injects an API key header (`auth_config["api_key"]`, default header `X-API-Key`)
 - `AuthType.COOKIE`: injects a cookie header (`cookie_name`, `cookie_value`)
-- `AuthType.OAUTH2_USER`: user-scoped OAuth via HITL pause/resume (see **[OAuth & HITL](oauth-hitl.md)**)
+- `AuthType.OAUTH2_USER`: user-scoped OAuth via HITL pause/resume, with one MCP session per user (see **[OAuth & HITL](oauth-hitl.md)**)
+
+Where credentials can go:
+
+- an MCP stdio command gets no HTTP headers, so it accepts only `AuthType.NONE`: pass credentials to the subprocess with `env={...}` (any other `auth_type` fails validation)
+- `AuthType.OAUTH2_USER` needs an MCP server reached over a URL; UTCP/HTTP/CLI sources reject it
+- UTCP/HTTP/CLI sources get no auth headers: `env` and `auth_config` values reach the utcp client as variables
 
 ToolNode resolves auth:
 
-- during `connect(...)` (connection-time headers), and
-- per tool call (`ToolNode.call(...)`) so tokens can refresh/rotate.
+- during `connect(...)` (headers for the MCP session it opens), and
+- per tool call (`ToolNode.call(...)`): with `OAUTH2_USER` this looks up the caller's token, and a changed token opens a new session for that user.
 
 ### Resilience knobs
 
@@ -75,7 +81,8 @@ ToolNode resolves auth:
 
 - `timeout_s`: per-call timeout (default 30s)
 - `retry_policy`: tenacity-based backoff (`max_attempts`, min/max wait, retryable HTTP status codes)
-- `max_concurrency`: concurrency limit per ToolNode instance (default 10)
+- `max_concurrency`: concurrency limit per ToolNode instance, shared by all users (default 10)
+- `session_pool`: limits for per-user MCP sessions (`SessionPoolConfig(max_sessions=64, idle_timeout_s=900.0)`)
 
 ### Tool filtering (`tool_filter`)
 
@@ -173,7 +180,7 @@ from __future__ import annotations
 import asyncio
 
 from penguiflow import ModelRegistry
-from penguiflow.tools import AuthType, ExternalToolConfig, ToolNode, TransportType
+from penguiflow.tools import ExternalToolConfig, ToolNode, TransportType
 
 
 async def main() -> None:
@@ -184,8 +191,7 @@ async def main() -> None:
             name="github",
             transport=TransportType.MCP,
             connection="npx -y @modelcontextprotocol/server-github",
-            auth_type=AuthType.BEARER,
-            auth_config={"token": "${GITHUB_TOKEN}"},
+            env={"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},  # stdio: credentials via env
             tool_filter=["get_.*", "list_.*", "search_.*"],
             max_concurrency=3,
             timeout_s=30.0,

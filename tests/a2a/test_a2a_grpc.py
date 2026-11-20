@@ -1,14 +1,23 @@
+"""Tests for A2A gRPC."""
+
+from __future__ import annotations
+
 import grpc
 import pytest
 from google.rpc import error_details_pb2
 from grpc_status import rpc_status
 
-from penguiflow import Message as FlowMessage
-from penguiflow import Node, NodePolicy, create
 from penguiflow_a2a import A2AConfig, A2AService
 from penguiflow_a2a.bindings.grpc import add_a2a_grpc_service
 from penguiflow_a2a.grpc import a2a_pb2, a2a_pb2_grpc
-from penguiflow_a2a.models import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+from penguiflow_a2a.models import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+)
+
+from .planner_doubles import echo_planner
 
 
 def _agent_card() -> AgentCard:
@@ -16,7 +25,11 @@ def _agent_card() -> AgentCard:
         protocol_versions=["0.3"],
         name="Test Agent",
         description="Test",
-        supported_interfaces=[AgentInterface(url="https://example.com/a2a", protocol_binding="GRPC")],
+        supported_interfaces=[
+            AgentInterface(
+                url="https://example.com/a2a", protocol_binding="GRPC"
+            )
+        ],
         version="1.0.0",
         capabilities=AgentCapabilities(
             streaming=True,
@@ -26,17 +39,17 @@ def _agent_card() -> AgentCard:
         ),
         default_input_modes=["application/json"],
         default_output_modes=["application/json"],
-        skills=[AgentSkill(id="echo", name="Echo", description="Echo", tags=["test"])],
+        skills=[
+            AgentSkill(
+                id="echo", name="Echo", description="Echo", tags=["test"]
+            )
+        ],
     )
 
 
-async def _start_grpc_service():
-    async def echo(message: FlowMessage, _ctx) -> str:
-        return f"echo:{message.payload}"
-
-    node = Node(echo, name="echo", policy=NodePolicy(validate="none"))
-    flow = create(node.to(), emit_errors_to_rookery=True)
-    service = A2AService(flow, agent_card=_agent_card(), config=A2AConfig())
+async def _start_grpc_service() -> tuple[grpc.aio.Server, A2AService, int]:
+    planner = echo_planner()
+    service = A2AService(planner, agent_card=_agent_card(), config=A2AConfig())
     server = grpc.aio.server()
     add_a2a_grpc_service(server, service)
     port = server.add_insecure_port("127.0.0.1:0")
@@ -44,12 +57,13 @@ async def _start_grpc_service():
     return server, service, port
 
 
-def _metadata():
+def _metadata() -> tuple[tuple[str, str], ...]:
     return (("a2a-version", "0.3"),)
 
 
 @pytest.mark.asyncio
 async def test_grpc_send_get_list() -> None:
+    """GRPC send get list."""
     server, service, port = await _start_grpc_service()
     channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
     stub = a2a_pb2_grpc.A2AServiceStub(channel)
@@ -63,7 +77,10 @@ async def test_grpc_send_get_list() -> None:
             configuration=a2a_pb2.SendMessageConfiguration(blocking=True),
         )
         response = await stub.SendMessage(request, metadata=_metadata())
-        assert response.task.status.state == a2a_pb2.TaskState.TASK_STATE_COMPLETED
+        assert (
+            response.task.status.state
+            == a2a_pb2.TaskState.TASK_STATE_COMPLETED
+        )
 
         task_id = response.task.id
         get_task = await stub.GetTask(
@@ -85,6 +102,7 @@ async def test_grpc_send_get_list() -> None:
 
 @pytest.mark.asyncio
 async def test_grpc_error_info_task_not_found() -> None:
+    """GRPC error info task not found."""
     server, service, port = await _start_grpc_service()
     channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
     stub = a2a_pb2_grpc.A2AServiceStub(channel)

@@ -10,14 +10,32 @@ from typing import Any, Literal
 
 @dataclass(slots=True)
 class GuardrailContext:
-    """Context for a guardrail evaluation session."""
+    """Context for a guardrail evaluation session.
+
+    One context serves every run of a planner, so strikes are counted per
+    run (``GuardrailEvent.run_id``): one run's violations never show up in
+    another run's ``previous_violations``.
+    """
 
     run_id: str
     tenant_id: str | None = None
     persona_id: str | None = None
     tool_context: dict[str, Any] = field(default_factory=dict)
-    strike_counts: dict[str, int] = field(default_factory=dict)
+    strikes_by_run: dict[str, dict[str, int]] = field(default_factory=dict)
     policy_config: dict[str, Any] = field(default_factory=dict)
+
+    def add_strike(self, run_id: str, category: str) -> None:
+        """Count one strike of ``category`` for ``run_id``."""
+        counts = self.strikes_by_run.setdefault(run_id, {})
+        counts[category] = counts.get(category, 0) + 1
+
+    def strike_total(self, run_id: str) -> int:
+        """Return how many strikes ``run_id`` has."""
+        return sum(self.strikes_by_run.get(run_id, {}).values())
+
+    def clear_run(self, run_id: str) -> None:
+        """Forget ``run_id``'s strikes once the run is over."""
+        self.strikes_by_run.pop(run_id, None)
 
 
 @dataclass(slots=True)
@@ -77,14 +95,15 @@ class ContextSnapshotV1:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for external classifiers."""
-
         return {
             "schema_version": self.schema_version,
             "user_text": self.user_text,
             "primary_source": self.primary_source.value,
             "contains_untrusted": self.contains_untrusted,
             "max_tool_risk": self.max_tool_risk.value,
-            "current_tool": self.current_tool.name if self.current_tool else None,
+            "current_tool": self.current_tool.name
+            if self.current_tool
+            else None,
             "requests_system_info": self.requests_system_info,
             "requests_capability_change": self.requests_capability_change,
             "previous_violations": self.previous_violations,
@@ -94,13 +113,17 @@ class ContextSnapshotV1:
 class ContextSnapshotBuilder:
     """Builds ContextSnapshotV1 from planner state."""
 
-    def __init__(self, tool_risk_registry: dict[str, ToolRiskTier] | None = None) -> None:
+    def __init__(
+        self, tool_risk_registry: dict[str, ToolRiskTier] | None = None
+    ) -> None:
+        """Build snapshots with these tool risk tiers (default: medium)."""
         self._tool_risks = tool_risk_registry or {}
         self._default_risk = ToolRiskTier.MEDIUM
 
-    def build(self, event: GuardrailEvent, ctx: GuardrailContext) -> ContextSnapshotV1:
+    def build(
+        self, event: GuardrailEvent, ctx: GuardrailContext
+    ) -> ContextSnapshotV1:
         """Build context snapshot from current state."""
-
         text = event.text_content or ""
         current_tool = None
         if event.tool_name:
@@ -118,18 +141,21 @@ class ContextSnapshotBuilder:
         return ContextSnapshotV1(
             user_text=text,
             primary_source=self._infer_source(event),
-            contains_untrusted=ctx.tool_context.get("contains_untrusted", False),
+            contains_untrusted=ctx.tool_context.get(
+                "contains_untrusted", False
+            ),
             available_tools=tuple(available),
             current_tool=current_tool,
             max_tool_risk=max_risk,
             requests_system_info=self._check_system_info_request(text),
             requests_capability_change=self._check_capability_request(text),
-            previous_violations=sum(ctx.strike_counts.values()),
+            previous_violations=ctx.strike_total(event.run_id),
         )
 
-    def set_tool_risks(self, tool_risk_registry: dict[str, ToolRiskTier]) -> None:
+    def set_tool_risks(
+        self, tool_risk_registry: dict[str, ToolRiskTier]
+    ) -> None:
         """Replace the tool risk registry."""
-
         self._tool_risks = dict(tool_risk_registry)
 
     def _risk_order(self, risk: ToolRiskTier) -> int:
@@ -146,14 +172,18 @@ class ContextSnapshotBuilder:
             r"(show|reveal|print)\s*(your|the)\s*(instructions|rules|prompt)",
             r"what\s+are\s+your\s+instructions",
         ]
-        return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+        return any(
+            re.search(pattern, text, re.IGNORECASE) for pattern in patterns
+        )
 
     def _check_capability_request(self, text: str) -> bool:
         patterns = [
             r"(remove|disable|bypass)\s*(your\s+)?(restrictions|limits)",
             r"unrestricted\s+mode",
         ]
-        return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+        return any(
+            re.search(pattern, text, re.IGNORECASE) for pattern in patterns
+        )
 
 
 __all__ = [

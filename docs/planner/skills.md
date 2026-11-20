@@ -58,7 +58,6 @@ Key knobs (from `penguiflow.skills.models.SkillsConfig`):
 - `cache_dir`: where the skill store SQLite DB lives
 - `max_tokens`: cap for how much skill context can be injected per run
 - `top_k`: how many relevant skills to retrieve automatically
-- `summarize`: whether to summarize skill payloads to fit the budget
 - `redact_pii`: redact PII in skill text before injection (recommended)
 - `skill_packs`: list of `SkillPackConfig(name, path, format?, scope_mode?, ...)`
 - `directory`: optional “known skills” directory rendering (useful for discoverability)

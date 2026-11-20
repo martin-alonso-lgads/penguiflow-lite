@@ -1,12 +1,11 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.13.4,<0.14"]
+build-backend = "uv_build"
 
 [project]
-name = "penguiflow"
-version = "3.11.2"
+name = "penguiflow-lite"
+version = "8.0.0"
 description = "Async-first orchestration library for multi-agent and data pipelines"
-readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [
@@ -17,9 +16,9 @@ dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
     "fastapi>=0.118",
-    "uvicorn>=0.32",
     "databricks-mcp>=0.6.0",
     "mcp>=1.26,<2",
+    "typing-extensions>=4.15",
 ]
 
 [project.optional-dependencies]
@@ -31,13 +30,10 @@ dev = [
     "coverage[toml]>=7.0",
     "hypothesis>=6.103",
     "ruff>=0.2",
-    "ag-ui-protocol>=0.0.42",
     "jsonschema>=4.23",
     "fastapi>=0.118",
     "httpx>=0.27",
-    "jinja2>=3.1",
     "pyyaml>=6.0",
-    "uvicorn>=0.32",
     "tenacity>=9.0.0",
     "aiohttp>=3.9.0",
     "markitdown>=0.1.5",
@@ -54,17 +50,6 @@ dev = [
     # pydantic-ai transport tests
     "pydantic-ai-slim[openai,openrouter]>=1.107.0,<2",
     "genai-prices>=0.0.66,<1",
-]
-docs = [
-    "mkdocs>=1.6",
-    "mkdocs-material>=9.6,<9.7",
-    "mkdocstrings[python]>=0.25",
-]
-cli = [
-    "ag-ui-protocol>=0.0.42",
-    "jinja2>=3.1",
-    "fastapi>=0.118",
-    "uvicorn>=0.32",
 ]
 a2a-server = [
     "fastapi>=0.118",
@@ -117,38 +102,12 @@ pydantic-ai = [
 penguiflow-admin = "penguiflow.admin:main"
 penguiflow = "penguiflow.cli.main:app"
 
-[project.urls]
-Homepage = "https://github.com/hurtener/penguiflow"
 
-[tool.setuptools]
-packages = { find = { include = ["penguiflow*", "penguiflow_a2a*", "examples*"] } }
-include-package-data = true
-
-[tool.setuptools.exclude-package-data]
-"penguiflow" = [
-    "**/.DS_Store",
-    "**/*.py[cod]",
-    "**/__pycache__/*",
-    "cli/playground_ui/node_modules/*",
-    "cli/playground_ui/node_modules/**/*",
-    "cli/playground_ui/package.json",
-    "cli/playground_ui/src/*",
-    "cli/playground_ui/src/**/*",
-    "cli/playground_ui/tsconfig.json",
-    "cli/playground_ui/vite.config.ts",
-    "templates/new/**/.vscode/*",
-]
-
-[tool.setuptools.package-data]
-"penguiflow" = [
-    "templates/vscode/*",
-    "templates/new/**/*",
-    "templates/*.yaml",
-    "cli/templates/*",
-    "cli/templates/**/*",
-    "rich_output/registry.json",
-    "cli/playground_ui/dist/*",
-    "cli/playground_ui/dist/**/*",
+[tool.uv.build-backend]
+module-name = ["penguiflow", "penguiflow_a2a", "examples"]
+module-root = ""
+source-exclude = [
+    ".DS_Store",
 ]
 
 [tool.uv]
@@ -165,11 +124,9 @@ dev = [
     "coverage[toml]>=7.0",
     "hypothesis>=6.103",
     "ruff>=0.2",
-    "ag-ui-protocol>=0.0.42",
     "jsonschema>=4.23",
     "fastapi>=0.118",
     "httpx>=0.27",
-    "jinja2>=3.1",
     "pyyaml>=6.0",
     "tenacity>=9.0.0",
     "aiohttp>=3.9.0",
@@ -187,35 +144,63 @@ dev = [
     # pydantic-ai transport tests
     "pydantic-ai-slim[openai,openrouter]>=1.107.0,<2",
     "genai-prices>=0.0.66,<1",
+    "mypy-protobuf>=5.1.0",
+    "types-grpcio>=1.85.0.20261028",
+    "types-pyyaml>=6.0.12.20261113",
 ]
 
 [tool.ruff]
-line-length = 120
 target-version = "py311"
+line-length = 79
+src = [".", "tests"]
+# Generated protobuf/gRPC modules and their stubs.
 extend-exclude = [
-    "ooflow.py",
-    "penguiflow_a2a/grpc/a2a_pb2.py",
-    "penguiflow_a2a/grpc/a2a_pb2_grpc.py",
-    "tmp/codex-skills",
-    "test_generation",
-    ".claude/",
+    "penguiflow_a2a/grpc/a2a_pb2*.py",
+    "penguiflow_a2a/grpc/a2a_pb2*.pyi",
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "W"]
-ignore = ["UP042"]
+select = ["E", "F", "I", "UP", "B", "D", "W", "N", "C4", "SIM", "RUF", "ANN", "TC", "A", "ARG", "RET", "PTH", "DTZ", "ASYNC", "TRY", "EM", "SLF", "T20", "ERA", "INP", "C90"]
+ignore = []
 
-[tool.ruff.lint.isort]
-known-first-party = ["penguiflow"]
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# Public exception names kept as they are for API stability.
+[tool.ruff.lint.pep8-naming]
+ignore-names = [
+    "ModelRetry",
+    "ValidationRetry",
+    "MemoryBudgetExceeded",
+    "RemoteTaskInputRequired",
+    "RemoteTaskAuthRequired",
+    "SteeringCancelled",
+]
+
+# Pydantic evaluates annotations at runtime, so their imports stay at runtime.
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 
 [tool.mypy]
 python_version = "3.11"
-plugins = []
-files = ["penguiflow", "penguiflow_a2a"]
-disallow_untyped_defs = false
-ignore_missing_imports = true
-warn_unused_ignores = true
+files = ["penguiflow", "penguiflow_a2a", "examples", "tests"]
+strict = true
+pretty = true
 show_error_codes = true
+warn_redundant_casts = true
+warn_unreachable = true
+warn_unused_ignores = true
+no_implicit_optional = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+mypy_path = ["."]
+explicit_package_bases = true
+# Generated protobuf modules; mypy reads their .pyi stubs instead.
+exclude = ['penguiflow_a2a/grpc/a2a_pb2(_grpc)?\.py$']
 
 # numpy is a transitive-only dependency. Newer numpy releases ship .pyi stubs
 # that use PEP 695 `type` statements, which mypy rejects under our 3.11 target
@@ -230,7 +215,6 @@ follow_imports_for_stubs = true
 addopts = "-q"
 asyncio_mode = "auto"
 testpaths = ["tests"]
-norecursedirs = ["test_generation"]
 
 [tool.coverage.run]
 source = ["penguiflow"]

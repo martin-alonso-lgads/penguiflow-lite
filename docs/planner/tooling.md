@@ -47,10 +47,11 @@ For planner-level filtering and tool discovery (`tool_search`, `tool_get`, defer
 ## Operational defaults
 
 - Call `await tool_node.connect()` at service startup (or warm it on first request) and reuse the same ToolNode across sessions.
+- With `AuthType.OAUTH2_USER`, one ToolNode also serves every user: connect it with `connect(ctx)` (a `ToolContext` carrying a `user_id`), and it keeps one MCP session per user, with that user's token (the first opens at `connect(ctx)`, the others on each user's first call). Idle sessions are closed per `ExternalToolConfig.session_pool`.
 - Use `tool_filter` (or equivalent) to expose only a safe subset of tools to the LLM.
-- Set `ExternalToolConfig.max_concurrency` conservatively for external APIs (3–5 is a typical starting point).
+- Set `ExternalToolConfig.max_concurrency` conservatively for external APIs (3–5 is a typical starting point). It is shared by all users of the ToolNode.
 - If you expose MCP Apps, keep the `ToolNode` reachable after the initial tool call. The HTML artifact is only the view; the host still needs a live backend route for `tools/call`, `tools/list`, `resources/list`, and `resources/read`.
-- For web/playground hosts, the recommended lookup key is `session_id + namespace`. If you emit an app artifact and then drop the `ToolNode`/MCP client handle, the app will load but fail on its first follow-up action.
+- For web hosts, the recommended lookup key is `session_id + namespace`. If you emit an app artifact and then drop the `ToolNode`/MCP client handle, the app will load but fail on its first follow-up action.
 - Prefer bounded outputs:
   - small tool outputs are returned inline,
   - large/binary content should become artifacts (see Tools docs).
@@ -105,6 +106,7 @@ from penguiflow.tools.presets import get_preset
 
 registry = ModelRegistry()
 
+# The preset passes ${GITHUB_PERSONAL_ACCESS_TOKEN} to the server through env.
 github = ToolNode(config=get_preset("github"), registry=registry)
 await github.connect()
 
@@ -112,9 +114,9 @@ for spec in github.get_tools():
     print(spec.name)
 ```
 
-!!! note
-    Presets are for local development and often use `npx -y ...` (Node.js required).
-    For production, prefer running MCP servers as separate services and connecting via URL.
+> [!NOTE]
+> Presets are for local development and often use `npx -y ...` (Node.js required).
+> For production, prefer running MCP servers as separate services and connecting via URL.
 
 ## Configuration highlights (what matters operationally)
 

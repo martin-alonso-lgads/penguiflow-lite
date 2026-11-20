@@ -1,6 +1,6 @@
 ---
 name: penguiflow-statestore
-description: "Deep expertise for PenguiFlow persistence: implement or review a `StateStore` backend (required + optional duck-typed capabilities), enforce correct contracts (idempotency, ordering, cursors, cancellation), wire A2A router continuity via conversation bindings, sessions/tasks/updates/steering and background-task orchestration, integrate `ArtifactStore`, support distributed execution (`RemoteBinding`), and build UIs/clients around the Playground HTTP+SSE contract. Use when building/debugging StateStore or ArtifactStore implementations; designing database schemas; investigating missing/duplicated/out-of-order events; integrating A2A manager/specialist continuity, OAuth/HITL pause-resume; persisting trajectories/planner events; or implementing frontends that consume `/chat`, `/session/stream`, `/tasks`, `/events`, `/trajectory`, and `/artifacts`."
+description: "Deep expertise for PenguiFlow persistence: implement or review a `StateStore` backend (required + optional duck-typed capabilities), enforce correct contracts (idempotency, ordering, cursors, cancellation), wire A2A router continuity via conversation bindings, sessions/tasks/updates/steering and background-task orchestration, integrate `ArtifactStore`, support distributed execution (`RemoteBinding`), and back UI clients that need task updates, replay views and artifacts. Use when building/debugging StateStore or ArtifactStore implementations; designing database schemas; investigating missing/duplicated/out-of-order events; integrating A2A manager/specialist continuity, OAuth/HITL pause-resume; persisting trajectories/planner events; or deciding which store capabilities a frontend served by your HTTP layer depends on."
 ---
 
 # PenguiFlow StateStore
@@ -19,18 +19,17 @@ Hard boundaries vs siblings: the **application patterns** that consume these cap
 - `references/statestore-implementation-spec.md` — full contract (semantics, schemas, edge cases, checklist)
 - `references/statestore-production-guide.md` — production guide + Postgres example + OAuth pause/resume notes
 - `references/artifacts-and-resources.md` — `ArtifactStore` contract + planner/tool integration notes
-- `references/distributed-execution.md` — distributed hooks, A2A router continuity, `RemoteBinding`
-- `references/playground-frontend-api.md` — Playground HTTP + SSE contract (frontend-facing)
+- `references/distributed-execution.md` — multi-worker persistence, A2A server/client continuity, `RemoteBinding` (maintained here, not synced)
 
 ## Code map (workspace)
 
 When you need exact behavior, open the code:
 - `penguiflow/state/protocol.py`, `penguiflow/state/models.py`, `penguiflow/state/in_memory.py`, `penguiflow/state/adapters.py`
 - `penguiflow/artifacts.py`
-- `penguiflow/core.py` (best-effort audit log + best-effort `save_remote_binding`)
+- `penguiflow/planner/pause_management.py` (planner pause/resume persistence), `penguiflow/planner/memory_integration.py` (memory persistence), `penguiflow/planner/react_runtime.py` (trajectory and planner-event persistence)
 - `penguiflow/sessions/session.py`, `penguiflow/sessions/persistence.py`, `penguiflow/sessions/registry.py`, `penguiflow/sessions/task_service.py`
-- `penguiflow/cli/playground.py`, `penguiflow/cli/playground_sse.py`, `penguiflow/sessions/projections.py`
-- `penguiflow/remote.py`, `penguiflow_a2a/*` (remote execution + bindings)
+- `penguiflow/sessions/projections.py`
+- `penguiflow/remote.py` (remote transport protocols), `penguiflow_a2a/core.py` (A2A server: per-task `save_remote_binding`), `penguiflow_a2a/planner_tools.py` (client: binding save/lookup)
 
 ## Workflow decision tree
 
@@ -42,28 +41,30 @@ When you need exact behavior, open the code:
    - stable ordering on reads (tie-breaker for equal timestamps),
    - cancellation-friendly async I/O and bounded timeouts.
 3. If the deployment uses `A2AAgentToolset` router-to-specialist continuity, add the optional conversation binding methods: `find_binding`, `list_bindings`, `mark_binding_terminal`.
-4. Add optional capabilities and verify cursor semantics (`since_id` is exclusive; ordering is stable).
-5. Add an artifact store either by returning `artifact_store` or by having the store implement `ArtifactStore`.
+4. Add optional capabilities and verify cursor semantics (`since_id` is exclusive; ordering is stable). A store with `save_task` is used directly by sessions, so it also needs `save_update`, `save_steering`, `list_tasks`, `list_updates` and `list_steering`.
+5. Add an artifact store either by returning `artifact_store` or by having the store implement `ArtifactStore`. Implement all seven methods, `list(scope=...)` included: `ArtifactStore` is `@runtime_checkable`, and a store that fails `isinstance` is not discovered, so the planner silently falls back to `NoOpArtifactStore`.
 6. Run and extend tests; include negative/error-path coverage for your backend.
 
 ### Debug “persistence is weird”
 
-- Missing data: check capability detection (missing duck-typed methods) and feature wiring; use `require_capabilities`.
+- Missing data: check capability detection (missing duck-typed methods) and feature wiring; use `require_capabilities`. Trajectories persist only when `tool_context` has `trace_id` and `session_id`; planner events need `trace_id`.
 - Duplicates: verify idempotency keys/fingerprints and DB uniqueness.
 - Out-of-order: ensure stable sorting and correct cursor handling.
-- A2A specialist loses context: confirm `A2AAgentToolset` can see a store via `tool_context["state_store"]` or planner `_state_store`; confirm `save_remote_binding` persists `router_session_id`, `remote_skill`, `tenant_id`, `user_id`, `last_remote_task_id`, `is_terminal`, and `metadata`; confirm `find_binding` returns the newest non-terminal binding scoped by router session, agent URL, skill, tenant, and user.
+- Session calls raise: session writes are awaited, so `save_task` / `save_steering` errors (and `save_event` errors through `StateStoreSessionAdapter`) propagate to the caller.
+- A2A specialist loses context: confirm `A2AAgentToolset` can see a store via `tool_context["state_store"]` or the planner's `state_store`, and that the run has `tool_context["session_id"]`; confirm `save_remote_binding` persists `router_session_id`, `remote_skill`, `tenant_id`, `user_id`, `last_remote_task_id`, `is_terminal`, and `metadata`; confirm `find_binding` returns the newest non-terminal binding scoped by router session, agent URL, skill, tenant, and user. Bindings are conversation-scoped: the toolset never marks them terminal.
+- Memory shared across tenants: memory isolation reads `tool_context["tenant_id"]`, not `tenant`.
 - Steering failures: ensure steering sanitization and payload size limits are respected.
-- OAuth/HITL resume fails across workers: ensure planner pause state is implemented with TTL and consume-on-load semantics.
+- OAuth/HITL resume fails across workers: ensure planner pause state is implemented with TTL and consume-on-load semantics. A2A paused tasks are the exception: `A2AService` keeps their resume tokens in memory, so they resume only in the same process.
 
 ### Build a frontend / UI client
 
-- Use the Playground server as the reference contract (`references/playground-frontend-api.md`).
+- PenguiFlow doesn't ship a UI-facing HTTP server; expose sessions, replay and artifacts through your own HTTP layer.
 - Ensure your deployment supports the store capabilities required for:
-  - task state + updates (`/session/stream`, `/tasks`)
-  - replay views (`/events`, `/trajectory`)
-  - artifacts (`/artifacts/*`)
+  - task state + updates (`list_tasks`, `list_updates`)
+  - replay views (`load_history`, `list_planner_events`, `get_trajectory`)
+  - artifacts (`artifact_store`)
 
 ## Helper scripts
 
-- Run `scripts/statestore_inspect.py` to print the StateStore/ArtifactStore surface and (optionally) capability-check a concrete backend object.
-- Run `scripts/sync_references_from_repo.py --repo <path>` to refresh bundled reference docs from a PenguiFlow repo checkout.
+- Run `scripts/statestore_inspect.py` to print the StateStore/ArtifactStore surface and (optionally) capability-check a concrete backend object, for example `--check penguiflow.state.in_memory:InMemoryStateStore --instantiate --json`.
+- Run `scripts/sync_references_from_repo.py --repo <path>` to refresh the bundled spec, production guide and artifacts references from a PenguiFlow repo checkout. It overwrites them, so make edits in the repo's `docs/` sources.

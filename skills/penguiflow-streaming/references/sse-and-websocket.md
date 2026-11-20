@@ -1,176 +1,232 @@
-# SSE, WebSocket, and Programmatic Iteration
+# SSE, WebSocket, and Session Bridges
 
-`penguiflow.streaming` ships four helpers for shipping chunks to clients.
+There is no built-in SSE/WebSocket formatter; the wire format is a few lines of your own code. The pattern is always the same: the planner's synchronous `event_callback` enqueues events into a per-request `asyncio.Queue`, and the HTTP/WS handler drains it.
 
-## `format_sse_event(chunk, *, event_name=None, retry_ms=None) -> str`
+The recipes below assume a `make_planner(event_callback=None)` factory of your own that returns a `ReactPlanner` with `stream_final_response=True` (`PlannerTaskPipeline` calls it with no arguments and installs its own callback).
 
-Renders a `StreamChunk` as an SSE event string ready to send over `text/event-stream`.
+## Local helpers
 
 ```python
-from penguiflow.streaming import format_sse_event
+import json
 
-frame = format_sse_event(chunk)
-# event: chunk        (or "done" if chunk.done is True)
-# id: <seq>
-# data: <text>
-# data: <meta json>   (when meta is non-empty)
-#
+from penguiflow.planner import PlannerEvent, PlannerFinish, PlannerPause
+
+
+def sse(event: str, data: str, *, event_id: str | None = None) -> str:
+    lines = [f"event: {event}"]
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.extend(f"data: {line}" for line in data.splitlines() or [""])
+    return "\n".join(lines) + "\n\n"
+
+
+def event_to_json(event: PlannerEvent) -> str:
+    return json.dumps(event.to_payload(), default=str)
+
+
+def outcome_to_json(result: PlannerFinish | PlannerPause) -> str:
+    if isinstance(result, PlannerPause):
+        return json.dumps(
+            {
+                "event": "paused",
+                "reason": result.reason,
+                "resume_token": result.resume_token,
+                "payload": result.payload,
+            },
+            default=str,
+        )
+    return json.dumps(
+        {"event": "final", "reason": result.reason, "payload": result.payload},
+        default=str,
+    )
 ```
 
-### Parameters
-- `event_name` — Override the default `"chunk"` / `"done"`. Use when your UI listens for multiple custom event types.
-- `retry_ms` — When supplied, appends `retry: <ms>` to instruct the client's EventSource on reconnect backoff.
-
-### FastAPI / Starlette SSE recipe
+## FastAPI SSE recipe (answer tokens + status + final)
 
 ```python
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from penguiflow.streaming import format_sse_event, stream_flow
+
+from penguiflow.planner import PlannerEvent
 
 app = FastAPI()
 
-@app.get("/stream")
-async def stream(request_id: str):
-    msg = Message(payload={"q": request_id}, headers=Headers(tenant="acme"))
-    flow.run()  # or running already
+
+@app.get("/chat")
+async def chat(q: str, session_id: str) -> StreamingResponse:
+    queue: asyncio.Queue[PlannerEvent | None] = asyncio.Queue()
+    planner = make_planner(event_callback=queue.put_nowait)  # per request
 
     async def gen():
-        async for chunk in stream_flow(flow, msg, to=compose_node, include_final=False):
-            yield format_sse_event(chunk)
+        task = asyncio.create_task(
+            planner.run(q, tool_context={"session_id": session_id})
+        )
+        task.add_done_callback(lambda _t: queue.put_nowait(None))
+        try:
+            while (event := await queue.get()) is not None:
+                extra = event.extra
+                if (
+                    event.event_type == "llm_stream_chunk"
+                    and extra.get("channel") == "answer"
+                ):
+                    seq = str(extra.get("action_seq"))
+                    yield sse("chunk", extra["text"], event_id=seq)
+                elif event.event_type == "tool_call_start":
+                    yield sse("status", f"calling {extra.get('tool_name')}")
+            result = await task
+            yield sse("final", outcome_to_json(result))  # finish or pause
+        finally:
+            if not task.done():
+                task.cancel()  # client disconnected
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 ```
 
-The client uses `new EventSource("/stream?request_id=...")` and listens for `"chunk"` / `"done"` events.
-
-### Browser side
+Browser side:
 
 ```javascript
-const es = new EventSource("/stream?request_id=q1");
-es.addEventListener("chunk", (e) => append(e.data));
-es.addEventListener("done", () => es.close());
+const es = new EventSource(`/chat?q=${encodeURIComponent(q)}&session_id=s1`);
+let seq = null, text = "";
+es.addEventListener("chunk", (e) => { if (e.lastEventId !== seq) { seq = e.lastEventId; text = ""; } text += e.data; render(text); });
+es.addEventListener("status", (e) => showStatus(e.data));
+es.addEventListener("final", (e) => { renderFinal(JSON.parse(e.data)); es.close(); });
 ```
 
-## `chunk_to_ws_json(chunk, *, extra=None) -> str`
+The `id` carries `action_seq`, so the client resets the text when the planner restarts its answer. A `final` frame whose `event` is `"paused"` carries the `resume_token` for `planner.resume(...)`.
 
-Serializes a `StreamChunk` as JSON for WebSocket transports.
-
-```python
-from penguiflow.streaming import chunk_to_ws_json
-
-payload = chunk_to_ws_json(chunk, extra={"client_seq": 42})
-# {"stream_id": "...", "seq": 0, "text": "hello ", "done": false, "meta": {}, "client_seq": 42}
-```
-
-`extra` is merged into the JSON object. Use for client-correlation ids or routing hints your WS protocol expects.
-
-### FastAPI WebSocket recipe
+## FastAPI WebSocket recipe
 
 ```python
+import asyncio
+
 from fastapi import FastAPI, WebSocket
-from penguiflow.streaming import chunk_to_ws_json, stream_flow
+
+from penguiflow.planner import PlannerEvent
+
+app = FastAPI()
+
 
 @app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
+async def ws(websocket: WebSocket) -> None:
     await websocket.accept()
     request = await websocket.receive_json()
-    msg = Message(payload=request, headers=Headers(tenant=request["tenant"]))
-
-    async for chunk in stream_flow(flow, msg, to=compose_node, include_final=False):
-        await websocket.send_text(chunk_to_ws_json(chunk))
-
+    queue: asyncio.Queue[PlannerEvent | None] = asyncio.Queue()
+    planner = make_planner(event_callback=queue.put_nowait)
+    task = asyncio.create_task(
+        planner.run(
+            request["q"], tool_context={"session_id": request["session_id"]}
+        )
+    )
+    task.add_done_callback(lambda _t: queue.put_nowait(None))
+    while (event := await queue.get()) is not None:
+        await websocket.send_text(event_to_json(event))
+    result = await task
+    await websocket.send_text(outcome_to_json(result))
     await websocket.close()
 ```
 
-## `stream_flow(flow, parent_msg, *, to=None, timeout=None, include_final=False) -> AsyncIterator`
+## Sharing one planner instance
 
-Async iterator over chunks for a single run.
+`event_callback` belongs to the planner instance. If you must share one instance across concurrent requests, route inside the callback with a `contextvars.ContextVar` set in the request's task before `planner.run()` (events are emitted from that task, so the variable is visible). Otherwise prefer a planner factory.
 
-```python
-async for chunk in stream_flow(flow, parent_msg, to=compose_node, timeout=30.0):
-    handle(chunk)
-```
+## Session bridge (`StreamingSession`)
 
-### Behavior
-- Calls `await flow.emit(parent_msg, to=to)` internally — don't pre-emit.
-- Yields each `StreamChunk` as it arrives.
-- When a chunk with `done=True` arrives:
-  - `include_final=False` (default): stops.
-  - `include_final=True`: continues, yields the next non-chunk payload (typically `FinalAnswer`), then stops.
-- `timeout` applies per-fetch (not total). Raises `asyncio.TimeoutError` if no chunk arrives in `timeout` seconds.
+Sessions remove the per-request plumbing: `PlannerTaskPipeline` builds a planner per task, installs its own callback, and projects events into `StateUpdate`s that clients subscribe to.
 
-### When to use
-- Tests that need to assert on the chunk sequence.
-- HTTP handlers that need both chunks and the final answer in one iterator.
-- Simple bridges where you don't want a separate sink node.
-
-### When NOT to use
-- Multi-trace concurrent serving. `stream_flow` fetches from the flow's egress; if multiple traces are running concurrently, you may pick up chunks from a different trace. Use trace-scoped `flow.fetch(trace_id=...)` patterns instead.
-
-## `emit_stream_events(source, ctx, parent_msg, *, adapter=None, to=None, final_meta=None)`
-
-Bridges an async iterable of provider events (e.g., an LLM SDK's streaming response) into `StreamChunk` emissions.
+A planner pause makes the task `PAUSED`: the session publishes a `STATUS_CHANGE` with `status == "PAUSED"`, then a `CHECKPOINT` (`kind: "approval_required"`, `resume_token`), and the task waits for an `APPROVE` or `REJECT` steering event. The stream must stop there too (after forwarding the `CHECKPOINT`, which the client needs for the token), or it hangs.
 
 ```python
-from penguiflow.streaming import emit_stream_events
+import asyncio
+import json
+import uuid
 
-async def compose(msg, ctx):
-    response = llm_client.stream(prompt=msg.payload.prompt)
-    await emit_stream_events(
-        response,
-        ctx,
-        parent_msg=msg,
-        adapter=lambda event: (event.delta, event.is_last, {"provider": "openai"}),
-        to=chunk_sink,
-        final_meta={"total_tokens": response.usage.total_tokens},
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+from penguiflow import (
+    PlannerTaskPipeline,
+    SessionManager,
+    SteeringEvent,
+    SteeringEventType,
+    TaskResult,
+    UpdateType,
+)
+
+app = FastAPI()
+manager = SessionManager()
+TERMINAL = {"COMPLETE", "FAILED", "CANCELLED"}
+runs: dict[str, asyncio.Task[TaskResult]] = {}  # tasks that may be paused
+
+
+@app.get("/sessions/{session_id}/chat")
+async def chat(session_id: str, q: str) -> StreamingResponse:
+    session = await manager.get_or_create(session_id)
+    pipeline = PlannerTaskPipeline(planner_factory=make_planner)
+    task_id = uuid.uuid4().hex
+
+    async def gen():
+        updates = await session.subscribe(task_ids=[task_id])  # subscribe first
+        run = asyncio.create_task(
+            session.run_task(pipeline, query=q, task_id=task_id)
+        )
+        runs[task_id] = run
+        run.add_done_callback(lambda _t: runs.pop(task_id, None))
+        paused = False
+        async for update in updates:
+            data = json.dumps(update.content, default=str)
+            yield sse(update.update_type.value, data, event_id=update.update_id)
+            if update.update_type == UpdateType.CHECKPOINT and paused:
+                return  # carries the resume_token; the task waits for approval
+            if update.update_type != UpdateType.STATUS_CHANGE:
+                continue
+            status = update.content.get("status")
+            paused = status == "PAUSED"
+            if status in TERMINAL:
+                break
+        await asyncio.wait({run})  # FAILED/CANCELLED were already sent
+        if not run.cancelled():
+            run.exception()  # mark the error as retrieved
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/sessions/{session_id}/tasks/{task_id}/approve")
+async def approve(session_id: str, task_id: str, resume_token: str) -> dict:
+    session = await manager.get_or_create(session_id)
+    accepted = await session.steer(
+        SteeringEvent(
+            session_id=session_id,
+            task_id=task_id,
+            event_type=SteeringEventType.APPROVE,
+            payload={"resume_token": resume_token, "decision": "approve"},
+        )
     )
+    return {"accepted": accepted}
 ```
 
-### `adapter`
-Callable `event -> (text: str, done: bool, meta: dict)`. The default treats events as strings (`str(event), False, {}`).
+After approving, the client re-subscribes (`session.subscribe(task_ids=[task_id], since_id=<last update_id>)`) to follow the resumed run. `REJECT` with the same token ends the task as cancelled.
 
-For typed providers, write a real adapter:
+- Answer chunks (LLM `channel="answer"`, tool chunks with `meta={"channel": "answer"}`) arrive as `RESULT` updates, other channels as `THINKING`, tool calls as `TOOL_CALL`, step progress as `PROGRESS`.
+- `subscribe(task_ids=[...], since_id=...)` replays persisted updates for reconnecting clients.
+- For full duplex (updates out, steering in), implement the `Transport` protocol (`send(update)`, `receive() -> SteeringEvent | None`, `close()`) and call `await session.connect(transport)`.
 
-```python
-def openai_adapter(event):
-    if event.choices[0].finish_reason == "stop":
-        return ("", True, {})
-    return (event.choices[0].delta.content or "", False, {})
-```
-
-### `final_meta`
-Attached to the auto-emitted terminator chunk if the source didn't already emit one with `done=True`. Use for usage statistics, latencies, etc.
-
-### Termination guarantee
-`emit_stream_events` ensures a chunk with `done=True` is always emitted at the end — either from the source itself or as a synthesized terminator. Consumers can rely on the close signal.
-
-## Choosing among the helpers
+## Choosing a bridge
 
 | Need | Use |
 |---|---|
-| SSE to browser | `format_sse_event` + `stream_flow` (or sink node + manual SSE) |
-| WebSocket to browser | `chunk_to_ws_json` + `stream_flow` |
-| Test the chunk sequence | `stream_flow(include_final=True)` |
-| Wrap an LLM SDK's stream | `emit_stream_events` |
-| Custom transport (gRPC stream, MQTT, ...) | Custom sink node — serialize `chunk` yourself |
-
-## Sink-node alternative
-
-For high-concurrency servers, a dedicated sink node decoupled from the HTTP/WS handler scales better than `stream_flow`:
-
-```
-compose --(chunk)--> chunk_sink --(forward)--> per-connection queue --(consume)--> HTTP handler
-```
-
-The sink looks up the connection by `trace_id` (the chunk's `stream_id`) and pushes the chunk into a per-connection `asyncio.Queue`. The HTTP/WS handler drains its queue. This pattern avoids tying the flow's lifecycle to a single HTTP request.
+| One request, one stream (chat endpoint) | per-request queue + planner factory |
+| Reconnect / replay, background tasks, steering from the client | `StreamingSession` + `subscribe()` / `connect(transport)` |
+| Another agent is the client | `A2AService` streaming — see [[penguiflow-a2a-integration]] |
 
 ## Failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| SSE shows `data:` but no `event:` | `format_sse_event` called with explicit `event_name=""` | Pass a non-empty name or omit |
-| `EventSource` reconnects infinitely | Server closes without `done` event | Always emit a chunk with `done=True` before closing |
-| WS client gets the same chunk twice | Producer emits to two `to=...` sinks both forwarding to WS | Pick one sink path |
-| `stream_flow` picks up another trace's chunks | Multi-trace concurrent serving | Use trace-scoped fetch in a custom sink |
-| Adapter throws on unexpected event | Provider added new event type | Default to `("", False, {})` for unknown events |
+| SSE frames merge in the browser | missing blank line terminator | each frame must end with `\n\n` |
+| `EventSource` reconnects forever | server closed without a terminal event | always send a `final` (or `error`) event before closing |
+| Client receives another user's tokens | shared planner + single callback | planner per request, or contextvar routing |
+| Handler hangs after the run ends | no sentinel enqueued | `task.add_done_callback(lambda _t: queue.put_nowait(None))` |
+| Session stream hangs mid-run | task is `PAUSED` waiting for approval | stop after the `CHECKPOINT` that follows `PAUSED`; approve with its `resume_token` |
+| Planner keeps running after disconnect | task not cancelled | cancel the run task in `finally` |

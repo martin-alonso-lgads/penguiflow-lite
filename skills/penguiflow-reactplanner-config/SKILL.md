@@ -28,8 +28,8 @@ For copy/paste-ready templates and a full “golden config”, read:
 - Consolidate planner knobs into one place (avoid sprinkling params across call sites).
 - If your app is multi-tenant or session-based, ensure you have a stable `session_id` you can pass in `tool_context`.
 
-### 2) Turn on the native LLM adapter (recommended default for 2.x)
-- Set `use_native_llm=True`.
+### 2) Turn on the native LLM adapter (recommended)
+- Set `use_native_llm=True` (the default is `False`, the LiteLLM client). LLM tracing (`PENGUIFLOW_LLM_TRACING`) only works on the native adapter.
 - Pass `llm` as either a string (e.g. `"openai/gpt-4o"`) or a dict with credentials:
   - `{"model": "openai/gpt-4o", "api_key": "...", "base_url": "..."}`.
 - Keep `json_schema_mode=True` and `temperature=0.0` for planner stability.
@@ -42,8 +42,10 @@ Use `ToolSearchConfig(enabled=True, default_loading_mode=DEFERRED, activation_sc
 Always-visible tools (best practice; keep visible and allowed):
 - Discovery: `tool_search`, `tool_get`
 - Skills: `skill_search`, `skill_get`, `skill_list`
-- Common: `finish`
-- Rich output (only if enabled): see [[penguiflow-rich-output]] for the full always-visible set.
+- Background tasks (only if your catalog has them): `tasks.*`
+- Rich output (only if enabled): the `RICH_OUTPUT_TOOLS` set in `references/reactplanner-config-templates.md`; see [[penguiflow-rich-output]] for the tools themselves.
+
+There is no `finish` tool to keep visible: the planner ends a run with the `final_response` opcode (`next_node: "final_response"`), which isn't a catalog tool, so policies and deferred loading can't hide it.
 
 Scoping discovery without rewriting the query (optional):
 - `tool_search(args={"query": "send", "tags": ["mail", "write"]})` — AND match against the
@@ -63,9 +65,9 @@ Use both layers when needed:
 Hard rule: if you apply a visibility policy, it must still include the always-visible tools listed above, or the planner will lose discovery/skills mid-run.
 
 ### 5) Enable Skills (PenguiFlow skills subsystem)
-- Configure `SkillsConfig(enabled=True, skill_packs=[...], redact_pii=True, top_k=...)`.
-- Ensure skills packs are loaded at planner init (they are when `SkillsConfig.enabled=True`).
-- In multi-tenant apps, pass `tenant_id` / `project_id` in `tool_context` so skills scope filtering works as intended.
+- Configure `SkillsConfig(enabled=True, skill_packs=[...], redact_pii=True, top_k=...)` and pass it as `ReactPlanner(skills=...)`.
+- Packs are loaded into the SQLite skill store at planner init when `SkillsConfig.enabled=True`; the relevant skills then go into the system prompt at the start of each run.
+- Pack skills are **global**: every tenant and project sees them, whatever the pack's `scope_mode`. Don't put tenant-private guidance in packs. For per-tenant skills use a runtime provider that filters on `tool_context["tenant_id"]` and returns nothing when it's missing. See [[penguiflow-runtime-skills-pack]].
 - For runtime/persona skills, pass `skills_provider=...` or `skills_provider_factory=...` into `ReactPlanner(...)`.
 - Runtime providers are Python API only; they compose with local packs, and runtime skills win on name collisions.
 - Skills can declare applicability metadata:
@@ -75,28 +77,45 @@ Hard rule: if you apply a visibility policy, it must still include the always-vi
 - Applicability is enforced against the request's allowed capability set, so skills only surface when the matching tools/namespaces/tags are active.
 
 ### 5a) Draft new skills safely (optional)
-- Enable `SkillsConfig(..., proposal={"enabled": True})` to expose `skill_propose`.
+- Enable `SkillsConfig(..., proposal=SkillProposalConfig(enabled=True))` to expose `skill_propose`.
 - `skill_propose` drafts a structured skill only; it does **not** persist anything.
-- Keep persistence/review in the host product (for example, Canvas or your own admin UI/API).
+- Keep persistence/review in the host product (for example, your own admin UI/API).
 
 ### 6) Enable rich output (optional)
 Rich output (charts, tables, forms, interactive HITL components) is owned by [[penguiflow-rich-output]]. From the planner-config side, two things matter: call `attach_rich_output_nodes(registry, config=RichOutputConfig(enabled=True, ...))` and include the returned nodes in your catalog; and add rich-output tool names to the always-visible set **only if** rich output is enabled. Everything else (components, schemas, builders, interactive HITL) lives in the rich-output skill.
 
 ### 7) Background tasks + steering (optional)
-- Enable `BackgroundTasksConfig(enabled=True, ...)` if your host app wires `tasks.*` tools (e.g., `tasks.spawn`) and a task service.
+- Pass `background_tasks=BackgroundTasksConfig(enabled=True)` if your host app wires `tasks.*` tools (e.g., `tasks.spawn`) and a task service. On the planner, `enabled` only adds the background-task guidance to the system prompt; the tools come from your catalog and need `tool_context["task_service"]`.
+- Task limits (concurrency, counts per session, runtime) are `SessionLimits` on `SessionManager(limits=...)`, not planner config. `BackgroundTasksConfig` rejects unknown fields.
 - Provide `steering=SteeringInbox(...)` to `run()` / `resume()` if you need live operator steering or external cancellation.
 
-### 7a) Streaming final responses (optional, v2.6+)
+### 7a) Streaming final responses (optional)
 - Set `stream_final_response=True` on `ReactPlanner` to stream the synthesized final answer to clients.
 - The underlying `JSONLLMClient` protocol accepts `stream` and `on_stream_chunk` parameters; the planner wires these through automatically when streaming is enabled.
-- Frontends should consume the stream via AG-UI `TEXT_MESSAGE_CONTENT` events — see the `penguiflow-agui-events` skill for the reducer contract.
+- Frontends consume the stream as `llm_stream_chunk` planner events (with `extra["channel"] == "answer"`) delivered through your `event_callback`; see [[penguiflow-streaming]] for shipping them over SSE/WebSocket.
 - Hard rule: streaming is a final-response affordance; intermediate planner steps remain non-streamed JSON.
 
 ### 8) Expose the agent over A2A without a standalone server
-Prefer the router-first A2A binding for spec-compliant `A2AService` integrations:
+Wrap the planner in an `A2AService` and mount it with the router-first binding:
+
+```python
+from penguiflow.planner import ToolVisibilityPolicy
+from penguiflow_a2a import A2AConfig, A2AService, install_a2a_http
+
+service = A2AService(
+    planner,
+    agent_card=agent_card,
+    config=A2AConfig(agent_url="https://agent.example.com"),
+    tool_visibility=a2a_visibility,   # ToolVisibilityPolicy applied to every A2A run
+)
+install_a2a_http(app, service)
+```
+
 - Use `install_a2a_http(app, service)` when the host app owns the FastAPI instance.
 - Use `create_a2a_http_router(service)` when the host app wants explicit `include_router(...)` composition.
 - Keep `create_a2a_http_app(service)` only as the convenience path for standalone agents.
+
+Each A2A task is one `planner.run()`: the A2A `contextId` becomes `tool_context["session_id"]` (per-conversation serialization and memory), a `PlannerPause` becomes `input-required` and the next message to that task resumes it, and a cancel request (`CancelTask`) cancels through steering. The tenant (or `A2AConfig.default_tenant`) lands in both `tool_context["tenant_id"]` and `tool_context["tenant"]`, so short-term memory, artifacts and session KV are scoped per tenant with the default `MemoryIsolation`. A2A carries no user identity, so the memory user is `"anonymous"` unless you pass a `user_id` in `A2AService(tool_context=...)`. Details in [[penguiflow-a2a-integration]].
 
 Practical rules:
 - Keep `/.well-known/agent-card.json` installed at the app level, not inside a reusable router.
@@ -104,25 +123,26 @@ Practical rules:
 - Do not add app-global validation handlers just for A2A routes; parse and map A2A request errors inside the binding so unrelated host routes keep normal FastAPI behavior.
 
 ### 9) Adapt planner behavior for A2A callers
-If the same planner serves both human UI traffic and downstream A2A callers, make delivery channel explicit in `tool_context`:
-- Set `tool_context["delivery_channel"] = "a2a"` and, when useful, `tool_context["response_mode"] = "text_only"`.
-- Apply a `ToolVisibilityPolicy` for A2A requests that hides UI-only and rich-output tools such as `render_component`, `describe_component`, `ui_form`, `ui_confirm`, and `ui_select_option`.
-- Add matching prompt or `llm_context` guidance so the planner returns fully materialized text or JSON instead of relying on rendered components the downstream agent cannot see.
+If the same planner serves both human UI traffic and downstream A2A callers:
+- `A2AService` sets `tool_context["delivery_channel"] = "a2a"` on every A2A run (override it via the service's static `tool_context=` if needed). Add `tool_context={"response_mode": "text_only"}` when useful.
+- Pass `tool_visibility=ToolVisibilityPolicy(...)` to `A2AService` to hide UI-only and rich-output tools such as `render_component`, `describe_component`, `ui_form`, `ui_confirm`, and `ui_select_option`.
+- Add matching prompt or `llm_context` guidance (keyed on `delivery_channel`) so the planner returns fully materialized text or JSON instead of relying on rendered components the downstream agent cannot see.
 
 Use this pattern when:
-- an agent is mounted in Playground and also exposed through A2A
-- a background-task agent delegates to another PenguiFlow agent over A2A
+- an agent serves a UI client and is also exposed through A2A
+- a background-task agent delegates to another planner agent over A2A
 - rich output is valuable for humans but lossy for machine-to-machine callers
 
 ## Troubleshooting (fast checks)
 - `tool_search is not configured`: `ToolSearchConfig.enabled` is False or you didn’t include planner init that builds the `ToolSearchCache`.
 - `activation_scope='session' requires tool_context['session_id']`: you enabled session activation but aren’t passing `session_id`.
-- `skill_search is not configured`: `SkillsConfig.enabled` is False or packs didn’t load; also ensure `skill_*` tools are not filtered out.
-- `skill_propose is not configured`: `skills.proposal.enabled` is False.
+- `skill_search is not configured`: the tool ran on a planner with no skill provider (you added the skill tools to your own catalog with `SkillsConfig.enabled=False`). With skills enabled, check that the `skill_*` tools aren't filtered out and that packs loaded (`skill_pack_missing` / `skill_pack_invalid` warnings).
+- The LLM calls `skill_propose` but no such tool exists: `skills.proposal.enabled` is False, so the tool isn't registered.
+- `ValidationError` on `BackgroundTasksConfig`: the config still sets a removed field (limits now live in `SessionLimits`).
 - Runtime skills not appearing: confirm the custom provider is injected, the request's `ToolVisibilityPolicy` still allows the relevant tools, and the skill's applicability metadata matches those allowed tools/tags/namespaces.
 - Rich output tools missing: you didn’t attach nodes via `attach_rich_output_nodes(...)` or they were filtered out by policy.
 - A2A routes return `422` instead of A2A problem details: confirm route handlers still use FastAPI `Request` injection and that A2A validation is handled inside the binding, not via host-app exception overrides.
-- Downstream A2A callers get incomplete answers: confirm the request sets `delivery_channel="a2a"` and that rich-output/UI tools are hidden for that path.
+- Downstream A2A callers get incomplete answers: confirm UI/rich-output tools are hidden via `A2AService(tool_visibility=...)` and your prompt guidance keys on `delivery_channel="a2a"`.
 
 ## References
 - Templates and knob-by-knob guidance: `references/reactplanner-config-templates.md`

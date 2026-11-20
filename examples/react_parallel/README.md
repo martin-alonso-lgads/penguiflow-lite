@@ -1,9 +1,10 @@
 # React planner parallel fan-out
 
-This example demonstrates Phase D of the React planner: a single planner action
-returns a `plan` array with two shard fetches plus a `join` descriptor. Each
-branch is validated and executed concurrently, then the join node merges their
-outputs using the auto-populated `expect`, `results`, and `parallel_*` metadata.
+This example demonstrates parallel fan-out in the React planner: a single
+planner action returns a `plan` array with two shard fetches plus a `join`
+descriptor. Each branch is validated and executed concurrently, then the join
+node merges their outputs using the auto-populated `expect`, `results`, and
+`parallel_*` metadata.
 
 ## Run it
 

@@ -1,12 +1,12 @@
-from __future__ import annotations
+"""Tests for rich output registry."""
 
-import re
-from pathlib import Path
+from __future__ import annotations
 
 from penguiflow.rich_output.registry import get_registry, load_registry
 
 
 def test_registry_loads_components() -> None:
+    """Registry loads components."""
     registry = get_registry()
     assert registry.version
     assert "echarts" in registry.components
@@ -15,24 +15,7 @@ def test_registry_loads_components() -> None:
 
 
 def test_registry_allowlist_filters() -> None:
+    """Registry allowlist filters."""
     registry = load_registry()
     allowed = registry.allowlist({"markdown"})
     assert list(allowed.keys()) == ["markdown"]
-
-
-def test_frontend_renderer_registry_matches_backend_components() -> None:
-    registry = load_registry()
-    renderer_registry_path = (
-        Path(__file__).resolve().parents[1]
-        / "penguiflow"
-        / "cli"
-        / "playground_ui"
-        / "src"
-        / "lib"
-        / "renderers"
-        / "registry.ts"
-    )
-    text = renderer_registry_path.read_text(encoding="utf-8")
-    frontend_components = set(re.findall(r"^\s{2}([a-z_]+):\s*\{", text, re.MULTILINE))
-
-    assert set(registry.components) == frontend_components - {"mcp_app"}

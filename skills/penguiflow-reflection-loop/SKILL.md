@@ -1,6 +1,6 @@
 ---
 name: penguiflow-reflection-loop
-description: Explain, configure, and troubleshoot the ReactPlanner reflection loop: how post-answer critique, revision, and clarification work; how to wire `ReflectionConfig` and optional `reflection_llm`; how env/spec-driven scaffolds expose the knobs; and how to verify behavior through planner events, metadata, and cost counters. Use when a user asks about "reflection loop", "self-critique", "reflection_critique", "quality_threshold", "max_revisions", or wants to compare reflection-enabled vs reflection-disabled runs.
+description: Explain, configure, and troubleshoot the ReactPlanner reflection loop: how post-answer critique, revision, and clarification work; how to turn it on with `reflection_config=ReflectionConfig(enabled=True, ...)` (it is off by default) and an optional `reflection_llm`; and how to verify behavior through planner events, metadata, and cost counters. Use when a user asks about "reflection loop", "self-critique", "reflection_critique", "quality_threshold", "max_revisions", or wants to compare reflection-enabled vs reflection-disabled runs.
 ---
 
 # PenguiFlow Reflection Loop
@@ -8,14 +8,13 @@ description: Explain, configure, and troubleshoot the ReactPlanner reflection lo
 ## When to use
 
 - Explaining how ReactPlanner's built-in answer-quality loop works.
-- Wiring reflection into a manual `ReactPlanner(...)` construction.
-- Retrofitting reflection into scaffolded `config.py` and `planner.py` files.
+- Wiring reflection into a `ReactPlanner(...)` construction.
 - Debugging whether a run passed critique, requested a revision, or fell back to clarification.
 
 ## When NOT to use
 
 - General planner configuration outside reflection: use [[penguiflow-reactplanner-config]].
-- AG-UI event wiring and frontend reducer behavior: use [[penguiflow-agui-events]].
+- Frontend event wiring and reducer behavior: owned by your UI client; see [[penguiflow-streaming]] for delivery helpers.
 - Generic eval frameworks or offline benchmarking pipelines not tied to `ReactPlanner`.
 
 ## Hard boundaries
@@ -35,7 +34,7 @@ It does not describe arbitrary multi-agent reviewer patterns.
 
 Locate where the app constructs `ReactPlanner(...)`.
 
-Reflection is inactive unless that constructor receives `reflection_config=...`.
+Reflection runs only when that constructor receives `reflection_config=ReflectionConfig(enabled=True, ...)`. `enabled` defaults to `False`, so a `ReflectionConfig` without it does nothing.
 
 ### 2) Enable the feature explicitly
 
@@ -58,7 +57,7 @@ reflection_config=ReflectionConfig(
 ### 3) Choose shared vs separate critique model
 
 - Shared model: simplest rollout; omit `use_separate_llm` and `reflection_llm`.
-- Separate critique model: set `use_separate_llm=True` and provide `reflection_llm`.
+- Separate critique model: set `use_separate_llm=True` and provide `reflection_llm` (the constructor raises `ValueError` without it).
 
 Important rule:
 - the critique model judges answer quality;
@@ -85,8 +84,8 @@ That can be the healthy case:
 
 - `docs/planner/reflection-loop.md` - shareable external-facing guide with code examples.
 - `tests/test_react_reflection.py` - best source for expected runtime behavior.
-- `examples/planner_enterprise_agent_v2/main.py` - production-style planner wiring.
-- `examples/planner_enterprise_agent_v2/config.py` - env-driven reflection settings.
+- `examples/planner_enterprise_agent/main.py` - production-style planner wiring, including `ReflectionConfig(enabled=True, criteria=ReflectionCriteria(...))`.
+- `examples/planner_enterprise_agent/config.py` - how that example reads its reflection settings from environment variables.
 - `penguiflow/planner/react_runtime.py` - reflection loop control flow.
 - `penguiflow/planner/llm.py` - critique, revision, and clarification generation.
 

@@ -1,8 +1,8 @@
 # ReactPlanner — Adaptive Re-Planning
 
-This example demonstrates **Phase C** of the PenguiFlow ReactPlanner: when a tool
-fails, the planner receives structured failure feedback and proposes a fallback
-plan that still honours hop budgets.
+This example demonstrates **adaptive re-planning** in the PenguiFlow
+ReactPlanner: when a tool fails, the planner receives structured failure
+feedback and proposes a fallback plan that still honours hop budgets.
 
 ```bash
 uv run python examples/react_replan/main.py

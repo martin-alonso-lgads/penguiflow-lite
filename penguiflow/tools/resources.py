@@ -20,15 +20,18 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from penguiflow.artifacts import ArtifactRef
     from penguiflow.planner.context import ToolContext
 
 __all__ = [
     "ResourceCache",
-    "ResourceInfo",
-    "ResourceTemplateInfo",
-    "ResourceContents",
     "ResourceCacheConfig",
+    "ResourceContents",
+    "ResourceInfo",
+    "ResourceSubscriptionManager",
+    "ResourceTemplateInfo",
 ]
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,30 @@ class ResourceContents(BaseModel):
     """Base64-encoded binary content (for binary resources)."""
 
 
+def _first_content_item(contents: object) -> object:
+    """Pick the content item from a resource read result.
+
+    Supported shapes: a dict with a "contents" list (or a raw content
+    dict), a list of content items, or a single content object.
+    """
+    if isinstance(contents, dict):
+        resource_data = contents.get("contents", [contents])
+        if isinstance(resource_data, list) and resource_data:
+            return resource_data[0]
+        return resource_data
+    if isinstance(contents, list):
+        return contents[0] if contents else {}
+    return contents
+
+
+def _content_field(item: object, key: str) -> str | None:
+    """Return the ``key`` attribute of ``item``, else its dict value."""
+    value = getattr(item, key, None) or (
+        item.get(key) if isinstance(item, dict) else None
+    )
+    return value if isinstance(value, str) else None
+
+
 class ResourceCacheConfig(BaseModel):
     """Configuration for :class:`ResourceCache` behavior.
 
@@ -123,8 +150,8 @@ class ResourceCacheConfig(BaseModel):
     max_entries: int = 1000
     """Maximum number of cached entries."""
 
-    ttl_seconds: int = 3600
-    """Time-to-live for cached entries (1 hour default)."""
+    ttl_seconds: int = Field(default=3600, ge=0)
+    """Seconds a cached entry stays valid (1 hour default, 0 = no expiry)."""
 
     inline_text_if_under_chars: int = 10_000
     """Inline text resources if under this size."""
@@ -159,30 +186,35 @@ class ResourceCache:
     content may be inlined.
 
     The cache invalidates entries on `resources/updated` notifications
-    from the MCP server.
+    from the MCP server, and drops entries older than
+    ``ResourceCacheConfig.ttl_seconds``. A ToolNode keeps one cache per MCP
+    session, so one user's reads are never served to another user.
     """
 
     def __init__(
         self,
         namespace: str,
         config: ResourceCacheConfig | None = None,
+        *,
+        time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize the resource cache.
 
         Args:
             namespace: ToolNode namespace for artifact naming
             config: Cache configuration
+            time_source: Clock used for entry ages and access times.
         """
         self._namespace = namespace
         self._config = config or ResourceCacheConfig()
         self._entries: dict[str, _CacheEntry] = {}
         self._lock = asyncio.Lock()
-        self._time_source = time.monotonic
+        self._time_source = time_source
 
     async def get_or_fetch(
         self,
         uri: str,
-        read_fn: Any,  # Callable that reads the resource
+        read_fn: Callable[[str], Awaitable[object]],
         ctx: ToolContext,
     ) -> dict[str, Any]:
         """Get cached resource or fetch from server.
@@ -193,32 +225,57 @@ class ResourceCache:
             ctx: Tool context
 
         Returns:
-            Dict with either 'artifact' (ArtifactRef) or 'text' (inline content)
+            Dict with either 'artifact' (ArtifactRef) or 'text' (inline
+            content)
         """
         if not self._config.enabled:
-            return await self._fetch_and_store(uri, read_fn, ctx, skip_cache=True)
+            return await self._fetch_and_store(
+                uri, read_fn, ctx, skip_cache=True
+            )
 
         async with self._lock:
-            entry = self._entries.get(uri)
-            if entry is not None:
-                # Check if artifact still exists
-                if entry.artifact_ref is not None:
-                    if await ctx.artifacts.exists(entry.artifact_ref.id):
-                        entry.last_accessed = self._time_source()
-                        return {"artifact": entry.artifact_ref.model_dump()}
-                    # Artifact expired/deleted - refetch
-                    del self._entries[uri]
-                elif entry.inline_text is not None:
-                    entry.last_accessed = self._time_source()
-                    return {"text": entry.inline_text}
+            cached = await self._cached_result(uri, ctx)
+        if cached is not None:
+            return cached
 
         # Not in cache or expired - fetch
         return await self._fetch_and_store(uri, read_fn, ctx)
 
+    async def _cached_result(
+        self, uri: str, ctx: ToolContext
+    ) -> dict[str, Any] | None:
+        """Return the live cached result for ``uri``, dropping stale ones."""
+        entry = self._live_entry(uri)
+        if entry is None:
+            return None
+        if entry.artifact_ref is not None:
+            if await ctx.artifacts.exists(entry.artifact_ref.id):
+                entry.last_accessed = self._time_source()
+                return {"artifact": entry.artifact_ref.model_dump()}
+            # Artifact expired/deleted - refetch
+            del self._entries[uri]
+            return None
+        if entry.inline_text is not None:
+            entry.last_accessed = self._time_source()
+            return {"text": entry.inline_text}
+        return None
+
+    def _live_entry(self, uri: str) -> _CacheEntry | None:
+        """Return the entry for ``uri`` unless it outlived the TTL."""
+        entry = self._entries.get(uri)
+        if entry is None:
+            return None
+        ttl = self._config.ttl_seconds
+        if ttl > 0 and self._time_source() - entry.created_at >= ttl:
+            del self._entries[uri]
+            logger.debug("Expired resource cache entry: %s", uri)
+            return None
+        return entry
+
     async def _fetch_and_store(
         self,
         uri: str,
-        read_fn: Any,
+        read_fn: Callable[[str], Awaitable[object]],
         ctx: ToolContext,
         *,
         skip_cache: bool = False,
@@ -226,36 +283,10 @@ class ResourceCache:
         """Fetch resource and store in cache."""
         import base64
 
-        # Call the read function
-        contents = await read_fn(uri)
-
-        # Convert to a single content item from supported response shapes:
-        # - {"contents": [...]}
-        # - [content_item, ...]
-        # - content_item
-        if isinstance(contents, dict):
-            # Handle raw dict response
-            resource_data = contents.get("contents", [contents])
-            if isinstance(resource_data, list) and resource_data:
-                content_item = resource_data[0]
-            else:
-                content_item = resource_data
-        elif isinstance(contents, list):
-            content_item = contents[0] if contents else {}
-        else:
-            # Assume it's already a proper object
-            content_item = contents
-
-        # Extract content fields
-        text = getattr(content_item, "text", None) or (
-            content_item.get("text") if isinstance(content_item, dict) else None
-        )
-        blob = getattr(content_item, "blob", None) or (
-            content_item.get("blob") if isinstance(content_item, dict) else None
-        )
-        mime_type = getattr(content_item, "mimeType", None) or (
-            content_item.get("mimeType") if isinstance(content_item, dict) else None
-        )
+        content_item = _first_content_item(await read_fn(uri))
+        text = _content_field(content_item, "text")
+        blob = _content_field(content_item, "blob")
+        mime_type = _content_field(content_item, "mimeType")
 
         now = self._time_source()
         entry = _CacheEntry(uri=uri, created_at=now, last_accessed=now)
@@ -288,19 +319,18 @@ class ResourceCache:
                         await self._maybe_evict()
                         self._entries[uri] = entry
                 return {"text": text}
-            else:
-                # Large text - store as artifact
-                ref = await ctx.artifacts.upload(
-                    text,
-                    mime_type=mime_type or "text/plain",
-                    namespace=f"{self._namespace}.resource",
-                )
-                if not skip_cache:
-                    entry.artifact_ref = ref
-                    async with self._lock:
-                        await self._maybe_evict()
-                        self._entries[uri] = entry
-                return {"artifact": ref.model_dump()}
+            # Large text - store as artifact
+            ref = await ctx.artifacts.upload(
+                text,
+                mime_type=mime_type or "text/plain",
+                namespace=f"{self._namespace}.resource",
+            )
+            if not skip_cache:
+                entry.artifact_ref = ref
+                async with self._lock:
+                    await self._maybe_evict()
+                    self._entries[uri] = entry
+            return {"artifact": ref.model_dump()}
 
         return {"error": "Resource has no content"}
 
@@ -391,8 +421,8 @@ class ResourceSubscriptionManager:
     async def subscribe(
         self,
         uri: str,
-        subscribe_fn: Any,
-        callback: Any | None = None,
+        subscribe_fn: Callable[[str], Awaitable[object]],
+        callback: Callable[[str], object] | None = None,
     ) -> bool:
         """Subscribe to resource updates.
 
@@ -415,16 +445,16 @@ class ResourceSubscriptionManager:
                     callback=callback,
                     subscribed_at=asyncio.get_event_loop().time(),
                 )
-                logger.debug(f"Subscribed to resource: {uri}")
-                return True
             except Exception as e:
                 logger.warning(f"Failed to subscribe to resource {uri}: {e}")
                 return False
+            logger.debug(f"Subscribed to resource: {uri}")
+            return True
 
     async def unsubscribe(
         self,
         uri: str,
-        unsubscribe_fn: Any,
+        unsubscribe_fn: Callable[[str], Awaitable[object]],
     ) -> bool:
         """Unsubscribe from resource updates.
 
@@ -442,11 +472,13 @@ class ResourceSubscriptionManager:
             try:
                 await unsubscribe_fn(uri)
                 del self._subscriptions[uri]
-                logger.debug(f"Unsubscribed from resource: {uri}")
-                return True
             except Exception as e:
-                logger.warning(f"Failed to unsubscribe from resource {uri}: {e}")
+                logger.warning(
+                    f"Failed to unsubscribe from resource {uri}: {e}"
+                )
                 return False
+            logger.debug(f"Unsubscribed from resource: {uri}")
+            return True
 
     async def handle_update(self, uri: str) -> None:
         """Handle a resource update notification.
@@ -462,12 +494,27 @@ class ResourceSubscriptionManager:
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception as e:
-                    logger.warning(f"Resource update callback failed for {uri}: {e}")
+                    logger.warning(
+                        f"Resource update callback failed for {uri}: {e}"
+                    )
 
     @property
     def subscribed_uris(self) -> list[str]:
         """List of currently subscribed URIs."""
         return list(self._subscriptions.keys())
+
+    def clear(self) -> list[str]:
+        """Forget every subscription without contacting the server.
+
+        Used when the MCP session closes: the server drops a session's
+        subscriptions with it, so a new session must subscribe again.
+
+        Returns:
+            The URIs that were subscribed.
+        """
+        uris = list(self._subscriptions)
+        self._subscriptions.clear()
+        return uris
 
     def is_subscribed(self, uri: str) -> bool:
         """Check if subscribed to a resource.

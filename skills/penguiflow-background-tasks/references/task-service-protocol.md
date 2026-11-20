@@ -1,184 +1,132 @@
 # The `TaskService` Protocol
 
-`tasks.*` tools delegate to whatever object is in `tool_context["task_service"]`. The library defines the protocol; you (or your platform) supply the implementation.
+The `tasks.*` tools call whatever object is in `tool_context["task_service"]`. The contract is `penguiflow.sessions.task_service.TaskService`, a structural `Protocol`. `InProcessTaskService` is the shipped implementation.
 
-## What `TaskService` must do
+## Methods
 
-At a high level:
-- Spawn a background task (subagent or job mode).
-- Track task lifecycle: PENDING → RUNNING → COMPLETED / FAILED / CANCELLED.
-- Stream observations / context patches back when tasks complete.
-- Support cancellation and prioritization.
-- Group tasks; seal and apply groups.
-- Enforce limits configured in `BackgroundTasksConfig`.
+All methods are `async` and keyword-only. Every one takes `session_id`.
 
-## Method surface (signatures)
+| Method | Other args | Returns |
+|---|---|---|
+| `spawn` | `query`, `parent_task_id`, `priority`, `merge_strategy`, `propagate_on_cancel`, `notify_on_complete`, `context_depth`, `task_id`, `idempotency_key`, `context_tool_context`, group args | `TaskSpawnResult` |
+| `spawn_tool_job` | `tool_name`, `tool_args`, the same args minus `query` / `context_depth` / `idempotency_key` | `TaskSpawnResult` |
+| `list` | `status: TaskStatus \| None` | `list[TaskSummary]` |
+| `get` | `task_id`, `include_result` | `TaskDetails \| None` |
+| `cancel` | `task_id`, `reason` | `bool` |
+| `prioritize` | `task_id`, `priority` | `bool` |
+| `apply_patch` | `patch_id`, `action` (`"apply"`/`"reject"`), `strategy` | `bool` |
+| `acknowledge_background` | `task_ids` | `int` (results removed) |
+| `seal_group` | `group_id` or `group_name`, `turn_id` | `dict` (`ok`, `group_id`, `status`, `sealed_task_count`, or `error`) |
+| `cancel_group` | `group_id`, `reason`, `propagate_on_cancel` | `dict` (`ok`, `cancelled_task_count`, `total_tasks`) |
+| `apply_group` | `group_id`, `action`, `strategy` | `dict` (`ok`, `applied_patch_count`, `rejected_patch_count`, `total_patches`, or `error`) |
+| `list_groups` | `status` (`open`/`sealed`/`complete`/`failed`) | `list[TaskGroup]` |
+| `get_group` | `group_id` or `group_name`, `turn_id` | `TaskGroup \| None` |
+
+The group args of `spawn` and `spawn_tool_job` are `group`, `group_id`, `group_sealed`, `retain_turn`, `group_merge_strategy`, `group_report` and `turn_id`. `merge_strategy` is a `MergeStrategy` (`penguiflow.sessions.models`); its values are lowercase.
+
+Result models (`penguiflow.sessions.task_service`):
+- `TaskSpawnResult`: `task_id`, `session_id`, `status`, `group_id`, `group`, `retained`, `group_completion`.
+- `TaskSummary`: `task_id`, `session_id`, `status`, `task_type`, `priority`, `description`, `progress`, `error`, `has_result`.
+- `TaskDetails`: a `TaskSummary` plus `result_digest` (filled when `include_result=True`), `spawned_from_task_id` and `spawned_from_event_id`.
+
+`TaskStatus` is `PENDING`, `RUNNING`, `PAUSED`, `COMPLETE`, `FAILED` or `CANCELLED`.
+
+A custom service only needs the methods your agents call. The tool-initiated path (`extra["background"]`) calls only `spawn` and `spawn_tool_job`.
+
+## `InProcessTaskService`
 
 ```python
-class TaskService(Protocol):
-    async def spawn(
-        self,
-        *,
-        session_id: str,
-        mode: str,                   # "subagent" | "job"
-        prompt: str | None = None,       # for subagent mode
-        tool_name: str | None = None,    # for job mode
-        tool_args: dict | None = None,   # for job mode
-        merge_strategy: str = "HUMAN_GATED",
-        group: str | None = None,
-        timeout_s: float | None = None,
-        priority: int = 0,
-        metadata: dict | None = None,
-    ) -> str: ...                        # returns task_id
+from typing import Any
 
-    async def list(self, *, session_id: str, status: str | None = None) -> list[dict]: ...
+from penguiflow.catalog import NodeSpec
+from penguiflow.planner import ReactPlanner
+from penguiflow.planner.models import BackgroundTasksConfig
+from penguiflow.sessions import (
+    InProcessTaskService,
+    SessionLimits,
+    SessionManager,
+    SpawnDecision,
+    SpawnRequest,
+    TaskPipeline,
+)
+from penguiflow.sessions.telemetry import LoggingTaskTelemetrySink
+from penguiflow.sessions.tool_jobs import build_tool_job_pipeline
 
-    async def get(self, task_id: str) -> dict | None: ...
+worker_tools: list[NodeSpec] = ...  # e.g. build_catalog(nodes, registry)
+specs = {spec.name: spec for spec in worker_tools}
 
-    async def cancel(self, task_id: str) -> bool: ...
 
-    async def prioritize(self, task_id: str, priority: int) -> None: ...
+def make_subagent() -> ReactPlanner:
+    return ReactPlanner(llm="gpt-4o-mini", catalog=worker_tools)
 
-    async def seal_group(self, *, session_id: str, group: str) -> None: ...
 
-    async def list_groups(self, *, session_id: str) -> list[dict]: ...
+def tool_job_factory(tool_name: str, tool_args: Any) -> TaskPipeline:
+    return build_tool_job_pipeline(spec=specs[tool_name], args_payload=dict(tool_args))
 
-    async def apply_group(
-        self, *, session_id: str, group: str, merge_strategy: str | None = None,
-    ) -> dict: ...                       # returns merge summary
-```
 
-Exact attribute names and types come from `penguiflow.sessions.task_service`. The protocol is duck-typed — implement these methods on any object.
+class TenantQuota:
+    async def decide(self, request: SpawnRequest) -> SpawnDecision:
+        if request.mode == "job" and request.tool_name not in specs:
+            return SpawnDecision(allowed=False, reason="unknown_tool")
+        return SpawnDecision(allowed=True)
 
-## In-process reference implementation
-
-PenguiFlow ships an in-process `TaskService` suitable for development:
-- Tasks run as `asyncio.Task`s within the same process.
-- Lifecycle is tracked in-memory.
-- No persistence across restarts.
-
-Wire it like:
-```python
-from penguiflow.sessions.task_service import InProcessTaskService
 
 task_service = InProcessTaskService(
-    planner=foreground_planner,
-    max_concurrent=4,
-    max_per_session=20,
+    sessions=SessionManager(
+        limits=SessionLimits(max_background_tasks=4, max_task_runtime_s=300),
+        state_store=None,                         # or a StateStore / SessionStateStore
+        telemetry_sink=LoggingTaskTelemetrySink(),
+    ),
+    planner_factory=make_subagent,                # required (may be None)
+    subagent_planner_factory=None,                # overrides planner_factory for subagents
+    tool_job_factory=tool_job_factory,            # needed for mode="job"
+    spawn_guard=TenantQuota(),                    # default allows everything
+    background_config=BackgroundTasksConfig(default_group_merge_strategy="human_gated"),
 )
-
-# pass on every planner.run(...)
-result = await foreground_planner.run(
-    user_message,
-    tool_context={"session_id": "...", "task_service": task_service},
-)
 ```
 
-This works for: dev playground, single-process production, low-volume agents. It doesn't work for: multi-worker deployments, anything needing task recovery after restart.
+What a spawn does:
+1. Asks `spawn_guard.decide(SpawnRequest(...))`. A denial raises `RuntimeError(reason or "spawn_blocked")`.
+2. Gets or creates the `StreamingSession`, and applies `background_config` to it.
+3. Returns the existing task when an `idempotency_key` or `task_id` repeats.
+4. Snapshots the session context. `tool_context` keeps JSON values only, and `context_depth` trims `llm_context`.
+5. Resolves or creates the group, then calls `session.spawn_task(...)`. That checks `SessionLimits`, records the task as `PENDING` and starts an `asyncio` task. The task waits for a concurrency slot, runs, and ends `COMPLETE`, `FAILED` or `CANCELLED`.
+6. Joins the group, seals it if asked, and waits for it when `retain_turn=True`.
 
-## Production patterns
+Without a subagent factory, `spawn` raises `background_tasks_unavailable`. Without a `tool_job_factory`, `spawn_tool_job` raises `tool_background_unavailable`.
 
-### Pattern 1: persistent in-process
+### Subagent runs
 
-In-process `TaskService` + `StateStore` for durability. The service:
-- Writes task state to the store on every transition.
-- Hydrates from the store on startup (recovers PENDING/RUNNING tasks).
-- Continues to execute tasks in `asyncio`.
+Each subagent is a `PlannerTaskPipeline` run. Its `tool_context` gets `session_id="<session>:<task_id>"`, `parent_session_id`, `is_subagent=True`, `trace_id` and `task_id`, so its memory is separate from the foreground's.
 
-Survives process restart. Doesn't scale across workers.
+If a subagent pauses (HITL), the task becomes `PAUSED` and the session publishes a `CHECKPOINT` with `kind: "approval_required"` and the `resume_token`. Approve with an `APPROVE` steering event whose payload carries `{"resume_token": ..., "decision": ...}`. `REJECT` cancels the task.
 
-### Pattern 2: distributed queue
+### Tool jobs
 
-Wrap a real queue (Redis, RabbitMQ, SQS) and a worker pool:
-- `TaskService.spawn` enqueues a task message.
-- A worker process subscribes, runs subagent/job, posts result back.
-- The foreground planner polls (or subscribes to) task state via `TaskService.list` / `get`.
-
-Scales horizontally. Adds infrastructure dependency. State must live in the queue + a metadata store.
-
-### Pattern 3: subprocess executor
-
-Spawn subprocesses for jobs (e.g., long Python scripts, sandboxed code). Useful for:
-- Memory isolation.
-- CPU-bound work that would block `asyncio`.
-- Sandboxing untrusted code.
-
-`TaskService.spawn` launches the subprocess and tracks its handle. Cancellation kills the process.
-
-## Spawn flow walkthrough
-
-```
-foreground tool calls tasks.spawn(mode="subagent", prompt="...", group="g1")
-    │
-    ▼
-TaskService.spawn(...)
-    1. Validate limits (max_concurrent, max_per_session)
-    2. Create task record (PENDING)
-    3. Persist (if durable backend)
-    4. Schedule execution
-    5. Return task_id
-    │
-    ▼
-foreground continues
-    │
-    ▼
-(background) execution
-    1. Mark RUNNING, persist
-    2. Run subagent or tool
-    3. Capture result
-    4. Mark COMPLETED/FAILED, persist
-    5. If APPEND/REPLACE: apply ContextPatch to foreground context
-    6. If HUMAN_GATED: queue for later apply
-    7. If grouped: increment group count; maybe auto-seal
-```
+`build_tool_job_pipeline(spec=..., args_payload=...)` validates the args, calls the tool once with a `ToolJobContext`, and returns the output as the task result. It also extracts artifacts. Jobs cannot pause.
 
 ## Cancellation
 
-`tasks.cancel(task_id)`:
-- PENDING → mark CANCELLED, don't execute.
-- RUNNING → cancel the in-flight `asyncio.Task` (cooperative; same caveats as [[penguiflow-core-flows]] cancellation).
-- COMPLETED/FAILED — no-op.
+`tasks.cancel` / `service.cancel` send a `CANCEL` steering event. The session marks the task `CANCELLED`, cancels its `asyncio` task and cascades to its children. A child spawned with `propagate_on_cancel="isolate"` keeps running. `tasks.cancel_group` cancels the group's pending tasks when `propagate_on_cancel="cascade"`.
 
-For subprocess executors, cancellation sends SIGTERM/SIGKILL. Implement gracefully.
+## Persistence and recovery
 
-## Recovery (restart-aware services)
+With `SessionManager(state_store=...)`, the session saves task records, updates and steering events. It accepts a `SessionStateStore` or a core `StateStore`, which is wrapped in `StateStoreSessionAdapter`. Store errors are not swallowed: a failing task save fails the spawn or status change that triggered it.
 
-On startup:
-1. Load all tasks with status PENDING or RUNNING from the store.
-2. For RUNNING, decide: re-execute, mark FAILED, or wait for the original worker.
-3. For PENDING, schedule execution.
+On `get_or_create`, a session reloads its task records. Nothing else survives a restart: running tasks, pending patches, groups, `background_results` and the idempotency map are in memory. After a restart, list the tasks that were `PENDING`/`RUNNING`, then re-spawn them (if idempotent) or mark them failed.
 
-The choice depends on idempotency:
-- Idempotent tasks: re-execute.
-- Non-idempotent: mark FAILED + alert; require operator intervention.
+## Custom services
 
-Always log recovery decisions.
+Implement the protocol over your own queue or database when tasks must outlive a process or spread across workers:
+- `spawn` / `spawn_tool_job` enqueue a job and return a `TaskSpawnResult` with status `PENDING`.
+- Workers run the subagent or the tool, and write the status and the result digest back.
+- `list` / `get` / the group methods read your store. `cancel` signals the worker.
 
-## Limits enforcement
-
-The service must enforce `max_concurrent_tasks` and `max_tasks_per_session` from `BackgroundTasksConfig`. Options when limits hit:
-- Reject spawn (return error to planner).
-- Queue (PENDING) and execute when capacity frees up.
-
-Library default is reject; production services usually queue with a deeper backpressure layer.
-
-## Observability hooks
-
-Emit `PlannerEvent` (or your own equivalent) for every lifecycle transition:
-- `task_spawned`, `task_started`, `task_completed`, `task_failed`, `task_cancelled`, `task_merged`.
-- `task_group_sealed`, `task_group_applied`.
-
-Track:
-- Queue depth (PENDING count) — saturation signal.
-- p95 time-to-start (PENDING duration) — capacity signal.
-- p95 task duration — workload signal.
-- Failure rate by mode and tool.
+Keep the return types: the `tasks.*` tools validate them (`TaskSummary`, `TaskDetails`, `TaskGroup`).
 
 ## Anti-patterns
 
-- **In-process `asyncio` for CPU-bound work** — blocks the event loop. Use subprocess or worker pool.
-- **No persistence in multi-worker deployments** — tasks vanish on restart.
-- **Persistence without lifecycle hooks** — store sees PENDING but never updates; debugging nightmare.
-- **No idempotency for retried tasks** — duplicates side effects on recovery.
-- **Subagents that can spawn more tasks** — recursion explosion; visibility policy.
-- **No per-session limit** — one bad session DoSes the worker.
+- CPU-bound work in in-process tasks, which blocks the event loop. Use a custom service with a worker pool.
+- Relying on in-process groups or pending patches across restarts.
+- Non-idempotent jobs re-spawned after recovery without an idempotency key.
+- Passing clients through the session `tool_context` to subagents: they are dropped. Close over them in the factory.

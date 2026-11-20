@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from penguiflow.planner.guardrails.async_eval import AsyncRuleEvaluator
-from penguiflow.planner.guardrails.models import GuardrailDecision
+from typing_extensions import override
+
+if TYPE_CHECKING:
+    from penguiflow.planner.guardrails.async_eval import AsyncRuleEvaluator
+    from penguiflow.planner.guardrails.models import GuardrailDecision
 
 
 class SteeringGuardInbox(ABC):
@@ -21,13 +24,24 @@ class SteeringGuardInbox(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def await_response(self, correlation_id: str, timeout_s: float) -> SteeringGuardResponse:
-        """Wait for response. Raises TimeoutError if exceeded."""
+    async def await_response(
+        self, correlation_id: str, timeout_s: float
+    ) -> SteeringGuardResponse:
+        """Wait for response. Raises TimeoutError if exceeded.
+
+        A timeout must not discard the evaluation: its response stays
+        available to ``drain_responses`` once it completes.
+        """
         raise NotImplementedError
 
     @abstractmethod
     def drain_responses(self, run_id: str) -> list[SteeringGuardResponse]:
-        """Drain pending responses for late decision handling."""
+        """Return and forget the completed responses of ``run_id``.
+
+        The gateway calls this to collect decisions that arrived after it
+        stopped waiting, and when a run finishes. Only responses for
+        events submitted with this ``run_id`` are returned.
+        """
         raise NotImplementedError
 
 
@@ -57,14 +71,22 @@ class InMemoryGuardInbox(SteeringGuardInbox):
     """In-process async evaluation."""
 
     def __init__(self, evaluator: AsyncRuleEvaluator) -> None:
+        """Create an inbox that evaluates events with ``evaluator``."""
         self._evaluator = evaluator
-        self._pending: dict[str, asyncio.Future[SteeringGuardResponse]] = {}
-        self._completed: dict[str, SteeringGuardResponse] = {}
+        self._futures: dict[str, asyncio.Future[SteeringGuardResponse]] = {}
+        self._run_ids: dict[str, str] = {}
+        self._tasks: set[asyncio.Task[None]] = set()
 
+    @override
     async def submit(self, event: SteeringGuardEvent) -> str:
-        future: asyncio.Future[SteeringGuardResponse] = asyncio.Future()
-        self._pending[event.correlation_id] = future
-        asyncio.create_task(self._evaluate(event, future))
+        future: asyncio.Future[SteeringGuardResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._futures[event.correlation_id] = future
+        self._run_ids[event.correlation_id] = event.run_id
+        task = asyncio.create_task(self._evaluate(event, future))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return event.correlation_id
 
     async def _evaluate(
@@ -72,36 +94,52 @@ class InMemoryGuardInbox(SteeringGuardInbox):
         event: SteeringGuardEvent,
         future: asyncio.Future[SteeringGuardResponse],
     ) -> None:
+        from penguiflow.planner.guardrails.async_eval import (
+            AsyncRuleEvaluationError,
+        )
+
         try:
             decisions = await self._evaluator.evaluate(event)
             response = SteeringGuardResponse(
                 correlation_id=event.correlation_id,
                 decisions=decisions,
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except AsyncRuleEvaluationError as exc:
             response = SteeringGuardResponse(
                 correlation_id=event.correlation_id,
+                decisions=exc.decisions,
                 error=str(exc),
             )
-
-        self._completed[event.correlation_id] = response
-        self._pending.pop(event.correlation_id, None)
+        except Exception as exc:
+            response = SteeringGuardResponse(
+                correlation_id=event.correlation_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
         if not future.done():
             future.set_result(response)
 
-    async def await_response(self, correlation_id: str, timeout_s: float) -> SteeringGuardResponse:
-        if correlation_id in self._completed:
-            return self._completed[correlation_id]
-
-        future = self._pending.get(correlation_id)
+    @override
+    async def await_response(
+        self, correlation_id: str, timeout_s: float
+    ) -> SteeringGuardResponse:
+        future = self._futures.get(correlation_id)
         if future is None:
-            raise KeyError(f"Unknown correlation_id: {correlation_id}")
+            msg = f"Unknown correlation_id: {correlation_id}"
+            raise KeyError(msg)
+        # Shield the future so a timeout leaves the evaluation running and
+        # its late response drainable.
+        return await asyncio.wait_for(asyncio.shield(future), timeout_s)
 
-        return await asyncio.wait_for(future, timeout=timeout_s)
-
+    @override
     def drain_responses(self, run_id: str) -> list[SteeringGuardResponse]:
-        # NOTE: Simple implementation drains globally.
-        responses = list(self._completed.values())
-        self._completed.clear()
+        done = [
+            correlation_id
+            for correlation_id, future in self._futures.items()
+            if future.done() and self._run_ids.get(correlation_id) == run_id
+        ]
+        responses = [self._futures[cid].result() for cid in done]
+        for correlation_id in done:
+            self._futures.pop(correlation_id, None)
+            self._run_ids.pop(correlation_id, None)
         return responses

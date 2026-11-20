@@ -10,6 +10,11 @@ Even a small classifier can run asynchronously without blocking LLM/tool
 execution. The guardrail uses RETRY guidance to ask for clarification rather
 than hard stopping.
 
+A RETRY only applies when the gateway waits for it, so `flow.py` builds the
+gateway with `DefaultRiskRouter(llm_before_wait_ms=500.0)`. With the default
+wait of 0 ms the classifier's verdict on the user input arrives late, and a
+late decision only applies when it is a STOP.
+
 ## Optional dependencies
 
 ```

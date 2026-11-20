@@ -167,7 +167,8 @@ See **[Planner observability](observability.md)**.
 **Fix**
 
 - confirm whether the gateway is in `shadow` or `enforce` mode
-- inspect the `failure.guardrail` payload in tool call results (it includes `rule_id` and `reason`)
+- inspect the `failure.guardrail` payload in tool call results, or `metadata["guardrail"]` on a run that finished `no_path` (both include `rule_id` and `reason`)
+- search the `guardrail_decision` log records on the `penguiflow.planner` logger (`event_type`, `rule_id`, `action`)
 - tune rule configs (allowlists, redaction patterns, timeouts)
 
 See **[Guardrails](guardrails.md)**.
