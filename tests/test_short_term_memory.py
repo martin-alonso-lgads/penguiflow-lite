@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -21,7 +22,7 @@ from penguiflow.planner.memory import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Coroutine, Mapping
 
 
 def test_memory_key_composite() -> None:
@@ -294,3 +295,122 @@ async def test_persist_hydrate_noop_when_store_missing_methods() -> None:
     await other.hydrate(Store(), "k")
     ctx = await other.get_llm_context()
     assert ctx["conversation_memory"]["recent_turns"] == []
+
+
+def _run_with_deadline(
+    coro_factory: Callable[[], Coroutine[Any, Any, None]], seconds: float
+) -> None:
+    """Run a coroutine in a thread; fail if it blocks past ``seconds``."""
+    errors: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            asyncio.run(coro_factory())
+        except BaseException as exc:  # Re-raised in the test thread.
+            errors.append(exc)
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "memory budget enforcement never returned"
+    if errors:
+        raise errors[0]
+
+
+def test_truncate_summary_makes_progress_when_summary_fits() -> None:
+    """A summary within its own budget never stalls the total budget."""
+
+    async def keep_summary(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"summary": payload["previous_summary"]}
+
+    async def scenario() -> None:
+        memory = DefaultShortTermMemory(
+            config=ShortTermMemoryConfig(
+                strategy="rolling_summary",
+                budget=MemoryBudget(
+                    full_zone_turns=10,
+                    summary_max_tokens=200,
+                    total_max_tokens=200,
+                    overflow_policy="truncate_summary",
+                ),
+            ),
+            summarizer=keep_summary,
+        )
+        state = memory.to_dict()
+        state["summary"] = "s" * 100
+        memory.from_dict(state)
+        await memory.add_turn(
+            ConversationTurn(
+                user_message="x" * 400, assistant_response="y" * 400
+            )
+        )
+        assert memory.estimate_tokens() <= 200
+
+    _run_with_deadline(scenario, seconds=5)
+
+
+async def test_rolling_summary_error_policy_still_summarizes() -> None:
+    """With ``overflow_policy="error"`` pending turns still get summarized."""
+    calls: list[int] = []
+
+    async def summarizer(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(len(payload["turns"]))
+        return {"summary": "<session_summary>ok</session_summary>"}
+
+    memory = DefaultShortTermMemory(
+        config=ShortTermMemoryConfig(
+            strategy="rolling_summary",
+            budget=MemoryBudget(
+                full_zone_turns=1,
+                summary_max_tokens=20,
+                total_max_tokens=100,
+                overflow_policy="error",
+            ),
+            retry_attempts=0,
+            retry_backoff_base_s=0.0,
+        ),
+        summarizer=summarizer,
+    )
+    for index in range(3):
+        await memory.add_turn(
+            ConversationTurn(
+                user_message=f"u{index} " + "x" * 200,
+                assistant_response="a",
+            )
+        )
+        await memory.flush()
+
+    ctx = await memory.get_llm_context()
+    assert calls == [1, 1]
+    assert ctx["conversation_memory"]["summary"].startswith(
+        "<session_summary>"
+    )
+    assert "pending_turns" not in ctx["conversation_memory"]
+
+
+async def test_error_policy_raise_leaves_memory_unchanged() -> None:
+    """A turn rejected by the budget is not kept in memory."""
+    memory = DefaultShortTermMemory(
+        config=ShortTermMemoryConfig(
+            strategy="truncation",
+            budget=MemoryBudget(
+                full_zone_turns=10,
+                summary_max_tokens=0,
+                total_max_tokens=50,
+                overflow_policy="error",
+            ),
+        )
+    )
+    await memory.add_turn(
+        ConversationTurn(user_message="u1", assistant_response="a1")
+    )
+    before = memory.to_dict()
+
+    with pytest.raises(MemoryBudgetExceeded):
+        await memory.add_turn(
+            ConversationTurn(
+                user_message="x" * 1000, assistant_response="y" * 1000
+            )
+        )
+
+    assert memory.to_dict() == before

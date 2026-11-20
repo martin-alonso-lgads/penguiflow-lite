@@ -70,7 +70,7 @@ Recipes in `references/metrics-and-alerts.md`.
 Tracing covers the **native LLM adapter only**: `ReactPlanner(use_native_llm=True, ...)` (the default is `False`, the LiteLLM client) or an adapter you build with `create_native_adapter(...)` and pass as `llm_client=`.
 - Zero-code: `export PENGUIFLOW_LLM_TRACING=mlflow` (or `log`) — every native-adapter completion becomes a span with provider, model, tokens, cost and latency (never message contents). Without `use_native_llm=True` the variable does nothing.
 - Explicit: pass `trace_sink=MlflowLLMTraceSink()` / `LoggingLLMTraceSink()` (from `penguiflow.llm.tracing`) to `create_native_adapter(...)`.
-- Raw LLM events (`request_start`/`request_end`/`retry`/`error`): `get_telemetry_hooks().register(callback)` from `penguiflow.llm.telemetry`, with ready-made `create_mlflow_callback()` / `create_prometheus_callback()`. These fire only for the standalone `penguiflow.llm.LLMClient`, not for planner LLM calls.
+- Raw LLM events (`request_start`/`request_end`/`retry`/`error`): `get_telemetry_hooks().register(callback)` from `penguiflow.llm.telemetry`, with ready-made `create_mlflow_callback()` / `create_prometheus_callback()`. They fire for the standalone `penguiflow.llm.LLMClient` and for the planner's own LLM calls (native adapter and LiteLLM client; `mode` is the output mode, or `native_tools` for native tool calling).
 
 Worked example: `examples/mlflow_llm_tracing/`.
 

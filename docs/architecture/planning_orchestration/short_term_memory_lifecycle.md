@@ -127,10 +127,10 @@ When the planner finishes, the completed exchange is added to STM so it can be r
 | Step | Key operation | Sync/async | Source ref |
 |------|---------------|------------|------------|
 | build turn | `_build_memory_turn`: extract `assistant_response` from `result.payload['raw_answer']` (or JSON-serialise the payload), fold trajectory steps into a `TrajectoryDigest` (only successful tool steps; observations truncated to 400 chars); skip digest if `include_trajectory_digest=False` | Sync | `memory_integration.py:_build_memory_turn` |
-| add_turn | Acquire lock; append to `_turns`; fire `on_turn_added`; for `truncation` drop oldest beyond `full_zone_turns` and enforce budget; for `rolling_summary` evict overflow into `_pending` and schedule summarization | Async (lock + task) | `memory.py:add_turn` |
-| persist | If `planner.state_store` is set and the memory exposes `persist`, call `store.save_memory_state(composite, to_dict())`; warn-and-continue on failure | Async (state store) | `memory_integration.py:_maybe_memory_persist` |
+| add_turn | Acquire lock; append to `_turns`; for `truncation` drop oldest beyond `full_zone_turns` and enforce budget; for `rolling_summary` evict overflow into `_pending`, schedule summarization, then enforce budget; fire `on_turn_added` | Async (lock + task) | `memory.py:add_turn` |
+| persist | If `planner.state_store` is set and the memory exposes `persist`, call `store.save_memory_state(composite, to_dict())`; warn-and-continue on failure. For `rolling_summary`, a background task then waits for the summary (`flush()`) and saves again; the next hydrate of that key waits for it | Async (state store) | `memory_integration.py:_maybe_memory_persist`, `_schedule_summary_persist` |
 
-`add_turn` enforces budgets **before** persistence runs, so the persisted snapshot never exceeds `total_max_tokens` under `truncate_summary` / `truncate_oldest` policies. Under `overflow_policy="error"`, `MemoryBudgetExceeded` is raised inside `add_turn`; the surrounding `_maybe_record_memory_turn` catches the exception, logs `memory_add_turn_failed`, and skips persistence — the in-memory state is left as the strategy's truncation rules dictate.
+`add_turn` enforces budgets **before** persistence runs, so the persisted snapshot never exceeds `total_max_tokens` under `truncate_summary` / `truncate_oldest` policies. Under `overflow_policy="error"`, `MemoryBudgetExceeded` is raised inside `add_turn` and the in-memory state is restored to what it was before the turn; the surrounding `_maybe_record_memory_turn` catches the exception, logs `memory_add_turn_failed`, and skips persistence. With `rolling_summary`, pending turns don't count toward the `error` check, because summarization is scheduled before it.
 
 `PlannerPause` results bypass both `add_turn` and `persist`; the resume path (Phase 2 again) re-applies memory context and only records once `PlannerFinish` is reached.
 
@@ -192,7 +192,7 @@ If the planner is configured with a `state_store`, STM survives process restarts
 
 The store contract is duck-typed: any object exposing `async save_memory_state(key, state)` and `async load_memory_state(key)` works. `penguiflow.state.in_memory.InMemoryStateStore` satisfies it for tests; production deployments typically point at a Redis-/Postgres-backed adapter.
 
-Persistence is **fire-and-forget on the success path**: `_maybe_memory_persist` swallows exceptions and logs `memory_persist_failed`. A failed persist does not roll back the in-memory `add_turn`, so a process crash between `add_turn` and `save_memory_state` loses the turn. Phase 5's persistence is the only write site; there is no separate flush-on-shutdown hook.
+Persistence is **fire-and-forget on the success path**: `_maybe_memory_persist` swallows exceptions and logs `memory_persist_failed`. A failed persist does not roll back the in-memory `add_turn`, so a process crash between `add_turn` and `save_memory_state` loses the turn. Phase 5 writes twice under `rolling_summary`: right after `add_turn`, and again from a background task once the summary is done (`_schedule_summary_persist`). The next hydrate of the same key on that planner awaits that task, so the load never replaces a newer in-process summary. There is no separate flush-on-shutdown hook.
 
 ---
 

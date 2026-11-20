@@ -6,6 +6,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Protocol
+from urllib.parse import quote, urlencode
 
 
 class TokenStore(Protocol):
@@ -236,11 +237,12 @@ class OAuthManager:
             "state": state,
             "response_type": "code",
         }
-        query = "&".join(f"{k}={v}" for k, v in params.items())
+        query = urlencode(params, quote_via=quote)
+        separator = "&" if "?" in config.auth_url else "?"
 
         return {
             "display_name": config.display_name,
-            "auth_url": f"{config.auth_url}?{query}",
+            "auth_url": f"{config.auth_url}{separator}{query}",
             "scopes": config.scopes,
             "state": state,
         }

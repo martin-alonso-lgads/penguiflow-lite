@@ -13,6 +13,7 @@ from penguiflow.cli.tools import (
     parse_env_overrides,
     run_tools_connect,
 )
+from penguiflow.tools import ToolAuthError
 
 
 def test_tools_list_outputs_presets() -> None:
@@ -193,3 +194,42 @@ def test_tools_connect_valid_env_override_via_cli() -> None:
     )
     assert result.exit_code == 0
     assert "Dry run only" in result.output
+
+
+def test_tools_connect_masks_env_values_via_cli() -> None:
+    """Env values are masked; ``${VAR}`` placeholders stay readable."""
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "tools",
+            "connect",
+            "github",
+            "--env",
+            "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "ghp_secret" not in result.output
+    assert '"GITHUB_PERSONAL_ACCESS_TOKEN": "***"' in result.output
+
+
+def test_run_tools_connect_turns_tool_errors_into_cli_errors() -> None:
+    """A ToolNode error at connect becomes a ToolsCLIError with a hint."""
+    mock_node = MagicMock()
+    mock_node.connect = AsyncMock(
+        side_effect=ToolAuthError("Missing env var GITHUB_TOKEN")
+    )
+    mock_node.close = AsyncMock()
+
+    with (
+        patch("penguiflow.tools.ToolNode", return_value=mock_node),
+        patch("penguiflow.registry.ModelRegistry"),
+        pytest.raises(ToolsCLIError) as excinfo,
+    ):
+        run_tools_connect("github", discover=True)
+
+    assert "GITHUB_TOKEN" in excinfo.value.message
+    assert excinfo.value.hint is not None
+    assert "--env" in excinfo.value.hint
+    mock_node.close.assert_awaited_once()

@@ -113,6 +113,17 @@ class ToolContext(Protocol):
         """
 
     @property
+    def run_state(self) -> MutableMapping[str, Any]:
+        """Mutable state shared by every tool call of the current run.
+
+        Unlike ``tool_context``, which each call gets as its own copy,
+        writes here are seen by the run's later tool calls and survive
+        pause and resume. Values must be JSON-serializable. Contexts outside
+        a planner run fall back to ``tool_context``.
+        """
+        return self.tool_context
+
+    @property
     def kv(self) -> SessionKV:
         """Durable session key/value facade.
 

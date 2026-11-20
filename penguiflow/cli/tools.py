@@ -70,13 +70,21 @@ def run_tools_list() -> None:
         )
 
 
+def _masked_env(env: dict[str, str]) -> dict[str, str]:
+    """Hide env values, keeping ``${VAR}`` placeholders readable."""
+    return {
+        key: value if value.startswith("${") else "***"
+        for key, value in env.items()
+    }
+
+
 def _echo_preset(config: ExternalToolConfig) -> None:
     click.echo(f"Preset: {config.name}")
     click.echo(f"  transport : {config.transport.value}")
     click.echo(f"  auth      : {config.auth_type.value}")
     click.echo(f"  connection: {config.connection}")
     if config.env:
-        click.echo(f"  env       : {json.dumps(config.env)}")
+        click.echo(f"  env       : {json.dumps(_masked_env(config.env))}")
 
 
 def _echo_tool_names(names: list[str], max_tools: int) -> None:
@@ -99,7 +107,7 @@ def run_tools_connect(
     env_overrides = env_overrides or {}
     try:
         from penguiflow.registry import ModelRegistry
-        from penguiflow.tools import ToolNode, get_preset
+        from penguiflow.tools import ToolNode, ToolNodeError, get_preset
     except Exception as exc:  # pragma: no cover - dependency guard
         msg = "penguiflow-lite[planner] is required for tool discovery."
         raise ToolsCLIError(
@@ -126,17 +134,27 @@ def run_tools_connect(
     node = ToolNode(config=config, registry=registry)
 
     async def _connect_and_list() -> list[str]:
-        await node.connect()
-        names = [spec.name for spec in node.get_tools()]
+        try:
+            await node.connect()
+            names = [spec.name for spec in node.get_tools()]
+        finally:
+            # Close on the loop the clients were opened on.
+            with contextlib.suppress(Exception):
+                await node.close()
         if show_tools:
             _echo_tool_names(names, max_tools)
         return names
 
     try:
         names = asyncio.run(_connect_and_list())
-    finally:
-        with contextlib.suppress(Exception):
-            asyncio.run(node.close())
+    except ToolNodeError as exc:
+        raise ToolsCLIError(
+            str(exc),
+            hint=(
+                "Set the variables the preset's env needs, or pass them "
+                "with --env NAME=value."
+            ),
+        ) from exc
 
     return ConnectResult(success=True, discovered=len(names))
 

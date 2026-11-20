@@ -97,7 +97,7 @@ Without a store, memory lives in the planner instance, one memory per composite 
 - `save_memory_state(key: str, state: dict) -> None`
 - `load_memory_state(key: str) -> dict | None`
 
-Every `run()` and `resume()` hydrates from the store (`load_memory_state`). After a run that finishes (`PlannerFinish`), the turn is added and the state saved. A paused run records no turn. With a store, prefer `truncation`: the save happens before the background summary is ready, so in the current code a rolling summary never reaches the store or the prompt (see `references/persistence-and-hooks.md`). See [[penguiflow-statestore]] for backends. The same methods also back `ctx.kv`, under keys like `kv:v1:<tenant_id>:<user_id>:<session_id>:session:<namespace>:<key>`, so implementations must treat keys as opaque strings, not only `tenant:user:session`.
+Every `run()` and `resume()` hydrates from the store (`load_memory_state`). After a run that finishes (`PlannerFinish`), the turn is added and the state saved. A paused run records no turn. With `rolling_summary`, the state is saved again once the background summary is done, and the next run on that planner waits for that save before it loads (see `references/persistence-and-hooks.md`). See [[penguiflow-statestore]] for backends. The same methods also back `ctx.kv`, under keys like `kv:v1:<tenant_id>:<user_id>:<session_id>:session:<namespace>:<key>`, so implementations must treat keys as opaque strings, not only `tenant:user:session`.
 
 ### 6) (Optional) Wire hooks for metrics
 `ShortTermMemoryConfig` accepts `on_turn_added(turn)`, `on_summary_updated(old, new)`, `on_health_changed(old, new)` — all async, **fire-and-forget**. Exceptions are swallowed. Use for lightweight metrics/logs only; durability goes through `StateStore`. Full signatures in `references/persistence-and-hooks.md`.
@@ -109,7 +109,7 @@ When STM is active, the memory payload has `recent_turns`, plus `summary` and `p
 - **No memory in the prompt** — key resolution failed; pass `memory_key=MemoryKey(...)` explicitly or put `session_id` (and `tenant_id`/`user_id`) in `tool_context`.
 - **Memory bloats prompts** — lower `full_zone_turns` (3-5), set `include_trajectory_digest=False`, move large tool outputs to artifacts.
 - **Rolling summary never appears** — confirm `strategy="rolling_summary"`. Summaries start only once there are more than `full_zone_turns` turns, and they run in the background. Check that `summarizer_model` (or the planner's LLM, when it's `None`) is reachable, and watch `on_health_changed` for `degraded`.
-- **`memory_add_turn_failed` warnings** — with `overflow_policy="error"`, the planner catches `MemoryBudgetExceeded` and logs it; the run still returns, and that turn is not persisted. Use `truncate_oldest` for services.
+- **`memory_add_turn_failed` warnings** — with `overflow_policy="error"`, the planner catches `MemoryBudgetExceeded` and logs it; the run still returns, and that turn is neither kept in memory nor persisted. Use `truncate_oldest` for services.
 - **Cross-session leak** — sessions are **not** tenant boundaries, and a derived key with only `session_id` uses tenant `"default"`. Pass an explicit `MemoryKey` or always set `tenant_id` and `user_id`.
 - **`memory_context_not_json_serialisable` warning** — a custom memory returned a non-JSON patch, so it was skipped. (A non-JSON `llm_context` raises `TypeError` at `run()`.)
 - **Hooks not firing** — exceptions are swallowed; add logging inside hook bodies.

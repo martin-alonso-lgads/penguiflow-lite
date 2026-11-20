@@ -85,7 +85,7 @@ Pauses don't emit an event — `planner.run()` returns a `PlannerPause`.
 ### Context and skills
 `llm_before`, `llm_context_hook_applied` / `llm_context_hook_failed`, `skills_retrieved`, `skill_pack_loaded`, `skill_directory_rendered`, `skill_search_query` / `skill_get` / `skill_list` / `skill_propose`, `tool_directory_rendered`, `tool_hints_generated`.
 
-Guardrail decisions on the LLM step are log records on `penguiflow.planner` (`guardrail_decision`, plus `guardrail_decision_shadow` in shadow mode), not planner events; `guardrail_retry` is the planner event. See [[penguiflow-guardrails]].
+Guardrail decisions at every event type (`llm_before`, `tool_call_start`, `tool_call_result`, `llm_stream_chunk`) are INFO log records on `penguiflow.planner` (`guardrail_decision`, with `event_type`, `run_id`, `action`, `rule_id`, `reason`, `enforced`; plus `guardrail_decision_shadow` for non-ALLOW decisions in shadow mode), not planner events; `guardrail_retry` is the planner event. A run ended by a guardrail STOP finishes `no_path` with `metadata["guardrail"]`. See [[penguiflow-guardrails]].
 
 Grep the planner for `event_type="` when you need the exact payload of a rarer event.
 

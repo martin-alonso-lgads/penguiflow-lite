@@ -22,6 +22,7 @@ from penguiflow.sessions.models import (
     ContextPatch,
     MergeStrategy,
     ProactiveReportRequest,
+    StateUpdate,
 )
 from penguiflow.sessions.task_service import SpawnGuard
 
@@ -1706,3 +1707,143 @@ class TestSessionGroupMethods:
 
         assert g2.group_id != g1.group_id
         assert g2.status == "open"
+
+
+class TestHumanGatedGroupApply:
+    """InProcessTaskService.apply_group on an approved human-gated group."""
+
+    @pytest.fixture
+    def task_service(self) -> InProcessTaskService:
+        """Create an InProcessTaskService over a fresh session manager."""
+        from penguiflow.sessions import SessionManager
+        from penguiflow.sessions.task_service import (
+            InProcessTaskService,
+            SpawnDecision,
+        )
+
+        class AllowAll(SpawnGuard):
+            """Always-allow spawn guard that records its requests."""
+
+            def __init__(self) -> None:
+                self.requests: list[Any] = []
+
+            @override
+            async def decide(self, request: Any) -> SpawnDecision:
+                self.requests.append(request)
+                return SpawnDecision(allowed=True)
+
+        return InProcessTaskService(
+            sessions=SessionManager(),
+            spawn_guard=AllowAll(),
+            planner_factory=None,
+        )
+
+    async def _gated_group(
+        self, task_service: InProcessTaskService
+    ) -> tuple[StreamingSession, str]:
+        session = await task_service.sessions.get_or_create("s1")
+        group = await session.resolve_or_create_group(
+            group_name="gated",
+            turn_id="turn-1",
+            merge_strategy=MergeStrategy.HUMAN_GATED,
+        )
+        for task_id in ("task-1", "task-2"):
+            await session.add_task_to_group(group.group_id, task_id)
+        await session.seal_group(group.group_id)
+        for task_id in ("task-1", "task-2"):
+            patch_id = await session.apply_context_patch(
+                patch=ContextPatch(task_id=task_id, digest=[f"{task_id} ok"]),
+                strategy=MergeStrategy.HUMAN_GATED,
+                group_id=group.group_id,
+            )
+            await session.mark_task_complete_in_group(
+                group.group_id, task_id, success=True, patch_id=patch_id
+            )
+        return session, group.group_id
+
+    @pytest.mark.asyncio
+    async def test_apply_queues_group_report(
+        self,
+        task_service: InProcessTaskService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Approving the group queues its synthesis report."""
+        session, group_id = await self._gated_group(task_service)
+        reports: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            session,
+            "enqueue_proactive_report",
+            lambda **kwargs: reports.append(kwargs),
+        )
+        session.configure_proactive_reporting(
+            generator=AsyncMock(), enabled=True
+        )
+
+        result = await task_service.apply_group(
+            session_id="s1", group_id=group_id, action="apply"
+        )
+        await session.stop_proactive_reporter()
+
+        group = await session.get_group(group_id=group_id)
+        assert group is not None
+        assert result["ok"] is True
+        assert result["applied_patch_count"] == 2
+        assert group.patches == []
+        assert group.merge_strategy == MergeStrategy.APPEND
+        assert [r["is_group_report"] for r in reports] == [True]
+        assert set(session.get_background_results()) == {"task-1", "task-2"}
+
+    @pytest.mark.asyncio
+    async def test_reject_publishes_rejection_notifications(
+        self,
+        task_service: InProcessTaskService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rejecting the group drops its patches and says so."""
+        session, group_id = await self._gated_group(task_service)
+        published: list[StateUpdate] = []
+        original_publish = session.publish
+
+        def record(update: StateUpdate) -> None:
+            published.append(update)
+            original_publish(update)
+
+        monkeypatch.setattr(session, "publish", record)
+
+        result = await task_service.apply_group(
+            session_id="s1", group_id=group_id, action="reject"
+        )
+
+        titles = [
+            u.content.get("title")
+            for u in published
+            if isinstance(u.content, dict)
+        ]
+        assert result["rejected_patch_count"] == 2
+        assert titles.count("Context patch rejected") == 2
+        assert session.pending_patches == {}
+
+
+@pytest.mark.asyncio
+async def test_lower_case_proactive_strategies_match(
+    session: StreamingSession, sample_patch: ContextPatch
+) -> None:
+    """Proactive ``strategies`` match whatever case they are written in."""
+    session.configure_proactive_reporting(
+        generator=AsyncMock(), enabled=True, strategies=["append"]
+    )
+
+    session.enqueue_proactive_report(
+        task_id="task-1",
+        trace_id="trace-1",
+        description="Test task",
+        execution_time_ms=100,
+        patch=sample_patch,
+        merge_strategy=MergeStrategy.APPEND,
+    )
+
+    assert session.proactive_queue.qsize() == 1
+    config = session.proactive_config
+    assert config is not None
+    assert config["strategies"] == ["APPEND"]
+    await session.stop_proactive_reporter()

@@ -28,8 +28,9 @@ import inspect
 import json
 import logging
 import re
+import time
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from types import GenericAlias
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, assert_never, cast
@@ -56,6 +57,14 @@ from .config import (
     UtcpMode,
 )
 from .errors import ToolAuthError, ToolConnectionError, ToolNodeError
+from .mcp_pool import (
+    SHARED_PRINCIPAL,
+    McpSession,
+    McpSessionPool,
+    Principal,
+    auth_fingerprint,
+    principal_from_tool_context,
+)
 from .prompts import (
     PromptArgumentInfo,
     PromptInfo,
@@ -127,22 +136,120 @@ def _container_set(
         parent[key] = value
 
 
-class _McpMessageRouter:
+def resource_updated_uri(message: object) -> str | None:
+    """Return the URI of a ``notifications/resources/updated`` message.
+
+    Args:
+        message: A message from an MCP session: a server notification, a
+            server request or an exception.
+
+    Returns:
+        The updated resource's URI, or ``None`` for any other message.
+    """
+    import mcp.types as mcp_types
+
+    root = getattr(message, "root", None)
+    if isinstance(root, mcp_types.ResourceUpdatedNotification):
+        return str(root.params.uri)
+    return None
+
+
+class McpMessageRouter:
     """MCP ``message_handler`` that lets a ToolNode see server messages.
 
-    Each message goes to ``ToolNode.handle_mcp_message`` first, then to
+    Resource update notifications go to ``on_resource_updated`` (the
+    session's own cache and subscribers). Every message then goes to
     ``fallback``: the client's default handler, which fastmcp uses to
     route task status notifications.
     """
 
-    def __init__(self, node: ToolNode) -> None:
-        self._node = node
+    def __init__(self, on_resource_updated: Callable[[str], None]) -> None:
+        """Route resource updates to ``on_resource_updated``."""
+        self._on_resource_updated = on_resource_updated
         self.fallback: MessageHandlerFnT | None = None
 
     async def __call__(self, message: _McpMessage) -> None:
-        self._node.handle_mcp_message(message)
+        """Handle one server message."""
+        uri = resource_updated_uri(message)
+        if uri is not None:
+            self._on_resource_updated(uri)
         if self.fallback is not None:
             await self.fallback(message)
+
+
+def _import_fastmcp() -> tuple[Any, Any, Any, Any, Any]:
+    """Return fastmcp's client, task handler and transport classes."""
+    try:
+        from fastmcp import Client as MCPClient
+        from fastmcp.client.tasks import TaskNotificationHandler
+        from fastmcp.client.transports import (
+            SSETransport,
+            StdioTransport,
+            StreamableHttpTransport,
+        )
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency hint
+        msg = (
+            "fastmcp is required for MCP ToolNode. Install "
+            "penguiflow-lite[planner]."
+        )
+        raise ToolConnectionError(msg) from exc
+    return (
+        MCPClient,
+        TaskNotificationHandler,
+        SSETransport,
+        StdioTransport,
+        StreamableHttpTransport,
+    )
+
+
+def _mcp_resource_method(
+    client: object, name: str, alias: str
+) -> Callable[[str], Awaitable[object]] | None:
+    """Find ``client``'s resource (un)subscribe method.
+
+    ``fastmcp.Client`` has no subscribe methods, so after any method on
+    the client itself this falls back to the underlying
+    ``mcp.ClientSession``, which takes the URI as an ``AnyUrl``.
+    """
+    for attr in (name, alias):
+        method = getattr(client, attr, None)
+        if callable(method):
+            return _resource_call(method, any_url=False)
+    session_method = getattr(getattr(client, "session", None), name, None)
+    if callable(session_method):
+        return _resource_call(session_method, any_url=True)
+    return None
+
+
+def _parse_resource_info(r: object) -> ResourceInfo:
+    """Parse one ``resources/list`` entry."""
+    return ResourceInfo(
+        uri=str(_attr_or_key(r, "uri", "")),
+        name=_optional_text(_attr_or_key(r, "name")),
+        description=_optional_text(_attr_or_key(r, "description")),
+        mime_type=_optional_text(_attr_or_key(r, "mimeType")),
+    )
+
+
+def _parse_template_info(t: object) -> ResourceTemplateInfo:
+    """Parse one ``resources/templates/list`` entry."""
+    return ResourceTemplateInfo(
+        uri_template=str(_attr_or_key(t, "uriTemplate", "")),
+        name=_optional_text(_attr_or_key(t, "name")),
+        description=_optional_text(_attr_or_key(t, "description")),
+        mime_type=_optional_text(_attr_or_key(t, "mimeType")),
+    )
+
+
+def _as_list(value: object) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _resource_call(
@@ -252,13 +359,27 @@ def _item_text(item: object) -> str | None:
 _AsyncFn = TypeVar("_AsyncFn", bound=Callable[..., Awaitable[object]])
 
 
-def _should_retry(exc: BaseException) -> bool:
-    """Retry timeouts, connection errors and retryable ToolNode errors."""
-    if isinstance(exc, asyncio.CancelledError):
-        return False
-    if isinstance(exc, ToolNodeError):
-        return exc.is_retryable
-    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+def _retry_predicate(
+    policy: RetryPolicy,
+) -> Callable[[BaseException], bool]:
+    """Return the retry test for ``policy``.
+
+    A ToolNode error with a status code is retried when the code is in
+    ``policy.retry_on_status``. Other ToolNode errors are retried by
+    category. Raw timeouts and connection errors are always retried.
+    """
+    retry_statuses = frozenset(policy.retry_on_status)
+
+    def should_retry(exc: BaseException) -> bool:
+        if isinstance(exc, asyncio.CancelledError):
+            return False
+        if isinstance(exc, ToolNodeError):
+            if exc.status_code is not None:
+                return exc.status_code in retry_statuses
+            return exc.is_retryable
+        return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+    return should_retry
 
 
 def _retrying(policy: RetryPolicy) -> Callable[[_AsyncFn], _AsyncFn]:
@@ -285,7 +406,7 @@ def _retrying(policy: RetryPolicy) -> Callable[[_AsyncFn], _AsyncFn]:
             min=policy.wait_exponential_min_s,
             max=policy.wait_exponential_max_s,
         ),
-        retry=retry_if_exception(_should_retry),
+        retry=retry_if_exception(_retry_predicate(policy)),
         reraise=True,
     )
 
@@ -394,6 +515,13 @@ class ToolNode:
             tokens for ``AuthType.OAUTH2_USER`` sources (e.g. an
             :class:`~penguiflow.tools.auth.OAuthManager`). Required whenever
             ``config.auth_type`` is ``OAUTH2_USER``; otherwise unused.
+        time_source: Clock for session idle times and resource cache ages.
+
+    For an MCP source with ``OAUTH2_USER`` auth, the node opens one MCP
+    session per user (``tool_context["tenant_id"]`` and ``["user_id"]``),
+    with that user's token, resource cache and subscriptions. Tools are
+    discovered once, on the first session. Every other source uses one
+    shared session.
 
     Example:
         >>> node = ToolNode(config=cfg, registry=registry)
@@ -405,8 +533,10 @@ class ToolNode:
     config: ExternalToolConfig
     registry: ModelRegistry
     auth_manager: Any | None = None
+    time_source: Callable[[], float] = field(
+        default=time.monotonic, repr=False
+    )
 
-    mcp_client: Any | None = field(default=None, repr=False)
     utcp_client: Any | None = field(default=None, repr=False)
     tools: list[NodeSpec] = field(default_factory=list, repr=False)
     tool_name_map: dict[str, str] = field(
@@ -419,11 +549,9 @@ class ToolNode:
         default=None, repr=False
     )  # Track event loop for reconnection
 
+    _pool: McpSessionPool = field(init=False, repr=False)
+
     # MCP Resources support (Phase 2)
-    resource_cache: ResourceCache | None = field(default=None, repr=False)
-    _subscription_manager: ResourceSubscriptionManager | None = field(
-        default=None, repr=False
-    )
     _resources: list[ResourceInfo] = field(default_factory=list, repr=False)
     _resource_templates: list[ResourceTemplateInfo] = field(
         default_factory=list, repr=False
@@ -448,12 +576,277 @@ class ToolNode:
     )
 
     def __post_init__(self) -> None:
-        """Create the concurrency limits, locks and resource managers."""
+        """Create the concurrency limits, locks and the session pool."""
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
         self._connect_lock = asyncio.Lock()
-        self._subscription_manager = ResourceSubscriptionManager(
-            self.config.name
+        limits = self.config.session_pool
+        self._pool = McpSessionPool(
+            max_sessions=limits.max_sessions,
+            idle_timeout_s=limits.idle_timeout_s,
+            time_source=self.time_source,
         )
+
+    # ─── MCP Sessions ────────────────────────────────────────────────────────
+
+    @property
+    def per_user_sessions(self) -> bool:
+        """Whether each user gets their own MCP session (``OAUTH2_USER``)."""
+        return (
+            self.config.transport == TransportType.MCP
+            and self.config.auth_type == AuthType.OAUTH2_USER
+        )
+
+    @property
+    def mcp_client(self) -> object | None:
+        """The shared MCP client, or ``None`` (always with per-user auth)."""
+        session = self._pool.get(SHARED_PRINCIPAL)
+        return None if session is None else session.client
+
+    @mcp_client.setter
+    def mcp_client(self, client: object | None) -> None:
+        """Install ``client`` as the shared session, or drop it with None.
+
+        Raises:
+            ToolNodeError: With per-user auth, where no session is shared.
+        """
+        if self.per_user_sessions:
+            msg = (
+                f"ToolNode '{self.config.name}' uses per-user MCP "
+                "sessions; there is no shared mcp_client"
+            )
+            raise ToolNodeError(msg)
+        if client is None:
+            self._pool.discard(SHARED_PRINCIPAL)
+            return
+        session = self._new_session(SHARED_PRINCIPAL, client)
+        session.loop = _running_loop()
+        self._pool.install(session)
+
+    @property
+    def resource_cache(self) -> ResourceCache | None:
+        """The shared session's resource cache, or ``None``."""
+        session = self._pool.get(SHARED_PRINCIPAL)
+        return None if session is None else session.cache
+
+    @property
+    def mcp_session_count(self) -> int:
+        """Number of open MCP sessions (shared and per-user)."""
+        return len(self._pool)
+
+    def _new_resource_cache(self) -> ResourceCache:
+        resources = self.config.artifact_extraction.resources
+        return ResourceCache(
+            namespace=self.config.name,
+            config=ResourceCacheConfig(
+                enabled=resources.cache_reads_to_artifacts,
+                ttl_seconds=resources.cache_ttl_seconds,
+                inline_text_if_under_chars=(
+                    resources.inline_text_if_under_chars
+                ),
+            ),
+            time_source=self.time_source,
+        )
+
+    def _new_session(self, principal: Principal, client: object) -> McpSession:
+        return McpSession(
+            principal=principal,
+            client=client,
+            cache=self._new_resource_cache(),
+            subscriptions=ResourceSubscriptionManager(self.config.name),
+        )
+
+    def _principal_for(self, ctx: ToolContext | None) -> Principal:
+        """Return the session key for a call made with ``ctx``.
+
+        Raises:
+            ToolAuthError: With per-user auth, when ``ctx`` is missing or
+                has no ``user_id``.
+        """
+        if not self.per_user_sessions:
+            return SHARED_PRINCIPAL
+        if ctx is None:
+            msg = (
+                f"ToolNode '{self.config.name}' requires HITL "
+                "OAuth but no ToolContext provided. "
+                "Call connect(ctx) with a ToolContext containing user_id."
+            )
+            raise ToolAuthError(msg)
+        principal = principal_from_tool_context(ctx.tool_context)
+        if principal is None:
+            msg = "user_id required in tool_context for OAuth"
+            raise ToolAuthError(msg)
+        return principal
+
+    async def _session_for(
+        self,
+        ctx: ToolContext | None,
+        headers: dict[str, str] | None = None,
+    ) -> McpSession:
+        """Return the open session for ``ctx``, opening it when needed.
+
+        With per-user auth this resolves the user's token first, which may
+        pause the run for OAuth consent. A token change opens a new
+        session.
+        """
+        principal = self._principal_for(ctx)
+        if headers is None:
+            headers = (
+                await self._resolve_user_oauth(ctx)
+                if ctx is not None and self.per_user_sessions
+                else self._get_static_auth_headers()
+            )
+        return await self._pool.acquire(
+            principal,
+            auth_fingerprint(headers),
+            functools.partial(self._open_session, principal, headers),
+        )
+
+    async def _open_session(
+        self, principal: Principal, headers: dict[str, str]
+    ) -> McpSession:
+        session = self._new_session(principal, None)
+        router = McpMessageRouter(
+            functools.partial(self._on_session_update, session)
+        )
+        session.client = await self.open_mcp_client(headers, router)
+        return session
+
+    @contextlib.asynccontextmanager
+    async def _lease(
+        self,
+        ctx: ToolContext | None,
+        headers: dict[str, str] | None = None,
+    ) -> AsyncGenerator[McpSession, None]:
+        """Use ``ctx``'s session for the block.
+
+        With per-user auth, an auth failure (HTTP 401) closes the session,
+        so the next call opens a new one with a fresh token.
+        """
+        session = await self._session_for(ctx, headers)
+        async with self._pool.lease(session):
+            try:
+                yield session
+            except ToolAuthError as exc:
+                if self.per_user_sessions and exc.status_code in (None, 401):
+                    self._pool.retire(session)
+                raise
+
+    @contextlib.asynccontextmanager
+    async def _optional_lease(
+        self, ctx: ToolContext | None
+    ) -> AsyncGenerator[McpSession | None, None]:
+        """Use ``ctx``'s session, or yield ``None`` when there is none.
+
+        The shared session is never opened here; a per-user session is
+        opened on first use.
+        """
+        if self.per_user_sessions:
+            if ctx is None or not ctx.tool_context.get("user_id"):
+                yield None
+                return
+            async with self._lease(ctx) as session:
+                yield session
+            return
+        shared = self._pool.get(SHARED_PRINCIPAL)
+        if shared is None:
+            yield None
+            return
+        async with self._pool.lease(shared):
+            yield shared
+
+    def _on_session_update(self, session: McpSession, uri: str) -> None:
+        """Handle a resource update one session's server sent."""
+        self._invalidate_session(session, uri)
+        self._fire_resource_callback(uri)
+
+    def _invalidate_session(self, session: McpSession, uri: str) -> None:
+        """Drop ``uri`` from ``session``'s cache and notify its subscribers."""
+        session.cache.invalidate(uri)
+        loop = _running_loop()
+        if loop is None:
+            return
+        task = loop.create_task(session.subscriptions.handle_update(uri))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _fire_resource_callback(self, uri: str) -> None:
+        if self._resource_update_callback is None:
+            return
+        try:
+            self._resource_update_callback(uri)
+        except Exception:
+            logger.debug("resource_update_callback_failed", exc_info=True)
+
+    async def open_mcp_client(
+        self, auth_headers: dict[str, str], router: McpMessageRouter
+    ) -> object:
+        """Open and initialize one fastmcp client with ``auth_headers``.
+
+        Override or patch this to supply a different MCP client.
+
+        Args:
+            auth_headers: HTTP headers for a URL connection (stdio
+                connections take none).
+            router: The client's message handler.
+
+        Returns:
+            The connected, initialized client.
+
+        Raises:
+            ToolConnectionError: If the client cannot connect.
+        """
+        client_cls, handler_cls, *transport_classes = _import_fastmcp()
+        client: Any = None
+        try:
+            transport = self._build_mcp_transport(
+                auth_headers, *transport_classes
+            )
+            client = client_cls(
+                transport, auto_initialize=False, message_handler=router
+            )
+            # Keep fastmcp's default handler so task status still routes.
+            router.fallback = handler_cls(client)
+            await client.__aenter__()
+            await self.initialize_mcp_client(client)
+        except Exception as exc:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.__aexit__(type(exc), exc, exc.__traceback__)
+            msg = (
+                "Failed to connect to MCP tool source "
+                f"'{self.config.name}': {exc}"
+            )
+            raise ToolConnectionError(msg) from exc
+        return client
+
+    def _build_mcp_transport(
+        self,
+        auth_headers: dict[str, str],
+        sse_transport_cls: type[Any],
+        stdio_transport_cls: type[Any],
+        streamable_http_transport_cls: type[Any],
+    ) -> object:
+        """Return the fastmcp transport for ``config.connection``."""
+        if self.config.is_url_connection:
+            return self._resolve_mcp_url_transport(
+                self.config.connection,
+                auth_headers,
+                sse_transport_cls,
+                streamable_http_transport_cls,
+            )
+        import shlex
+
+        parts = shlex.split(self.config.connection)
+        return stdio_transport_cls(
+            command=parts[0], args=parts[1:], env=self._stdio_env()
+        )
+
+    def _stdio_env(self) -> dict[str, str] | None:
+        """Return ``config.env`` with ``${VAR}`` placeholders filled in."""
+        if not self.config.env:
+            return None
+        env = self.config.env
+        return {key: self.substitute_env(val) for key, val in env.items()}
 
     def _is_connected_on(self, loop: asyncio.AbstractEventLoop) -> bool:
         """Return whether the client is connected on ``loop``."""
@@ -469,6 +862,9 @@ class ToolNode:
         tools (and, for MCP transports, resources and prompts) are populated
         and registered into ``self.registry``.
 
+        With ``OAUTH2_USER`` auth this opens ``ctx``'s user's session; other
+        users' sessions open on their first call.
+
         Args:
             ctx: Optional ToolContext for HITL OAuth during connection.
                  Required if auth_type is OAUTH2_USER.
@@ -482,16 +878,14 @@ class ToolNode:
                 already-registered name in ``self.registry``.
         """
         current_loop = asyncio.get_running_loop()
-
-        # Check if we need to reconnect due to event loop change
         if (
             self.connected
-            and self.connected_loop
+            and self.connected_loop is not None
             and self.connected_loop is not current_loop
         ):
-            # Connection was made on a different event loop - must reconnect
-            await self.force_reconnect()
-            return
+            # Connected on a different event loop: its clients can't run
+            # here, so drop them and connect again.
+            self._detach_from_loop()
 
         if self.connected:
             return
@@ -501,20 +895,9 @@ class ToolNode:
             if self._is_connected_on(current_loop):
                 return
 
-            # Reset discovery caches before connecting
-            self.tools = []
-            self.tool_name_map.clear()
-            self.app_metadata.clear()
-            self._prompts = []
-            self._prompts_supported = False
-            self.prompts_stale = False
-
-            # Resolve auth headers for connection (supports HITL OAuth if ctx
-            # provided)
-            auth_headers = await self._resolve_connection_auth(ctx)
-
+            self._reset_discovery_state()
             if self.config.transport == TransportType.MCP:
-                await self._connect_mcp(auth_headers)
+                await self._connect_mcp(ctx)
             elif self.config.transport in {
                 TransportType.HTTP,
                 TransportType.UTCP,
@@ -525,137 +908,52 @@ class ToolNode:
                 msg = (
                     f"Transport '{self.config.transport.value}' not supported"
                 )
-                raise ToolConnectionError(
-                    msg,
-                )
+                raise ToolConnectionError(msg)
 
             self.connected = True
             self.connected_loop = current_loop
 
-    async def _resolve_connection_auth(
-        self, ctx: ToolContext | None
-    ) -> dict[str, str]:
-        """Resolve auth headers for connection phase.
+    def _reset_discovery_state(self) -> None:
+        """Forget discovered tools, resources, prompts and app metadata."""
+        self.tools = []
+        self.tool_name_map.clear()
+        self.app_metadata.clear()
+        self._resources = []
+        self._resource_templates = []
+        self._resources_supported = False
+        self._prompts = []
+        self._prompts_supported = False
+        self.prompts_stale = False
 
-        For static auth (BEARER, API_KEY, COOKIE), returns headers directly.
-        For OAUTH2_USER, requires ctx and triggers HITL OAuth flow.
-        """
-        if self.config.auth_type == AuthType.NONE:
-            return {}
+    def _detach_from_loop(self) -> None:
+        """Drop clients and loop-bound locks after an event loop change."""
+        self._pool.detach()
+        self.utcp_client = None
+        self._connect_lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        self.connected = False
+        self.connected_loop = None
 
-        # Static auth types don't need ctx
-        if self.config.auth_type in {
-            AuthType.BEARER,
-            AuthType.API_KEY,
-            AuthType.COOKIE,
-        }:
-            return self._get_static_auth_headers()
-
-        # OAUTH2_USER requires ctx for HITL flow
-        if self.config.auth_type == AuthType.OAUTH2_USER:
-            if ctx is None:
-                msg = (
-                    f"ToolNode '{self.config.name}' requires HITL "
-                    "OAuth but no ToolContext provided. "
-                    "Call connect(ctx) with a ToolContext containing user_id."
-                )
-                raise ToolAuthError(msg)
-            return await self._resolve_user_oauth(ctx)
-
-        return {}
-
-    async def _connect_mcp(
-        self, auth_headers: dict[str, str] | None = None
-    ) -> None:
-        """Connect via FastMCP client.
+    async def _connect_mcp(self, ctx: ToolContext | None) -> None:
+        """Open ``ctx``'s MCP session and discover tools on it.
 
         Args:
-            auth_headers: Optional auth headers resolved during connect().
+            ctx: The caller's context; needed for per-user auth.
         """
+        session = await self._session_for(ctx)
         try:
-            from fastmcp import Client as MCPClient
-            from fastmcp.client.tasks import TaskNotificationHandler
-            from fastmcp.client.transports import (
-                SSETransport,
-                StdioTransport,
-                StreamableHttpTransport,
-            )
-        except (
-            ModuleNotFoundError
-        ) as exc:  # pragma: no cover - dependency hint
-            msg = (
-                "fastmcp is required for MCP ToolNode. Install "
-                "penguiflow-lite[planner]."
-            )
-            raise ToolConnectionError(
-                msg,
-            ) from exc
-
-        try:
-            # Determine transport: shell command or URL
-            connection = self.config.connection
-            transport: Any
-            if connection.startswith(
-                ("http://", "https://", "ws://", "wss://")
-            ):
-                # URL-based transport - determine which to use
-                transport = self._resolve_mcp_url_transport(
-                    connection,
-                    auth_headers,
-                    SSETransport,
-                    StreamableHttpTransport,
-                )
-            else:
-                # Shell command - split into command + args and create
-                # StdioTransport
-                import shlex
-
-                parts = shlex.split(connection)
-                command = parts[0]
-                args = parts[1:] if len(parts) > 1 else []
-                # Pass env vars from config, substituting ${VAR} placeholders
-                env: dict[str, str] | None = None
-                if self.config.env:
-                    env = {}
-                    for key, val in self.config.env.items():
-                        env[key] = (
-                            self.substitute_env(str(val))
-                            if isinstance(val, str)
-                            else str(val)
-                        )
-                transport = StdioTransport(command=command, args=args, env=env)
-
-            router = _McpMessageRouter(self)
-            self.mcp_client = MCPClient(
-                transport, auto_initialize=False, message_handler=router
-            )
-            # Keep fastmcp's default handler so task status still routes.
-            router.fallback = TaskNotificationHandler(self.mcp_client)
-            await self.mcp_client.__aenter__()
-            await self.initialize_mcp_client(self.mcp_client)
-            mcp_tools = await self.mcp_client.list_tools()
+            mcp_tools = await session.client.list_tools()
         except Exception as exc:
-            if self.mcp_client:
-                with contextlib.suppress(Exception):
-                    await self.mcp_client.__aexit__(
-                        type(exc), exc, exc.__traceback__
-                    )
-                self.mcp_client = None
+            self._pool.retire(session)
             msg = (
                 "Failed to connect to MCP tool source "
                 f"'{self.config.name}': {exc}"
             )
-            raise ToolConnectionError(
-                msg,
-            ) from exc
+            raise ToolConnectionError(msg) from exc
 
         self.tools = self.convert_mcp_tools(mcp_tools)
-
-        # Discover MCP resources (Phase 2)
-        await self.discover_mcp_resources()
-
-        # Discover MCP prompts (Phase 3)
-        await self.discover_mcp_prompts()
+        await self.discover_mcp_resources(session)
+        await self.discover_mcp_prompts(session)
 
     async def initialize_mcp_client(
         self, client: _McpClient
@@ -784,46 +1082,35 @@ class ToolNode:
         )
         return result
 
-    async def discover_mcp_resources(self) -> None:
+    async def discover_mcp_resources(
+        self, session: McpSession | None = None
+    ) -> None:
         """Discover MCP resources and templates.
 
-        Best-effort: doesn't fail if server doesn't support resources.
+        Best-effort: doesn't fail if server doesn't support resources. With
+        per-user sessions the resource list is user data, so it is kept on
+        ``session`` instead of the node.
+
+        Args:
+            session: The session to ask; defaults to the shared session.
         """
-        if self.mcp_client is None:
+        session = session or self._pool.get(SHARED_PRINCIPAL)
+        if session is None:
             return
 
-        # Try to list resources
         try:
-            resources = await self.mcp_client.list_resources()
-            self._resources = [
-                ResourceInfo(
-                    uri=str(
-                        getattr(r, "uri", r.get("uri", ""))
-                        if isinstance(r, dict)
-                        else r.uri
-                    ),
-                    name=getattr(
-                        r,
-                        "name",
-                        r.get("name") if isinstance(r, dict) else None,
-                    ),
-                    description=getattr(
-                        r,
-                        "description",
-                        r.get("description") if isinstance(r, dict) else None,
-                    ),
-                    mime_type=getattr(
-                        r,
-                        "mimeType",
-                        r.get("mimeType") if isinstance(r, dict) else None,
-                    ),
-                )
-                for r in (resources if isinstance(resources, list) else [])
+            resources = [
+                _parse_resource_info(r)
+                for r in _as_list(await session.client.list_resources())
             ]
             self._resources_supported = True
+            if self.per_user_sessions:
+                session.resources = resources
+            else:
+                self._resources = resources
             logger.debug(
                 "Discovered %d MCP resources for '%s'",
-                len(self._resources),
+                len(resources),
                 self.config.name,
             )
         except Exception as e:
@@ -836,39 +1123,21 @@ class ToolNode:
             self._resources = []
             self._resources_supported = False
 
-        # Try to list resource templates
+        await self._discover_resource_templates(session)
+
+        # Generate planner tools for resources if supported
+        if self._resources_supported:
+            resource_tools = self.generate_resource_tools()
+            self.tools.extend(resource_tools)
+
+    async def _discover_resource_templates(self, session: McpSession) -> None:
         try:
-            templates = await self.mcp_client.list_resource_templates()
-            self._resource_templates = []
-            for t in templates if isinstance(templates, list) else []:
-                uri_tmpl = (
-                    t.get("uriTemplate", "")
-                    if isinstance(t, dict)
-                    else getattr(t, "uriTemplate", "")
+            self._resource_templates = [
+                _parse_template_info(t)
+                for t in _as_list(
+                    await session.client.list_resource_templates()
                 )
-                desc = (
-                    t.get("description")
-                    if isinstance(t, dict)
-                    else getattr(t, "description", None)
-                )
-                mime = (
-                    t.get("mimeType")
-                    if isinstance(t, dict)
-                    else getattr(t, "mimeType", None)
-                )
-                name = (
-                    t.get("name")
-                    if isinstance(t, dict)
-                    else getattr(t, "name", None)
-                )
-                self._resource_templates.append(
-                    ResourceTemplateInfo(
-                        uri_template=str(uri_tmpl),
-                        name=name,
-                        description=desc,
-                        mime_type=mime,
-                    )
-                )
+            ]
             logger.debug(
                 "Discovered %d MCP resource templates for '%s'",
                 len(self._resource_templates),
@@ -881,11 +1150,6 @@ class ToolNode:
                 e,
             )
             self._resource_templates = []
-
-        # Generate planner tools for resources if supported
-        if self._resources_supported:
-            resource_tools = self.generate_resource_tools()
-            self.tools.extend(resource_tools)
 
     @staticmethod
     def _parse_prompt_info(p: object) -> PromptInfo:
@@ -905,12 +1169,18 @@ class ToolNode:
             arguments=arguments,
         )
 
-    async def discover_mcp_prompts(self) -> None:
+    async def discover_mcp_prompts(
+        self, session: McpSession | None = None
+    ) -> None:
         """Discover MCP prompts.
 
         Best-effort: doesn't fail if server doesn't support prompts.
+
+        Args:
+            session: The session to ask; defaults to the shared session.
         """
-        if self.mcp_client is None:
+        session = session or self._pool.get(SHARED_PRINCIPAL)
+        if session is None:
             return
 
         if not self.config.prompts.enabled:
@@ -920,10 +1190,9 @@ class ToolNode:
             return
 
         try:
-            prompts = await self.mcp_client.list_prompts()
             self._prompts = [
                 self._parse_prompt_info(p)
-                for p in (prompts if isinstance(prompts, list) else [])
+                for p in _as_list(await session.client.list_prompts())
             ]
             self._prompts_supported = True
             self.prompts_stale = False
@@ -1066,12 +1335,14 @@ class ToolNode:
     ) -> object:
         """Execute a tool with auth resolution and resilience.
 
-        Reconnects automatically if the client is not connected or was
+        Connects (with ``ctx``) if the node is not connected or was
         connected on a different event loop, resolves auth headers (pausing for
         HITL OAuth via ``ctx`` if needed), invokes the underlying MCP/UTCP tool
         with retries per ``config.retry_policy``, and runs the result through
         the layered artifact-extraction pipeline (and, for MCP Apps-enabled
-        tools, fetches and attaches the app UI resource).
+        tools, fetches and attaches the app UI resource). With
+        ``OAUTH2_USER`` auth the call goes through the caller's own MCP
+        session, opened with their token.
 
         Args:
             tool_name: Namespaced tool name (e.g. ``"{source}.{tool}"``) or
@@ -1091,33 +1362,21 @@ class ToolNode:
             ToolNodeError: If no client is available or the call fails after
                 exhausting retries.
         """
-        current_loop = asyncio.get_running_loop()
-        if not self.connected or (
-            self.connected_loop and self.connected_loop is not current_loop
-        ):
-            await self.force_reconnect()
+        await self._ensure_connected(ctx)
 
         async with self._semaphore:
             auth_headers = await self.resolve_auth(ctx)
+            original_name = self._original_tool_name(tool_name)
+            app_meta = self._call_app_metadata(tool_name)
 
-            original_name = self.tool_name_map.get(tool_name)
-            if original_name is None:
-                original_name = tool_name.removeprefix(f"{self.config.name}.")
-
-            app_meta = None
-            if (
-                self.config.apps.enabled
-                and self.config.apps.fetch_html_on_call
-            ):
-                app_meta = self.app_metadata.get(tool_name)
-
-            raw_result = await self.call_with_retry(
+            raw_result = await self._invoke(
                 original_name,
                 args,
                 auth_headers,
+                ctx,
                 raw_mcp=app_meta is not None,
             )
-            if self.mcp_client:
+            if self.config.transport == TransportType.MCP:
                 result = self._serialize_mcp_result_for_planner(
                     raw_result,
                     prefer_text_content=app_meta is not None,
@@ -1143,48 +1402,80 @@ class ToolNode:
             # Wrap result to match the output model schema: {"result": <data>}
             return {"result": transformed}
 
+    async def _ensure_connected(self, ctx: ToolContext) -> None:
+        """Connect with ``ctx`` unless connected on the running loop."""
+        current_loop = asyncio.get_running_loop()
+        loop_changed = (
+            self.connected_loop is not None
+            and self.connected_loop is not current_loop
+        )
+        if not self.connected or loop_changed:
+            await self.connect(ctx)
+
+    def _original_tool_name(self, tool_name: str) -> str:
+        original_name = self.tool_name_map.get(tool_name)
+        if original_name is None:
+            original_name = tool_name.removeprefix(f"{self.config.name}.")
+        return original_name
+
+    def _call_app_metadata(self, tool_name: str) -> AppMetadata | None:
+        if self.config.apps.enabled and self.config.apps.fetch_html_on_call:
+            return self.app_metadata.get(tool_name)
+        return None
+
+    async def _invoke(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        auth_headers: dict[str, str],
+        ctx: ToolContext,
+        *,
+        raw_mcp: bool,
+    ) -> object:
+        """Call the tool through ``ctx``'s MCP session, or through UTCP.
+
+        ``auth_headers`` pick the caller's MCP session: a per-user session
+        opened with other headers is replaced.
+        """
+        if self.config.transport != TransportType.MCP:
+            return await self.call_with_retry(tool_name, args, raw_mcp=raw_mcp)
+        async with self._lease(ctx, auth_headers) as session:
+            return await self.call_with_retry(
+                tool_name, args, raw_mcp=raw_mcp, session=session
+            )
+
     async def close(self) -> None:
         """Clean up resources.
 
-        Marks the node disconnected, clears discovered tool state, and best
-        -effort closes the underlying MCP/UTCP client (exceptions during
-        client teardown, e.g. from a stale event loop, are swallowed). Safe
-        to call multiple times.
+        Marks the node disconnected, clears discovered state, and closes
+        every MCP session (each one's cache and subscriptions go with it)
+        and the UTCP client. Exceptions during client teardown, e.g. from a
+        stale event loop, are swallowed. Safe to call multiple times.
         """
         self.connected = False
         self.connected_loop = None
-        self.tools = []
-        self.tool_name_map.clear()
-        self.prompts_stale = False
-        if self.mcp_client:
-            # May fail if wrong event loop
-            with contextlib.suppress(Exception):
-                await self.mcp_client.__aexit__(None, None, None)
-            self.mcp_client = None
+        self._reset_discovery_state()
+        await self._pool.close_all()
         if self.utcp_client:
             # Best effort
             with contextlib.suppress(Exception):
                 await self.utcp_client.aclose()
             self.utcp_client = None
+        if self._background_tasks:
+            await asyncio.gather(
+                *self._background_tasks, return_exceptions=True
+            )
 
-    async def force_reconnect(self) -> None:
-        """Force reconnection when event loop has changed.
+    async def force_reconnect(self, ctx: ToolContext | None = None) -> None:
+        """Close every session and connect again on the running loop.
 
-        This handles the case where the initial connection was made on a
-        different event loop (e.g., during build_planner before uvicorn starts)
-        and we need to reconnect on the current request-handling event loop.
+        Subscriptions do not carry over: subscribe again after this.
+
+        Args:
+            ctx: The caller's context; needed for per-user auth.
         """
-        # Clean up old connection (best effort - may fail on wrong loop)
-        self.connected = False
-        self.connected_loop = None
-        if self.mcp_client:
-            # Don't await __aexit__ as it's bound to old loop
-            self.mcp_client = None
-        if self.utcp_client:
-            self.utcp_client = None
-
-        # Now connect fresh on current loop
-        await self.connect()
+        await self.close()
+        await self.connect(ctx)
 
     # ─── Auth Resolution ─────────────────────────────────────────────────────
 
@@ -1299,19 +1590,34 @@ class ToolNode:
         self,
         tool_name: str,
         args: dict[str, Any],
-        auth_headers: dict[str, str] | None = None,
         *,
         raw_mcp: bool = False,
+        session: McpSession | None = None,
     ) -> object:
-        """Execute tool call with intelligent retry based on error category."""
-        transport = "mcp" if self.mcp_client else "utcp"
+        """Execute tool call with intelligent retry based on error category.
+
+        Auth is not passed here: an MCP session carries the headers it was
+        opened with, and UTCP credentials are client variables.
+
+        Args:
+            tool_name: The tool's name on the server.
+            args: Tool call arguments.
+            raw_mcp: Return the raw MCP result instead of a serialized one.
+            session: The MCP session to call through; defaults to the
+                shared session. With neither, the call goes through UTCP.
+
+        Returns:
+            The tool's result.
+        """
+        session = session or self._pool.get(SHARED_PRINCIPAL)
+        transport = "mcp" if session is not None else "utcp"
 
         @_retrying(self.config.retry_policy)
         async def _execute() -> object:
             try:
                 async with asyncio.timeout(self.config.timeout_s):
                     return await self._call_tool_once(
-                        tool_name, args, auth_headers, raw_mcp=raw_mcp
+                        tool_name, args, session, raw_mcp=raw_mcp
                     )
             except (asyncio.CancelledError, ToolNodeError):
                 raise
@@ -1324,22 +1630,21 @@ class ToolNode:
         self,
         tool_name: str,
         args: dict[str, Any],
-        auth_headers: dict[str, str] | None,
+        session: McpSession | None,
         *,
         raw_mcp: bool,
     ) -> object:
-        """Call the tool once through the MCP or UTCP client."""
-        if self.mcp_client:
+        """Call the tool once through the MCP session or UTCP client."""
+        if session is not None:
+            client = session.client
             if raw_mcp:
-                call_tool_mcp = getattr(self.mcp_client, "call_tool_mcp", None)
+                call_tool_mcp = getattr(client, "call_tool_mcp", None)
                 if callable(call_tool_mcp):
                     return await call_tool_mcp(tool_name, args)
-            result = await self.mcp_client.call_tool(tool_name, args)
+            result = await client.call_tool(tool_name, args)
             return result if raw_mcp else _serialize_mcp_result(result)
         if self.utcp_client:
-            return await self.call_utcp_tool(
-                tool_name, args, auth_headers or {}
-            )
+            return await self.call_utcp_tool(tool_name, args)
         msg = "No client available for tool execution"
         raise ToolNodeError(msg)
 
@@ -1381,25 +1686,17 @@ class ToolNode:
         return _serialize_mcp_result(result)
 
     async def call_utcp_tool(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        auth_headers: dict[str, str],
+        self, tool_name: str, args: dict[str, Any]
     ) -> object:
-        """Invoke UTCP tool, attempting to pass headers when supported."""
+        """Invoke a UTCP tool.
+
+        The UTCP client takes no per-call headers: static credentials reach
+        it as variables (see :meth:`build_utcp_variables`).
+        """
         if not self.utcp_client:
             msg = "UTCP client not initialised"
             raise ToolNodeError(msg)
-        try:
-            if auth_headers:
-                return await self.utcp_client.call_tool(
-                    tool_name, args, headers=auth_headers
-                )
-            return await self.utcp_client.call_tool(tool_name, args)
-        except TypeError:
-            # Older UTCP clients may not accept headers kwarg; fallback to
-            # args-only.
-            return await self.utcp_client.call_tool(tool_name, args)
+        return await self.utcp_client.call_tool(tool_name, args)
 
     # ─── Tool Conversion ─────────────────────────────────────────────────────
 
@@ -1886,8 +2183,8 @@ class ToolNode:
     ) -> object:
         """Handle MCP resource_link content blocks.
 
-        Converts resource_link references to artifact references with optional
-        auto-read for small resources.
+        Replaces each resource_link with a stub naming its URI; the LLM
+        reads the content with the generated resources_read tool.
 
         Args:
             result: Tool result that may contain resource_link content
@@ -2422,10 +2719,10 @@ class ToolNode:
     async def handle_resources_list(
         self,
         _args: object,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> dict[str, Any]:
         """Handler for resources_list tool."""
-        resources = await self.list_resources()
+        resources = await self.list_resources(ctx=ctx)
         return {
             "resources": [r.model_dump() for r in resources],
             "count": len(resources),
@@ -2452,22 +2749,26 @@ class ToolNode:
     async def handle_resources_templates_list(
         self,
         _args: object,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> dict[str, Any]:
         """Handler for resources_templates_list tool."""
-        templates = await self.list_resource_templates()
+        templates = await self.list_resource_templates(ctx=ctx)
         return {
             "templates": [t.model_dump() for t in templates],
             "count": len(templates),
         }
 
     async def list_resources(
-        self, refresh: bool = False
+        self, refresh: bool = False, *, ctx: ToolContext | None = None
     ) -> list[ResourceInfo]:
         """List available MCP resources.
 
+        With per-user sessions the list is the caller's (``ctx``), read
+        from their session the first time.
+
         Args:
             refresh: Force refresh from server
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             List of ResourceInfo objects (empty if not connected or resources
@@ -2476,48 +2777,46 @@ class ToolNode:
         if not self.connected or not self._resources_supported:
             return self._resources  # Return cached resources or empty list
 
-        if refresh and self.mcp_client is not None:
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return self._resources
+            if self.per_user_sessions:
+                return await self._session_resources(session, refresh=refresh)
+            if refresh:
+                await self._refresh_shared_resources(session)
+        return self._resources
+
+    async def _session_resources(
+        self, session: McpSession, *, refresh: bool
+    ) -> list[ResourceInfo]:
+        """Return ``session``'s resource list, reading it when needed."""
+        if refresh or session.resources is None:
             try:
-                resources = await self.mcp_client.list_resources()
-                self._resources = [
-                    ResourceInfo(
-                        uri=str(
-                            getattr(r, "uri", r.get("uri", ""))
-                            if isinstance(r, dict)
-                            else r.uri
-                        ),
-                        name=getattr(
-                            r,
-                            "name",
-                            r.get("name") if isinstance(r, dict) else None,
-                        ),
-                        description=getattr(
-                            r,
-                            "description",
-                            r.get("description")
-                            if isinstance(r, dict)
-                            else None,
-                        ),
-                        mime_type=getattr(
-                            r,
-                            "mimeType",
-                            r.get("mimeType") if isinstance(r, dict) else None,
-                        ),
-                    )
-                    for r in (resources if isinstance(resources, list) else [])
+                session.resources = [
+                    _parse_resource_info(r)
+                    for r in _as_list(await session.client.list_resources())
                 ]
             except Exception as e:
                 logger.warning(f"Failed to refresh resources: {e}")
+        return session.resources or []
 
-        return self._resources
+    async def _refresh_shared_resources(self, session: McpSession) -> None:
+        try:
+            self._resources = [
+                _parse_resource_info(r)
+                for r in _as_list(await session.client.list_resources())
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to refresh resources: {e}")
 
     async def list_resource_templates(
-        self, refresh: bool = False
+        self, refresh: bool = False, *, ctx: ToolContext | None = None
     ) -> list[ResourceTemplateInfo]:
         """List available MCP resource templates.
 
         Args:
             refresh: Force refresh from server
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             List of ResourceTemplateInfo objects (empty if not connected or not
@@ -2528,40 +2827,22 @@ class ToolNode:
                 self._resource_templates
             )  # Return cached templates or empty list
 
-        if refresh and self.mcp_client is not None:
-            try:
-                templates = await self.mcp_client.list_resource_templates()
-                self._resource_templates = [
-                    ResourceTemplateInfo(
-                        uri_template=str(
-                            getattr(t, "uriTemplate", t.get("uriTemplate", ""))
-                            if isinstance(t, dict)
-                            else t.uriTemplate
-                        ),
-                        name=getattr(
-                            t,
-                            "name",
-                            t.get("name") if isinstance(t, dict) else None,
-                        ),
-                        description=getattr(
-                            t,
-                            "description",
-                            t.get("description")
-                            if isinstance(t, dict)
-                            else None,
-                        ),
-                        mime_type=getattr(
-                            t,
-                            "mimeType",
-                            t.get("mimeType") if isinstance(t, dict) else None,
-                        ),
-                    )
-                    for t in (templates if isinstance(templates, list) else [])
-                ]
-            except Exception as e:
-                logger.warning(f"Failed to refresh resource templates: {e}")
-
+        if refresh:
+            async with self._optional_lease(ctx) as session:
+                if session is not None:
+                    await self._refresh_templates(session)
         return self._resource_templates
+
+    async def _refresh_templates(self, session: McpSession) -> None:
+        try:
+            self._resource_templates = [
+                _parse_template_info(t)
+                for t in _as_list(
+                    await session.client.list_resource_templates()
+                )
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to refresh resource templates: {e}")
 
     async def read_resource(
         self,
@@ -2572,7 +2853,8 @@ class ToolNode:
     ) -> dict[str, Any]:
         """Read a resource by URI.
 
-        Uses ResourceCache to avoid repeated fetches. Binary content is
+        Reads through the caller's MCP session and its ResourceCache, so
+        one user's reads are never served to another. Binary content is
         stored in ArtifactStore; small text may be inlined.
 
         Args:
@@ -2592,31 +2874,31 @@ class ToolNode:
                 "error": f"Resources not supported by '{self.config.name}'"
             }
 
-        if self.mcp_client is None:
-            return {"error": "MCP client not available"}
-
-        # Initialize resource cache if needed
-        if self.resource_cache is None:
-            self.resource_cache = ResourceCache(
-                namespace=self.config.name,
-                config=ResourceCacheConfig(
-                    inline_text_if_under_chars=self.config.artifact_extraction.resources.inline_text_if_under_chars,
-                ),
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return {"error": "MCP client not available"}
+            return await self._read_through(
+                session, uri, ctx, use_cache=use_cache
             )
 
-        # Capture client for closure (preserves type narrowing)
-        mcp_client = self.mcp_client
+    async def _read_through(
+        self,
+        session: McpSession,
+        uri: str,
+        ctx: ToolContext,
+        *,
+        use_cache: bool,
+    ) -> dict[str, Any]:
+        client = session.client
 
-        # Read function for cache
         async def read_fn(resource_uri: str) -> object:
-            return await mcp_client.read_resource(resource_uri)
+            return await client.read_resource(resource_uri)
 
         if use_cache:
-            return await self.resource_cache.get_or_fetch(uri, read_fn, ctx)
+            return await session.cache.get_or_fetch(uri, read_fn, ctx)
         # Bypass cache, read directly
         try:
-            contents = await self.mcp_client.read_resource(uri)
-            # Process contents similar to cache
+            contents = await client.read_resource(uri)
             return await self._process_resource_contents(contents, ctx)
         except Exception as e:
             return {"error": str(e)}
@@ -2688,141 +2970,103 @@ class ToolNode:
         self,
         uri: str,
         callback: Callable[[str], object] | None = None,
+        *,
+        ctx: ToolContext | None = None,
     ) -> bool:
         """Subscribe to resource updates.
+
+        The subscription belongs to the caller's MCP session. It ends when
+        that session closes (``close()``, a reconnect, or a per-user session
+        being replaced or evicted); subscribe again after that.
 
         Args:
             uri: Resource URI to subscribe to
             callback: Optional callback for updates
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             True if subscription successful
         """
-        if not self.connected or self.mcp_client is None:
+        if not self.connected or not self._resources_supported:
             return False
 
-        if not self._resources_supported:
-            return False
-
-        if self._subscription_manager is None:
-            return False
-
-        subscribe_method = self._mcp_resource_method(
-            "subscribe_resource", "subscribe"
-        )
-        if subscribe_method is None:
-            logger.debug(
-                "MCP client for '%s' does not support resource subscriptions",
-                self.config.name,
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return False
+            subscribe_method = _mcp_resource_method(
+                session.client, "subscribe_resource", "subscribe"
             )
-            return False
+            if subscribe_method is None:
+                logger.debug(
+                    "MCP client for '%s' does not support resource "
+                    "subscriptions",
+                    self.config.name,
+                )
+                return False
+            return await session.subscriptions.subscribe(
+                uri, subscribe_method, callback
+            )
 
-        async def subscribe_fn(resource_uri: str) -> None:
-            await subscribe_method(resource_uri)
-
-        return await self._subscription_manager.subscribe(
-            uri, subscribe_fn, callback
-        )
-
-    async def unsubscribe_resource(self, uri: str) -> bool:
+    async def unsubscribe_resource(
+        self, uri: str, *, ctx: ToolContext | None = None
+    ) -> bool:
         """Unsubscribe from resource updates.
 
         Args:
             uri: Resource URI to unsubscribe from
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             True if unsubscription successful
         """
-        if not self.connected or self.mcp_client is None:
+        if not self.connected:
             return False
 
-        if self._subscription_manager is None:
-            return False
-
-        unsubscribe_method = self._mcp_resource_method(
-            "unsubscribe_resource", "unsubscribe"
-        )
-        if unsubscribe_method is None:
-            logger.debug(
-                "MCP client for '%s' does not support resource "
-                "unsubscriptions",
-                self.config.name,
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return False
+            unsubscribe_method = _mcp_resource_method(
+                session.client, "unsubscribe_resource", "unsubscribe"
             )
-            return False
-
-        async def unsubscribe_fn(resource_uri: str) -> None:
-            await unsubscribe_method(resource_uri)
-
-        return await self._subscription_manager.unsubscribe(
-            uri, unsubscribe_fn
-        )
-
-    def _mcp_resource_method(
-        self, name: str, alias: str
-    ) -> Callable[[str], Awaitable[object]] | None:
-        """Find the client's resource (un)subscribe method.
-
-        ``fastmcp.Client`` has no subscribe methods, so after any method
-        on the client itself this falls back to the underlying
-        ``mcp.ClientSession``, which takes the URI as an ``AnyUrl``.
-        """
-        client = self.mcp_client
-        for attr in (name, alias):
-            method = getattr(client, attr, None)
-            if callable(method):
-                return _resource_call(method, any_url=False)
-        session_method = getattr(getattr(client, "session", None), name, None)
-        if callable(session_method):
-            return _resource_call(session_method, any_url=True)
-        return None
+            if unsubscribe_method is None:
+                logger.debug(
+                    "MCP client for '%s' does not support resource "
+                    "unsubscriptions",
+                    self.config.name,
+                )
+                return False
+            return await session.subscriptions.unsubscribe(
+                uri, unsubscribe_method
+            )
 
     def handle_mcp_message(self, message: object) -> None:
-        """Handle one message an MCP server sent to this client.
+        """Handle one message an MCP server sent to this node.
 
-        ``ToolNode`` installs itself as the fastmcp client's message
-        handler, so resource update notifications reach
-        ``handle_resource_updated``. Other messages are ignored here.
+        Each session's client routes its own server's messages to that
+        session. This entry point treats a resource update notification as
+        applying to every session (see :meth:`handle_resource_updated`).
+        Other messages are ignored here.
 
         Args:
             message: A message from the MCP session: a server
                 notification, a server request or an exception.
         """
-        import mcp.types as mcp_types
-
-        root = getattr(message, "root", None)
-        if isinstance(root, mcp_types.ResourceUpdatedNotification):
-            self.handle_resource_updated(str(root.params.uri))
+        uri = resource_updated_uri(message)
+        if uri is not None:
+            self.handle_resource_updated(uri)
 
     def handle_resource_updated(self, uri: str) -> None:
         """Handle a resource updated notification from MCP server.
 
-        Invalidates cache and notifies subscribers.
+        Invalidates ``uri`` in every session's cache and notifies every
+        session's subscribers, then the node's update callback once.
 
         Args:
             uri: URI of updated resource
         """
-        # Invalidate cache
-        if self.resource_cache is not None:
-            self.resource_cache.invalidate(uri)
-
-        if self._resource_update_callback is not None:
-            try:
-                self._resource_update_callback(uri)
-            except Exception:
-                logger.debug("resource_update_callback_failed", exc_info=True)
-
-        # Notify subscribers (only if in async context)
-        if self._subscription_manager is not None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # No running loop - skip subscriber notification
-                return
-            task = loop.create_task(
-                self._subscription_manager.handle_update(uri)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+        for session in self._pool.sessions():
+            self._invalidate_session(session, uri)
+        self._fire_resource_callback(uri)
 
     def set_resource_updated_callback(
         self, callback: Callable[[str], None] | None
@@ -2893,7 +3137,7 @@ class ToolNode:
             Enriched result with ``__mcp_app__`` key, or the original result on
             failure
         """
-        html = await self.fetch_app_html(app_meta.resource_uri)
+        html = await self.fetch_app_html(app_meta.resource_uri, ctx=ctx)
         if html is None:
             return tool_result
 
@@ -2947,24 +3191,27 @@ class ToolNode:
 
         return {"value": tool_result, "__mcp_app__": app_payload}
 
-    async def fetch_app_html(self, uri: str) -> str | None:
+    async def fetch_app_html(
+        self, uri: str, *, ctx: ToolContext | None = None
+    ) -> str | None:
         """Fetch ui:// resource HTML for MCP App rendering.
 
         Args:
             uri: Resource URI (typically ui:// scheme)
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             HTML string or None on failure
         """
-        if self.mcp_client is None:
-            return None
-
-        try:
-            contents = await self.mcp_client.read_resource(uri)
-            return _extract_text_from_resource(contents)
-        except Exception as e:
-            logger.warning("Failed to fetch app HTML from %s: %s", uri, e)
-            return None
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return None
+            try:
+                contents = await session.client.read_resource(uri)
+                return _extract_text_from_resource(contents)
+            except Exception as e:
+                logger.warning("Failed to fetch app HTML from %s: %s", uri, e)
+                return None
 
     @staticmethod
     def _serialize_app_tool_result(
@@ -3127,10 +3374,10 @@ class ToolNode:
     async def handle_prompts_list(
         self,
         _args: object,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> dict[str, Any]:
         """Handler for prompts_list tool."""
-        prompts = await self.list_prompts()
+        prompts = await self.list_prompts(ctx=ctx)
         return {
             "prompts": [p.model_dump() for p in prompts],
             "count": len(prompts),
@@ -3139,7 +3386,7 @@ class ToolNode:
     async def handle_prompts_get(
         self,
         args: object,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> dict[str, Any]:
         """Handler for prompts_get tool."""
         name = getattr(
@@ -3160,13 +3407,16 @@ class ToolNode:
             or {}
         )
 
-        return await self.get_prompt(name, arguments)
+        return await self.get_prompt(name, arguments, ctx=ctx)
 
-    async def list_prompts(self, refresh: bool = False) -> list[PromptInfo]:
+    async def list_prompts(
+        self, refresh: bool = False, *, ctx: ToolContext | None = None
+    ) -> list[PromptInfo]:
         """List available MCP prompts.
 
         Args:
             refresh: Force refresh from server
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             List of PromptInfo objects (empty if not connected or prompts not
@@ -3176,33 +3426,38 @@ class ToolNode:
             return self._prompts
 
         needs_refresh = refresh or self.prompts_stale
-        if not self._prompts_supported and not needs_refresh:
+        if not needs_refresh:
             return self._prompts
 
-        if needs_refresh and self.mcp_client is not None:
-            try:
-                prompts = await self.mcp_client.list_prompts()
-                self._prompts = [
-                    self._parse_prompt_info(p)
-                    for p in (prompts if isinstance(prompts, list) else [])
-                ]
-                self._prompts_supported = True
-                self.prompts_stale = False
-            except Exception as e:
-                logger.warning(f"Failed to refresh prompts: {e}")
-
+        async with self._optional_lease(ctx) as session:
+            if session is not None:
+                await self._refresh_prompts(session)
         return self._prompts
+
+    async def _refresh_prompts(self, session: McpSession) -> None:
+        try:
+            self._prompts = [
+                self._parse_prompt_info(p)
+                for p in _as_list(await session.client.list_prompts())
+            ]
+            self._prompts_supported = True
+            self.prompts_stale = False
+        except Exception as e:
+            logger.warning(f"Failed to refresh prompts: {e}")
 
     async def get_prompt(
         self,
         name: str,
         arguments: dict[str, str] | None = None,
+        *,
+        ctx: ToolContext | None = None,
     ) -> dict[str, Any]:
         """Execute a prompt and return rendered messages.
 
         Args:
             name: Prompt name
             arguments: Optional arguments for the prompt
+            ctx: The caller's context; needed for per-user sessions.
 
         Returns:
             Dict with 'messages' (list of serialized messages) and
@@ -3221,11 +3476,20 @@ class ToolNode:
                 f"'{self.config.name}'",
             }
 
-        if self.mcp_client is None:
-            return {"messages": [], "description": "MCP client not available"}
+        async with self._optional_lease(ctx) as session:
+            if session is None:
+                return {
+                    "messages": [],
+                    "description": "MCP client not available",
+                }
+            return await self._render_prompt(session, name, arguments)
 
+    @staticmethod
+    async def _render_prompt(
+        session: McpSession, name: str, arguments: dict[str, str] | None
+    ) -> dict[str, Any]:
         try:
-            result = await self.mcp_client.get_prompt(name, arguments)
+            result = await session.client.get_prompt(name, arguments)
             messages = serialize_prompt_messages(
                 getattr(result, "messages", [])
             )

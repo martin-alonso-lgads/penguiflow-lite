@@ -112,7 +112,7 @@ def _consume_total_budget(
     size_bytes: int,
     max_total_bytes: int,
 ) -> None:
-    if not tool_context or not max_total_bytes:
+    if tool_context is None or not max_total_bytes:
         return
     used = int(tool_context.get("_rich_output_bytes", 0))
     updated = used + size_bytes

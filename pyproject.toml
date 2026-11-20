@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "penguiflow-lite"
-version = "7.0.0"
+version = "8.0.0"
 description = "Async-first orchestration library for multi-agent and data pipelines"
 requires-python = ">=3.11"
 license = "MIT"

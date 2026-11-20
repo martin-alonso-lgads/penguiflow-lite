@@ -28,7 +28,7 @@ Parameters:
 
 In a tool, `await ctx.pause(...)` never returns. If the planner has `pause_enabled=False`, it raises `RuntimeError("Pause/resume is disabled for this planner")`, and the tool call fails with that error.
 
-Guardrail PAUSE decisions also produce `approval_required` pauses, with the decision under `payload["guardrail"]` (see `SKILL.md`). Your tools never call those.
+Guardrail PAUSE decisions also produce `approval_required` pauses, with the decision under `payload["guardrail"]` (see `SKILL.md`). Your tools never call those. With `pause_enabled=False` they don't raise: the run finishes `no_path` instead.
 
 ### Reason taxonomy
 
@@ -149,7 +149,8 @@ Split a destructive tool in two:
 - `plan_write` is pure: it builds the plan and returns a `plan_id`;
 - `commit_write` takes the `plan_id`, pauses for approval, then executes.
 
-State must not be stashed in `ctx.tool_context` between the calls. Each tool call gets a fresh copy of the run's `tool_context`, so a key set in one call is gone by the next. There are three ways to carry it:
+State must not be stashed in `ctx.tool_context` between the calls. Each tool call gets a fresh copy of the run's `tool_context`, so a key set in one call is gone by the next. There are four ways to carry it:
+- in `ctx.run_state`, a mapping that every tool call of the run shares and that survives pause and resume (values must be JSON-serializable; it lives in the trajectory metadata, not across runs);
 - through the tool result, as below: the model passes `plan_id` to the next call;
 - through the pause payload, which the host can pass back in the resume `tool_context`;
 - in a store keyed by session.

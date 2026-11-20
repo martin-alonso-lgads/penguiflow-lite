@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from penguiflow import ModelRegistry, Node, build_catalog, tool
 from penguiflow.planner import PlannerFinish, ReactPlanner
+from penguiflow.planner.memory import ShortTermMemoryConfig
 from penguiflow.planner.models import JSONLLMClient
 from penguiflow_a2a import (
     A2AAgentToolset,
@@ -276,6 +277,7 @@ async def test_real_planner_completes_task_with_answer_and_tool_context() -> (
 
         tool_context = TOOL_CONTEXTS[-1]
         assert tool_context["tenant"] == "acme"
+        assert tool_context["tenant_id"] == "acme"
         assert tool_context["session_id"] == "ctx-1"
         assert tool_context["a2a_context_id"] == "ctx-1"
         assert tool_context["a2a_task_id"] == task.id
@@ -283,6 +285,35 @@ async def test_real_planner_completes_task_with_answer_and_tool_context() -> (
         assert tool_context["api_key_ref"] == "secret-ref"
     finally:
         await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_tenants_on_one_context_get_separate_memory() -> None:
+    """Two tenants on the same contextId never share short-term memory."""
+    finish = {
+        "thought": "done",
+        "next_node": None,
+        "args": {"raw_answer": "ok"},
+    }
+    planner = ReactPlanner(
+        llm_client=StubClient([finish, finish]),
+        catalog=_catalog(record_context),
+        short_term_memory=ShortTermMemoryConfig(strategy="truncation"),
+    )
+    service = A2AService(planner, agent_card=_agent_card())
+    try:
+        for tenant in ("acme", "globex"):
+            await service.send_message(
+                _request(f"hi from {tenant}", context_id="shared-ctx"),
+                tenant=tenant,
+            )
+        keys = sorted(planner.memory_by_key)
+    finally:
+        await service.stop()
+
+    assert len(keys) == 2
+    assert keys[0].startswith("acme:")
+    assert keys[1].startswith("globex:")
 
 
 @pytest.mark.asyncio

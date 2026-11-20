@@ -4,9 +4,9 @@
 
 | Source | How credentials reach it |
 |---|---|
-| MCP over stdio (`connection` is a command) | Only through `env=`. No HTTP headers exist. |
-| MCP over a URL (`http(s)://`, `ws(s)://`) | Auth headers, sent when connecting (not per call). |
-| UTCP / HTTP / CLI | Auth headers on every call (when the utcp client accepts `headers=`), plus `env` and `auth_config` values as utcp variables. |
+| MCP over stdio (`connection` is a command) | Only through `env=`. No HTTP headers exist, so the config accepts only `auth_type=NONE`. |
+| MCP over a URL (`http(s)://`, `ws(s)://`) | Auth headers, sent when the MCP session opens (not per call). With `OAUTH2_USER`, each user gets their own session, opened with their token. |
+| UTCP / HTTP / CLI | No auth headers. `env` and `auth_config` values are passed to the utcp client as variables, named by their keys, for the UTCP manual's call templates to reference (the call template ToolNode builds in `BASE_URL` mode carries no auth). `OAUTH2_USER` is rejected. |
 
 ## Stdio servers: `env=`
 
@@ -21,7 +21,7 @@ ExternalToolConfig(
 )
 ```
 
-The MCP SDK starts the subprocess with a minimal inherited environment (`PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LOGNAME` on POSIX) plus `env`. Variables set in the host process are **not** passed through unless you list them in `env`. An `auth_type` other than `NONE` adds nothing for a stdio server.
+The MCP SDK starts the subprocess with a minimal inherited environment (`PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LOGNAME` on POSIX) plus `env`. Variables set in the host process are **not** passed through unless you list them in `env`. An `auth_type` other than `NONE` on a stdio command fails validation when the config is built.
 
 ## `AuthType` matrix
 
@@ -80,17 +80,17 @@ ExternalToolConfig(
 ```
 
 ### `AuthType.OAUTH2_USER`
-Per-user OAuth through an `OAuthManager` and a planner HITL pause. `auth_config` stays empty; providers are configured on the manager. It needs `tool_context["user_id"]` on every run and `connect(ctx)` instead of `connect()`. See `oauth-and-hitl.md`.
+Per-user OAuth through an `OAuthManager` and a planner HITL pause, for MCP over a URL only. `auth_config` stays empty; providers are configured on the manager. It needs `tool_context["user_id"]` on every run and `connect(ctx)` instead of `connect()`. ToolNode opens one MCP session per user, with that user's token. See `oauth-and-hitl.md`.
 
-The config validator requires `token` for `BEARER`, `api_key` for `API_KEY`, and both cookie keys for `COOKIE`; a missing key fails when the `ExternalToolConfig` is built.
+The config validator requires `token` for `BEARER`, `api_key` for `API_KEY`, and both cookie keys for `COOKIE`. It rejects any `auth_type` but `NONE` on an MCP stdio command, and `OAUTH2_USER` on UTCP/HTTP/CLI. Each of these fails when the `ExternalToolConfig` is built.
 
 ## Auth resolution timing
 
 ToolNode resolves auth at two moments:
-1. **`connect(...)`**: builds the headers and hands them to the transport. For an MCP URL server these are the only headers it will ever send on that connection.
-2. **`ToolNode.call(...)`**: resolves the headers again (substituting `${VAR}` again, or looking up the calling user's OAuth token, pausing if it is missing). UTCP sources send them with the call; MCP calls ignore them.
+1. **`connect(...)`**: builds the headers and opens the MCP session with them (or builds the utcp variables). For an MCP URL server these are the only headers that session will ever send.
+2. **`ToolNode.call(...)`**: resolves the headers again (substituting `${VAR}` again, or looking up the calling user's OAuth token, pausing if it is missing). With `OAUTH2_USER` they pick the caller's MCP session, and a changed token opens a new session. Static headers don't change an open session, and UTCP calls send no headers.
 
-So, for MCP URL sources, a rotated static token takes effect only after a reconnect (`await node.close()` then `await node.connect()`). For UTCP sources it takes effect on the next call.
+So a rotated static token, for MCP URL and UTCP sources alike, takes effect only after a reconnect (`await node.force_reconnect()`, which is `close()` then `connect()`). A user's new OAuth token takes effect on that user's next call.
 
 ## `${VAR}` substitution
 
@@ -125,9 +125,10 @@ For multi-tenant deployments, scope env vars per worker (one worker per tenant),
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ToolAuthError: Missing required environment variable 'X'` | Var set in your shell, not in the worker env | Set it in the process environment that runs the worker |
-| Stdio server can't authenticate | Credentials sent as `auth_type` headers, or expected from the host env | Pass them in `env=` |
+| `ValidationError: auth_type=... needs an MCP URL connection` | Header auth on a stdio command | Pass the credentials in `env=` with `auth_type=NONE`, or connect to the server's URL |
+| Stdio server can't authenticate | Credentials expected from the host env | Pass them in `env=` |
 | API key sent as `X-API-Key` | The custom header name is under another `auth_config` key | Use the `header` key |
 | `${HOST}` left as text in the URL | `connection` is not substituted | Build the URL in Python before creating the config |
-| Rotated token not used by an MCP URL server | Headers are sent only at connect | Reconnect after rotating |
+| Rotated token not used | MCP headers are sent only when a session opens; utcp variables are built at connect | `force_reconnect()` after rotating |
 | Tokens leak into prompts | Token put in `llm_context` | Move it to env / `auth_config` / the token store; redact prompt logs |
 | Cross-tenant token reuse | Token store keyed by `user_id` only | Use a tenant-scoped `user_id` (`tenant:user`) |

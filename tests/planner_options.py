@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
     from penguiflow.planner import PlannerEventCallback
+    from penguiflow.planner.guardrails import GuardrailGateway
     from penguiflow.planner.llm_context_hooks import LLMContextHook
     from penguiflow.planner.memory import (
         ShortTermMemory,
@@ -29,6 +30,7 @@ class PlannerOptions(TypedDict, total=False):
     event_callback: PlannerEventCallback | None
     final_response_model: type[BaseModel] | None
     final_response_retries: int
+    guardrail_gateway: GuardrailGateway | None
     llm_context_hooks: Sequence[LLMContextHook] | None
     max_iters: int
     multi_action_max_tools: int

@@ -5,7 +5,7 @@
 `penguiflow tools` provides lightweight helpers for working with ToolNode presets:
 
 - list built-in MCP presets
-- print the connection/auth details for a preset
+- print the connection/auth details for a preset (`env` values are masked as `***`; `${VAR}` placeholders stay visible)
 - optionally connect and discover the tool names exposed by that server
 
 Use it to validate connectivity and discover tool names before wiring a preset into your agent.
@@ -62,7 +62,7 @@ pip install "penguiflow-lite[planner]"
 
 - **“penguiflow-lite[planner] is required”**: install `penguiflow-lite[planner]`.
 - **Invalid `--env` format**: use `KEY=VALUE` (the CLI rejects missing `=`).
-- **Discovery fails**: verify auth env vars are present and valid for the preset; for OAuth presets you typically need HITL flows to acquire user tokens.
+- **Discovery fails**: the CLI reports the ToolNode error with a hint. Set the variables the preset's `env` needs (for example `GITHUB_PERSONAL_ACCESS_TOKEN` for `github`), or pass them with `--env NAME=value`.
 
 ## Observability
 
@@ -78,5 +78,5 @@ pip install "penguiflow-lite[planner]"
 
 ## Troubleshooting checklist
 
-- If discovery returns 0 tools, confirm the server is reachable and the auth mode matches the preset.
-- If OAuth is involved, confirm you’ve enabled HITL in your agent and have a token persistence strategy.
+- If discovery returns 0 tools, confirm the server is reachable and the preset's `env` credentials are valid.
+- The presets are stdio commands with credentials in `env` (`auth_type=NONE`); per-user OAuth needs an MCP server reached over a URL, configured in code.

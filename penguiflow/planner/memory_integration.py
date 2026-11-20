@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import time
@@ -231,6 +233,10 @@ async def _maybe_memory_hydrate(
     hydrate = getattr(memory, "hydrate", None)
     if hydrate is None:
         return
+    # A summary still being written would be overwritten by the load.
+    pending = planner.memory_persist_tasks.pop(key.composite(), None)
+    if pending is not None:
+        await pending
     try:
         await hydrate(planner.state_store, key.composite())
     except Exception as exc:
@@ -339,3 +345,50 @@ async def _maybe_record_memory_turn(
         )
         return
     await _maybe_memory_persist(planner, memory, key)
+    _schedule_summary_persist(planner, memory, key)
+
+
+def _schedule_summary_persist(
+    planner: ReactPlanner, memory: ShortTermMemory, key: MemoryKey
+) -> None:
+    """Persist again once a rolling summary in progress is done.
+
+    The turn is saved right away; the summary is written in the
+    background, so the next run's hydrate waits for this task first.
+    """
+    if (
+        planner.state_store is None
+        or planner.memory_config.strategy != "rolling_summary"
+    ):
+        return
+    composite = key.composite()
+    previous = planner.memory_persist_tasks.get(composite)
+
+    async def _persist_after_summary() -> None:
+        if previous is not None:
+            await previous
+        try:
+            await memory.flush()
+        except Exception as exc:
+            logger.warning(
+                "memory_flush_failed",
+                extra={
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+            return
+        await _maybe_memory_persist(planner, memory, key)
+
+    task = asyncio.create_task(_persist_after_summary())
+    planner.memory_persist_tasks[composite] = task
+    task.add_done_callback(
+        functools.partial(_forget_persist_task, planner, composite)
+    )
+
+
+def _forget_persist_task(
+    planner: ReactPlanner, composite: str, task: asyncio.Task[None]
+) -> None:
+    if planner.memory_persist_tasks.get(composite) is task:
+        del planner.memory_persist_tasks[composite]

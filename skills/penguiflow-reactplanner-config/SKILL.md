@@ -45,7 +45,7 @@ Always-visible tools (best practice; keep visible and allowed):
 - Background tasks (only if your catalog has them): `tasks.*`
 - Rich output (only if enabled): the `RICH_OUTPUT_TOOLS` set in `references/reactplanner-config-templates.md`; see [[penguiflow-rich-output]] for the tools themselves.
 
-There is no `finish` tool to keep visible: the planner ends a run with the `final_response` opcode (`next_node: "final_response"`), which isn't a catalog tool, so policies and deferred loading can't hide it. (`ToolSearchConfig.always_loaded_patterns` still lists `finish` by default; it matches nothing unless you have a tool with that name.)
+There is no `finish` tool to keep visible: the planner ends a run with the `final_response` opcode (`next_node: "final_response"`), which isn't a catalog tool, so policies and deferred loading can't hide it.
 
 Scoping discovery without rewriting the query (optional):
 - `tool_search(args={"query": "send", "tags": ["mail", "write"]})` — AND match against the
@@ -115,7 +115,7 @@ install_a2a_http(app, service)
 - Use `create_a2a_http_router(service)` when the host app wants explicit `include_router(...)` composition.
 - Keep `create_a2a_http_app(service)` only as the convenience path for standalone agents.
 
-Each A2A task is one `planner.run()`: the A2A `contextId` becomes `tool_context["session_id"]` (per-conversation serialization and memory), a `PlannerPause` becomes `input-required` and the next message to that task resumes it, and a cancel request (`CancelTask`) cancels through steering. The tenant lands in `tool_context["tenant"]`, not `tenant_id`, so short-term memory keys default to tenant `"default"` unless you configure `MemoryIsolation(tenant_key="tenant")` (or, for a single-tenant service, pass a static `tool_context={"tenant_id": ...}` to `A2AService`). Details in [[penguiflow-a2a-integration]].
+Each A2A task is one `planner.run()`: the A2A `contextId` becomes `tool_context["session_id"]` (per-conversation serialization and memory), a `PlannerPause` becomes `input-required` and the next message to that task resumes it, and a cancel request (`CancelTask`) cancels through steering. The tenant (or `A2AConfig.default_tenant`) lands in both `tool_context["tenant_id"]` and `tool_context["tenant"]`, so short-term memory, artifacts and session KV are scoped per tenant with the default `MemoryIsolation`. A2A carries no user identity, so the memory user is `"anonymous"` unless you pass a `user_id` in `A2AService(tool_context=...)`. Details in [[penguiflow-a2a-integration]].
 
 Practical rules:
 - Keep `/.well-known/agent-card.json` installed at the app level, not inside a reusable router.

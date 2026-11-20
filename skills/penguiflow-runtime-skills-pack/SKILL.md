@@ -100,7 +100,7 @@ Anything in a skill enters the system prompt. **No secrets, no PII, no tenant-pr
 - **Skill surfaces but mentions a forbidden tool** — applicability misconfigured; add `required_tool_names` or rewrite the skill to use `tool_search`.
 - **Cross-tenant skill leak** — pack skills are global by design. Move tenant-specific skills to a runtime provider that filters on `tool_context["tenant_id"]`.
 - **Top-k retrieval misses obvious skills** — search is SQLite full-text (FTS5) over name, title, trigger, description and tags, with a regex fallback; steps aren't searched. Rewrite `trigger` with the words users say.
-- **Skills bloat prompts** — lower `max_tokens` and `top_k`, or trim skill text. The formatter already drops `preconditions`/`failure_modes`, then cuts to 3 steps, then stops adding skills to fit `max_tokens`. (`SkillsConfig.summarize` is accepted but not used.)
+- **Skills bloat prompts** — lower `max_tokens` and `top_k`, or trim skill text. The formatter already drops `preconditions`/`failure_modes`, then cuts to 3 steps, then stops adding skills to fit `max_tokens`.
 
 ## Worked example
 - No bundled example ships a skill pack; `tests/test_skills_pack_loader.py` and `tests/test_skills_runtime_provider.py` show canonical pack layouts and runtime-provider wiring.

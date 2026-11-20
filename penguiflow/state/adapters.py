@@ -106,7 +106,11 @@ async def list_steering_compat(
 async def save_planner_event_compat(
     store: object, trace_id: str, event: PlannerEvent
 ) -> None:
-    """Save a planner event if ``store`` supports it; otherwise do nothing."""
+    """Save a planner event through ``store.save_planner_event``.
+
+    Raises:
+        TypeError: If ``store`` has no ``save_planner_event`` method.
+    """
     method = getattr(store, "save_planner_event", None)
     if method is not None:
         await method(trace_id, event)

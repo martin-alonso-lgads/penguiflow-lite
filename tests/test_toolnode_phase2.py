@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from typing import TYPE_CHECKING
 
 import mcp.types as mcp_types
 import pytest
@@ -32,6 +33,9 @@ from penguiflow.tools.resources import (
 )
 
 from .tool_context_doubles import FakeToolContext
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 pytest.importorskip("tenacity")
 
@@ -741,10 +745,10 @@ async def test_toolnode_handle_resource_updated(
     registry = ModelRegistry()
     node = ToolNode(config=config, registry=registry)
 
-    # Set up cache with an entry
-    cache_config = ResourceCacheConfig()
-    cache = ResourceCache("test", cache_config)
-    node.resource_cache = cache
+    # The shared session's cache, with an entry
+    node.mcp_client = _SessionOnlyClient()
+    cache = node.resource_cache
+    assert cache is not None
 
     async def read_fn(uri: str) -> dict[str, object]:
         return {"contents": [{"uri": uri, "text": "cached content"}]}
@@ -825,8 +829,8 @@ async def test_handle_mcp_message_routes_resource_updates(
     node.connected = True
     node.resources_supported = True
     node.mcp_client = _SessionOnlyClient()
-    cache = ResourceCache("test", ResourceCacheConfig())
-    node.resource_cache = cache
+    cache = node.resource_cache
+    assert cache is not None
 
     async def read_fn(uri: str) -> dict[str, object]:
         return {"contents": [{"uri": uri, "text": "cached content"}]}
@@ -880,6 +884,156 @@ async def test_subscribe_resource_falls_back_to_session() -> None:
         ("subscribe", AnyUrl("file:///data/a.txt")),
         ("unsubscribe", AnyUrl("file:///data/a.txt")),
     ]
+
+
+class _Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _counting_read_fn(
+    reads: list[str],
+) -> Callable[[str], Awaitable[dict[str, object]]]:
+    async def read_fn(uri: str) -> dict[str, object]:
+        reads.append(uri)
+        return {"contents": [{"uri": uri, "text": f"read {len(reads)}"}]}
+
+    return read_fn
+
+
+@pytest.mark.asyncio
+async def test_resource_cache_entry_expires_after_ttl(
+    artifact_store: InMemoryArtifactStore,
+) -> None:
+    """An entry older than ``ttl_seconds`` is fetched again."""
+    clock = _Clock()
+    cache = ResourceCache(
+        "test", ResourceCacheConfig(ttl_seconds=60), time_source=clock
+    )
+    reads: list[str] = []
+    read_fn = _counting_read_fn(reads)
+    ctx = DummyCtx(artifact_store)
+
+    first = await cache.get_or_fetch("file:///a.txt", read_fn, ctx)
+    clock.now += 59
+    cached = await cache.get_or_fetch("file:///a.txt", read_fn, ctx)
+    clock.now += 1
+    expired = await cache.get_or_fetch("file:///a.txt", read_fn, ctx)
+
+    assert first == cached == {"text": "read 1"}
+    assert expired == {"text": "read 2"}
+    assert len(reads) == 2
+
+
+@pytest.mark.asyncio
+async def test_resource_cache_ttl_zero_never_expires(
+    artifact_store: InMemoryArtifactStore,
+) -> None:
+    """``ttl_seconds=0`` keeps entries until they are invalidated."""
+    clock = _Clock()
+    cache = ResourceCache(
+        "test", ResourceCacheConfig(ttl_seconds=0), time_source=clock
+    )
+    reads: list[str] = []
+    read_fn = _counting_read_fn(reads)
+    ctx = DummyCtx(artifact_store)
+
+    await cache.get_or_fetch("file:///a.txt", read_fn, ctx)
+    clock.now += 10**9
+    await cache.get_or_fetch("file:///a.txt", read_fn, ctx)
+
+    assert len(reads) == 1
+
+
+class _ReadCountingClient:
+    """MCP client double that counts resource reads."""
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+
+    async def read_resource(self, uri: str) -> dict[str, object]:
+        """Return text naming the read count."""
+        self.reads.append(uri)
+        return {"contents": [{"uri": uri, "text": f"read {len(self.reads)}"}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cache_reads", "expected_reads"), [(True, 1), (False, 2)]
+)
+async def test_cache_reads_to_artifacts_controls_node_cache(
+    artifact_store: InMemoryArtifactStore,
+    *,
+    cache_reads: bool,
+    expected_reads: int,
+) -> None:
+    """``cache_reads_to_artifacts=False`` reads from the server each time."""
+    config = build_config(
+        artifact_extraction={
+            "resources": {"cache_reads_to_artifacts": cache_reads}
+        }
+    )
+    node = ToolNode(config=config, registry=ModelRegistry())
+    client = _ReadCountingClient()
+    node.mcp_client = client
+    node.connected = True
+    node.resources_supported = True
+    ctx = DummyCtx(artifact_store)
+
+    await node.read_resource("file:///a.txt", ctx)
+    await node.read_resource("file:///a.txt", ctx)
+
+    assert len(client.reads) == expected_reads
+
+
+@pytest.mark.asyncio
+async def test_node_cache_uses_configured_ttl(
+    artifact_store: InMemoryArtifactStore,
+) -> None:
+    """``cache_ttl_seconds`` sets the node's resource cache TTL."""
+    clock = _Clock()
+    config = build_config(
+        artifact_extraction={"resources": {"cache_ttl_seconds": 30}}
+    )
+    node = ToolNode(config=config, registry=ModelRegistry(), time_source=clock)
+    client = _ReadCountingClient()
+    node.mcp_client = client
+    node.connected = True
+    node.resources_supported = True
+    ctx = DummyCtx(artifact_store)
+
+    await node.read_resource("file:///a.txt", ctx)
+    clock.now += 31
+    await node.read_resource("file:///a.txt", ctx)
+
+    assert len(client.reads) == 2
+
+
+@pytest.mark.asyncio
+async def test_close_drops_subscriptions_so_resubscribe_contacts_server() -> (
+    None
+):
+    """After close() and a new client, subscribing reaches the server."""
+    node = ToolNode(config=build_config(), registry=ModelRegistry())
+    first = _SessionOnlyClient()
+    node.connected = True
+    node.resources_supported = True
+    node.mcp_client = first
+    assert await node.subscribe_resource("file:///a.txt") is True
+
+    await node.close()
+    second = _SessionOnlyClient()
+    node.connected = True
+    node.resources_supported = True
+    node.mcp_client = second
+
+    assert await node.subscribe_resource("file:///a.txt") is True
+    assert second.session.calls == [("subscribe", AnyUrl("file:///a.txt"))]
 
 
 # ─── Handler Tests ───────────────────────────────────────────────────────────

@@ -65,7 +65,7 @@ setup_proactive_reporting(
     session,
     make_foreground,                 # builds the planner that writes the report
     enabled=True,                    # False makes the call a no-op
-    strategies=["APPEND", "REPLACE"],  # default; uppercase names
+    strategies=["APPEND", "REPLACE"],  # default; names in any case
     max_queued=5,
     timeout_s=60.0,
     max_hops=2,
@@ -141,7 +141,5 @@ Use `LoggingTaskTelemetrySink()` or implement `async def emit(self, event)`. Tra
 |---|---|---|
 | Limits set on `BackgroundTasksConfig` | `ValidationError` | Use `SessionLimits` |
 | `enabled=False` taken as "off" | Tools still spawn if they're in the catalog | Remove `tasks.*` from the catalog |
-| Uppercase `merge_strategy` in `tasks.spawn` args | Args fail validation | Use `human_gated` / `append` / `replace` |
-| Lowercase `strategies` for proactive reports | Reports never fire | Use `"APPEND"`, `"REPLACE"` |
 | `append` from day one | Unreviewed results reach the user | Start `human_gated`; promote trusted tasks |
 | No `tool_job_factory` | Job spawns raise `tool_background_unavailable` | Pass one (see `task-service-protocol.md`) |

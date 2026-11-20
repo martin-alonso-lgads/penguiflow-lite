@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from penguiflow.tools.errors import (
     ErrorCategory,
     ToolAuthError,
@@ -187,9 +189,38 @@ def test_tool_auth_error_with_status() -> None:
 
 
 def test_tool_auth_error_without_status() -> None:
-    """ToolAuthError without status uses inferred category."""
+    """ToolAuthError without status keeps its class category."""
     exc = ToolAuthError("auth failed")
-    # Without status_code, _infer_category returns UNKNOWN
+    assert exc.category == ErrorCategory.AUTH_REQUIRED
+
+
+@pytest.mark.parametrize(
+    ("error_type", "category", "retryable"),
+    [
+        (ToolAuthError, ErrorCategory.AUTH_REQUIRED, False),
+        (ToolTimeoutError, ErrorCategory.RETRYABLE_SERVER, True),
+        (ToolConnectionError, ErrorCategory.NETWORK, True),
+        (ToolRateLimitError, ErrorCategory.RETRYABLE_RATE_LIMIT, True),
+        (ToolClientError, ErrorCategory.NON_RETRYABLE_CLIENT, False),
+        (ToolServerError, ErrorCategory.RETRYABLE_SERVER, True),
+        (ToolNodeError, ErrorCategory.UNKNOWN, False),
+    ],
+)
+def test_subclass_without_status_keeps_class_category(
+    error_type: type[ToolNodeError],
+    category: ErrorCategory,
+    *,
+    retryable: bool,
+) -> None:
+    """A subclass built without a status keeps its class-level category."""
+    exc = error_type("failed")
+    assert exc.category == category
+    assert exc.is_retryable is retryable
+
+
+def test_explicit_category_wins_over_class_category() -> None:
+    """An explicit category overrides the class-level one."""
+    exc = ToolTimeoutError("failed", category=ErrorCategory.UNKNOWN)
     assert exc.category == ErrorCategory.UNKNOWN
 
 

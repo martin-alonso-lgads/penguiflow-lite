@@ -14,7 +14,13 @@ from penguiflow.catalog import NodeSpec, build_catalog, tool
 from penguiflow.node import Node
 from penguiflow.registry import ModelRegistry
 
-from .models import GroupReportStrategy, MergeStrategy, TaskGroup, TaskStatus
+from .models import (
+    GroupReportStrategy,
+    MergeStrategy,
+    MergeStrategyName,
+    TaskGroup,
+    TaskStatus,
+)
 from .task_service import (
     ContextDepth,
     TaskDetails,
@@ -78,7 +84,7 @@ class TasksSpawnArgs(BaseModel):
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     priority: int = 0
-    merge_strategy: MergeStrategy = MergeStrategy.HUMAN_GATED
+    merge_strategy: MergeStrategyName = MergeStrategy.HUMAN_GATED
     propagate_on_cancel: Literal["cascade", "isolate"] = "cascade"
     notify_on_complete: bool = True
     context_depth: ContextDepth = "full"
@@ -112,7 +118,7 @@ class TasksSpawnArgs(BaseModel):
         "yielding. "
         "Requires group_merge_strategy in {APPEND, REPLACE}, not HUMAN_GATED.",
     )
-    group_merge_strategy: MergeStrategy | None = Field(
+    group_merge_strategy: MergeStrategyName | None = Field(
         default=None,
         description="Merge strategy for the group. Uses config default if not "
         "specified. "
@@ -189,7 +195,7 @@ class TasksPrioritizeResult(BaseModel):
 class TasksApplyPatchArgs(BaseModel):
     patch_id: str
     action: Literal["apply", "reject"] = "apply"
-    strategy: MergeStrategy | None = None
+    strategy: MergeStrategyName | None = None
 
 
 class TasksApplyPatchResult(BaseModel):
@@ -257,7 +263,7 @@ class TasksApplyGroupArgs(BaseModel):
 
     group_id: str
     action: Literal["apply", "reject"] = "apply"
-    strategy: MergeStrategy | None = None
+    strategy: MergeStrategyName | None = None
 
 
 class TasksApplyGroupResult(BaseModel):

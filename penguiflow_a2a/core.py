@@ -198,7 +198,10 @@ class A2AService:
 
     The A2A ``contextId`` is passed as ``tool_context["session_id"]``, so the
     planner serializes runs within one conversation and runs different
-    conversations in parallel.
+    conversations in parallel. The request's tenant (or
+    ``A2AConfig.default_tenant``) is passed as both
+    ``tool_context["tenant_id"]``, which short-term memory, artifacts and
+    session KV scope by, and ``tool_context["tenant"]``.
     """
 
     def __init__(
@@ -725,9 +728,11 @@ class A2AService:
             "delivery_channel": "a2a",
             **self._tool_context,
         }
+        resolved_tenant = tenant or self._config.default_tenant
         tool_context.update(
             {
-                "tenant": tenant or self._config.default_tenant,
+                "tenant": resolved_tenant,
+                "tenant_id": resolved_tenant,
                 "session_id": context_id,
                 "a2a_task_id": task_id,
                 "a2a_context_id": context_id,

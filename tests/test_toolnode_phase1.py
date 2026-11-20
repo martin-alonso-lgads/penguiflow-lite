@@ -183,7 +183,9 @@ def test_substitute_env_missing_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MISSING_ENV", raising=False)
     registry = ModelRegistry()
     config = build_config(
-        auth_type=AuthType.API_KEY, auth_config={"api_key": "${MISSING_ENV}"}
+        connection="https://mcp.example.com/mcp",
+        auth_type=AuthType.API_KEY,
+        auth_config={"api_key": "${MISSING_ENV}"},
     )
     node = ToolNode(config=config, registry=registry)
 
@@ -260,6 +262,92 @@ def _raise_status_exc() -> Never:
     raise _ServerError(msg)
 
 
+class _StatusError(Exception):
+    """An MCP error carrying a given HTTP status."""
+
+    def __init__(self, status_code: int) -> None:
+        """Store ``status_code``."""
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+class FailOnceMcpClient:
+    """MCP client whose first tool call raises a given exception."""
+
+    def __init__(self, first_error: Exception) -> None:
+        """Raise ``first_error`` on the first call."""
+        self.first_error = first_error
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(
+        self, name: str, args: dict[str, Any]
+    ) -> dict[str, object]:
+        """Raise on the first call; echo the tool name afterwards."""
+        self.calls.append((name, args))
+        if len(self.calls) == 1:
+            raise self.first_error
+        return {"ok": True, "name": name}
+
+
+def _retry_node(
+    client: FailOnceMcpClient, retry_on_status: list[int] | None = None
+) -> ToolNode:
+    policy: dict[str, object] = {
+        "wait_exponential_min_s": 0.01,
+        "wait_exponential_max_s": 0.1,
+    }
+    if retry_on_status is not None:
+        policy["retry_on_status"] = retry_on_status
+    node = ToolNode(
+        config=build_config(retry_policy=policy), registry=ModelRegistry()
+    )
+    node.mcp_client = client
+    node.connected = True
+    return node
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError("slow"), ConnectionResetError("reset")],
+    ids=["timeout", "connection"],
+)
+async def test_call_with_retry_retries_timeouts_and_connection_errors(
+    error: Exception,
+) -> None:
+    """Timeouts and connection errors are retried."""
+    client = FailOnceMcpClient(error)
+    node = _retry_node(client)
+
+    result = await node.call_with_retry("ping", {})
+
+    assert result == {"ok": True, "name": "ping"}
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_call_with_retry_honours_retry_on_status() -> None:
+    """A status listed in ``retry_on_status`` is retried."""
+    client = FailOnceMcpClient(_StatusError(408))
+    node = _retry_node(client, retry_on_status=[408])
+
+    result = await node.call_with_retry("ping", {})
+
+    assert result == {"ok": True, "name": "ping"}
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_call_with_retry_skips_status_missing_from_list() -> None:
+    """A status left out of ``retry_on_status`` is not retried."""
+    client = FailOnceMcpClient(_StatusError(503))
+    node = _retry_node(client, retry_on_status=[])
+
+    with pytest.raises(ToolServerError):
+        await node.call_with_retry("ping", {})
+    assert len(client.calls) == 1
+
+
 def test_build_utcp_config_auto_manual() -> None:
     """Build UTCP config auto manual."""
     registry = ModelRegistry()
@@ -296,7 +384,10 @@ async def test_oauth_flow_pause_and_resume() -> None:
         token_store=store,
     )
 
-    config = build_config(auth_type=AuthType.OAUTH2_USER)
+    config = build_config(
+        connection="https://mcp.example.com/mcp",
+        auth_type=AuthType.OAUTH2_USER,
+    )
     node = ToolNode(config=config, registry=registry, auth_manager=manager)
 
     class _ConsentingCtx(DummyCtx):

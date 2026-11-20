@@ -737,7 +737,8 @@ async def test_call_preserves_structured_mcp_result_for_app_payload(
     node = ToolNode(config=config, registry=registry)
     node.connected = True
     node.connected_loop = asyncio.get_running_loop()
-    node.mcp_client = object()
+    client = object()
+    node.mcp_client = client
     node.app_metadata["test_server.open_deck_editor"] = AppMetadata(
         resource_uri="ui://deck-editor/index.html"
     )
@@ -816,12 +817,12 @@ async def test_call_preserves_structured_mcp_result_for_app_payload(
         'Agent Deployment"',
         ctx,
     )
-    call_with_retry.assert_awaited_once_with(
-        "open_deck_editor",
-        {"deck_id": "deck-123"},
-        {},
-        raw_mcp=True,
-    )
+    call_with_retry.assert_awaited_once()
+    call_args = call_with_retry.await_args
+    assert call_args is not None
+    assert call_args.args == ("open_deck_editor", {"deck_id": "deck-123"})
+    assert call_args.kwargs["raw_mcp"] is True
+    assert call_args.kwargs["session"].client is client
 
     ref = await artifact_store.get_ref(app_payload["artifact_id"])
     assert ref is not None

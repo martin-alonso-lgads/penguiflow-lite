@@ -53,7 +53,7 @@ Summarizer retry and recovery knobs (defaults 20, 3, 2.0, 30.0); see `strategies
 Function `(str) -> int` used to estimate token counts for budget enforcement. The default is `len(text) // 4 + 1`. Provide a real tokenizer for accurate budgets.
 
 ### Hooks
-- `on_turn_added(turn)` — called after a turn is appended.
+- `on_turn_added(turn)` — called after a turn is appended (not for a turn the `error` policy rejects).
 - `on_summary_updated(old, new)` — called when a new rolling summary is stored.
 - `on_health_changed(old, new)` — called when `MemoryHealth` changes.
 
@@ -82,8 +82,8 @@ MemoryBudget(
 ### Overflow policies
 
 - `truncate_oldest` (default) — Drop pending turns first, then the oldest recent turns, and clear the summary as a last resort.
-- `truncate_summary` — Clip the rolling summary to `summary_max_tokens` first. Caution: in the current code, if the summary already fits `summary_max_tokens` and the payload is still over `total_max_tokens`, `add_turn` loops forever and blocks the event loop. Prefer `truncate_oldest`.
-- `error` — `add_turn` raises `MemoryBudgetExceeded`. Under `ReactPlanner` that exception is caught and logged as a `memory_add_turn_failed` warning: the run still returns, and that turn is not persisted. Use it only when you drive `DefaultShortTermMemory` yourself (tests, hard-bound tooling).
+- `truncate_summary` — Clip the rolling summary to `summary_max_tokens` first. When the summary already fits (or is left out while degraded) and the payload is still over `total_max_tokens`, it continues like `truncate_oldest`.
+- `error` — `add_turn` raises `MemoryBudgetExceeded` and leaves memory as it was (the turn is not kept). With `rolling_summary`, `pending_turns` don't count toward this check, since they are being summarized, so the prompt can briefly exceed `total_max_tokens` until the summary lands. Under `ReactPlanner` the exception is caught and logged as a `memory_add_turn_failed` warning: the run still returns, and that turn is not persisted. Use it only when you drive `DefaultShortTermMemory` yourself (tests, hard-bound tooling).
 
 Production recommendation: `truncate_oldest`.
 

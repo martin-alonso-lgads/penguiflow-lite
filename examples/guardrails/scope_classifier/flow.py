@@ -16,6 +16,7 @@ from penguiflow.node import Node
 from penguiflow.planner import ReactPlanner
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
+    DefaultRiskRouter,
     GuardrailGateway,
     RuleRegistry,
 )
@@ -71,6 +72,9 @@ async def main() -> None:
     gateway = GuardrailGateway(
         registry=rule_registry,
         guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(rule_registry)),
+        # Wait for the classifier on the user input, so its RETRY applies
+        # to this LLM call. Without a wait only a STOP could apply, late.
+        risk_router=DefaultRiskRouter(llm_before_wait_ms=500.0),
     )
 
     planner = ReactPlanner(

@@ -232,22 +232,23 @@ def _apply_rule_config(rule: object, config: Mapping[str, Any]) -> None:
                 setattr(rule, key, value)
 
 
+def _optional_ms(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _apply_risk_router(
     router: DefaultRiskRouter, payload: Mapping[str, Any]
 ) -> None:
-    high_wait = payload.get("high_risk_wait_ms")
-    medium_wait = payload.get("medium_risk_wait_ms")
     critical_closed = payload.get("critical_fail_closed")
     router.configure(
-        high_risk_wait_ms=float(high_wait)
-        if isinstance(high_wait, (int, float))
-        else None,
-        medium_risk_wait_ms=float(medium_wait)
-        if isinstance(medium_wait, (int, float))
-        else None,
+        high_risk_wait_ms=_optional_ms(payload.get("high_risk_wait_ms")),
+        medium_risk_wait_ms=_optional_ms(payload.get("medium_risk_wait_ms")),
         critical_fail_closed=critical_closed
         if isinstance(critical_closed, bool)
         else None,
+        llm_before_wait_ms=_optional_ms(payload.get("llm_before_wait_ms")),
     )
 
 

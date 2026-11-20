@@ -41,7 +41,7 @@ Cons:
 Tune:
 - `top_k=6` — typical.
 - `max_tokens=2000` — keeps the injection bounded.
-- `summarize` exists on `SkillsConfig` but isn't used; trimming is automatic.
+- Trimming to `max_tokens` is automatic; there is no summarization step.
 
 ## Directory rendering
 

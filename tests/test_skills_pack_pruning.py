@@ -16,6 +16,8 @@ from penguiflow.skills.provider import LocalSkillProvider
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_prune_pack_skills_removes_missing_entries(tmp_path: Path) -> None:
     """Prune pack skills removes missing entries."""
@@ -105,3 +107,25 @@ def test_prune_does_not_delete_learned_skills(tmp_path: Path) -> None:
         ["pack.core.keep"], scope_clause="", scope_params=()
     )
     assert [r.origin for r in remaining] == ["learned"]
+
+
+def test_pack_reusing_another_packs_skill_name_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second pack taking over a skill name leaves a warning."""
+    store = LocalSkillStore(db_path=tmp_path / "skills.db")
+    for pack_name, trigger in [("core", "One"), ("extra", "Other")]:
+        with caplog.at_level("WARNING", logger="penguiflow.skills"):
+            store.upsert_pack_skill(
+                SkillDefinition(name="shared", trigger=trigger, steps=["s"]),
+                pack_name=pack_name,
+                scope_mode="project",
+                update_existing=True,
+            )
+
+    conflicts = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "skill_pack_name_conflict"
+    ]
+    assert len(conflicts) == 1

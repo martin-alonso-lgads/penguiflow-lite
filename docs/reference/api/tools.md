@@ -14,6 +14,7 @@ error hierarchy.
 - `BinaryDetectionConfig`
 - `ResourceHandlingConfig`
 - `RetryPolicy`
+- `SessionPoolConfig`
 - `TransportType`
 - `UtcpMode`
 - `OAuthManager`

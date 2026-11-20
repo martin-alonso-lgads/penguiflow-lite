@@ -24,6 +24,7 @@ from .native_policy import StructuredMode, next_mode, resolve_policy
 from .pricing import calculate_cost, get_pricing
 from .profiles import get_profile
 from .providers import create_provider
+from .telemetry import LLMCallTelemetry
 from .tracing import LLMCallSpan, LLMTraceSink, resolve_trace_sink_from_env
 from .types import (
     AudioPart,
@@ -578,6 +579,41 @@ class NativeLLMAdapter:
         Returns:
             Tuple of (content, cost) matching JSONLLMClient protocol.
         """
+        telemetry = self._call_telemetry(_requested_mode(response_format))
+        telemetry.start()
+        try:
+            content, cost = await self._complete_spanned(
+                messages=messages,
+                response_format=response_format,
+                stream=stream,
+                on_stream_chunk=on_stream_chunk,
+                on_reasoning_chunk=on_reasoning_chunk,
+                telemetry=telemetry,
+            )
+        except Exception as exc:
+            telemetry.error(exc)
+            raise
+        telemetry.end(cost)
+        return content, cost
+
+    def _call_telemetry(self, mode: str) -> LLMCallTelemetry:
+        return LLMCallTelemetry(
+            provider=self._provider.provider_name,
+            model=self._provider.model,
+            mode=mode,
+        )
+
+    async def _complete_spanned(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: Mapping[str, Any] | None,
+        stream: bool,
+        on_stream_chunk: Callable[[str, bool], None] | None,
+        on_reasoning_chunk: Callable[[str, bool], None] | None,
+        telemetry: LLMCallTelemetry,
+    ) -> tuple[str, float]:
+        """Run the completion inside a trace span, when tracing is on."""
         if self._trace_sink is None:
             return await self._complete_inner(
                 messages=messages,
@@ -585,6 +621,7 @@ class NativeLLMAdapter:
                 stream=stream,
                 on_stream_chunk=on_stream_chunk,
                 on_reasoning_chunk=on_reasoning_chunk,
+                _telemetry=telemetry,
             )
 
         call = LLMCallSpan(
@@ -601,6 +638,7 @@ class NativeLLMAdapter:
                 on_stream_chunk=on_stream_chunk,
                 on_reasoning_chunk=on_reasoning_chunk,
                 _trace_call=call,
+                _telemetry=telemetry,
             )
             call.content_chars = len(content)
             call.cost_usd = cost
@@ -615,6 +653,7 @@ class NativeLLMAdapter:
         on_stream_chunk: Callable[[str, bool], None] | None = None,
         on_reasoning_chunk: Callable[[str, bool], None] | None = None,
         _trace_call: LLMCallSpan | None = None,
+        _telemetry: LLMCallTelemetry,
     ) -> tuple[str, float]:
         # Convert dict messages to LLMMessage format
         llm_messages = _prepare_messages_for_provider(
@@ -705,6 +744,7 @@ class NativeLLMAdapter:
                         "error_type": e.__class__.__name__,
                     },
                 )
+                _telemetry.retry(attempt + 1, e)
                 await asyncio.sleep(backoff_s)
             else:
                 return content, cost
@@ -924,6 +964,34 @@ class NativeLLMAdapter:
         to); tool-call fragment assembly is the provider's job and the
         assembled calls are returned, never streamed.
         """
+        telemetry = self._call_telemetry("native_tools")
+        telemetry.start()
+        try:
+            result = await self._complete_with_tools_spanned(
+                messages=messages,
+                tools=tools,
+                stream=stream,
+                on_stream_chunk=on_stream_chunk,
+                on_reasoning_chunk=on_reasoning_chunk,
+                telemetry=telemetry,
+            )
+        except Exception as exc:
+            telemetry.error(exc)
+            raise
+        telemetry.end(result.cost)
+        return result
+
+    async def _complete_with_tools_spanned(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[ToolSpec],
+        stream: bool,
+        on_stream_chunk: Callable[[str, bool], None] | None,
+        on_reasoning_chunk: Callable[[str, bool], None] | None,
+        telemetry: LLMCallTelemetry,
+    ) -> NativeToolCallResult:
+        """Run the tool completion inside a trace span, when tracing is on."""
         if self._trace_sink is None:
             return await self._complete_with_tools_inner(
                 messages=messages,
@@ -931,6 +999,7 @@ class NativeLLMAdapter:
                 stream=stream,
                 on_stream_chunk=on_stream_chunk,
                 on_reasoning_chunk=on_reasoning_chunk,
+                _telemetry=telemetry,
             )
         call = LLMCallSpan(
             provider=self._provider.provider_name,
@@ -946,6 +1015,7 @@ class NativeLLMAdapter:
                 on_stream_chunk=on_stream_chunk,
                 on_reasoning_chunk=on_reasoning_chunk,
                 _trace_call=call,
+                _telemetry=telemetry,
             )
             call.content_chars = len(result.content)
             call.cost_usd = result.cost
@@ -960,6 +1030,7 @@ class NativeLLMAdapter:
         on_stream_chunk: Callable[[str, bool], None] | None = None,
         on_reasoning_chunk: Callable[[str, bool], None] | None = None,
         _trace_call: LLMCallSpan | None = None,
+        _telemetry: LLMCallTelemetry,
     ) -> NativeToolCallResult:
         llm_messages = _prepare_messages_for_provider(
             provider_name=self._provider.provider_name,
@@ -1028,6 +1099,7 @@ class NativeLLMAdapter:
                         "backoff_s": backoff_s,
                     },
                 )
+                _telemetry.retry(attempt + 1, e)
                 await asyncio.sleep(backoff_s)
             else:
                 return NativeToolCallResult(

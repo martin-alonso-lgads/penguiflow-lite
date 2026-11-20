@@ -9,9 +9,9 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 from penguiflow.state.models import (
     StateUpdate,
@@ -104,9 +104,15 @@ class ContextPatch(BaseModel):
 class MergeStrategy(str, Enum):
     """How a completed task's `ContextPatch` merges into foreground context.
 
+    Merged results are kept per task in
+    ``SessionContext.background_results`` and shown to the foreground LLM
+    as read-only background results until acknowledged.
+
     Attributes:
-        APPEND: Add the patch to context alongside existing content.
-        REPLACE: Replace the relevant portion of context with the patch.
+        APPEND: Merge the result right away. A task's later result replaces
+            its earlier one.
+        REPLACE: Currently the same as ``APPEND``: the result is merged
+            right away, the latest result per task wins.
         HUMAN_GATED: Hold the patch for human approval before merging.
     """
 
@@ -124,6 +130,29 @@ _MERGE_STRATEGY_NAMES: dict[str, MergeStrategy] = {
 }
 
 
+def parse_merge_strategy(value: object) -> MergeStrategy:
+    """Parse a merge strategy name in any case.
+
+    Args:
+        value: A :class:`MergeStrategy`, or a name such as ``"APPEND"``,
+            ``"append"`` or ``"human-gated"``.
+
+    Returns:
+        The matching strategy.
+
+    Raises:
+        ValueError: If ``value`` names no strategy.
+    """
+    if isinstance(value, MergeStrategy):
+        return value
+    strategy = _MERGE_STRATEGY_NAMES.get(str(value).lower().strip())
+    if strategy is None:
+        names = ", ".join(s.value for s in MergeStrategy)
+        msg = f"Unknown merge strategy {value!r}; expected one of {names}"
+        raise ValueError(msg)
+    return strategy
+
+
 def merge_strategy_from_name(
     value: object, default: MergeStrategy
 ) -> MergeStrategy:
@@ -137,11 +166,28 @@ def merge_strategy_from_name(
     Returns:
         The matching strategy, or ``default``.
     """
-    if isinstance(value, MergeStrategy):
-        return value
     if value is None:
         return default
-    return _MERGE_STRATEGY_NAMES.get(str(value).lower().strip(), default)
+    try:
+        return parse_merge_strategy(value)
+    except ValueError:
+        return default
+
+
+def _coerce_merge_strategy(value: object) -> object:
+    """Pydantic before-validator: accept strategy names in any case."""
+    if value is None or isinstance(value, MergeStrategy):
+        return value
+    try:
+        return parse_merge_strategy(value)
+    except ValueError:
+        return value  # Let the enum validation report it.
+
+
+MergeStrategyName = Annotated[
+    MergeStrategy, BeforeValidator(_coerce_merge_strategy)
+]
+"""A :class:`MergeStrategy` field that accepts names in any case."""
 
 
 class NotificationAction(BaseModel):
@@ -496,6 +542,7 @@ __all__ = [
     "GroupReportStrategy",
     "GroupStatus",
     "MergeStrategy",
+    "MergeStrategyName",
     "NotificationAction",
     "NotificationPayload",
     "ProactiveReportContext",
@@ -509,4 +556,5 @@ __all__ = [
     "TaskType",
     "UpdateType",
     "merge_strategy_from_name",
+    "parse_merge_strategy",
 ]

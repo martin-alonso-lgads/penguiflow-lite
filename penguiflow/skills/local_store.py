@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -23,6 +24,24 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 _SCHEMA_VERSION = 1
+
+
+logger = logging.getLogger("penguiflow.skills")
+
+
+def _warn_if_other_pack(
+    name: str, existing_pack: object, pack_name: str
+) -> None:
+    """Log when a pack reuses a skill name another pack loaded."""
+    if existing_pack is not None and str(existing_pack) != pack_name:
+        logger.warning(
+            "skill_pack_name_conflict",
+            extra={
+                "skill_name": name,
+                "existing_pack": str(existing_pack),
+                "pack": pack_name,
+            },
+        )
 
 
 class LocalSkillStore:
@@ -68,7 +87,8 @@ class LocalSkillStore:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             row = conn.execute(
-                "SELECT id, origin, content_hash FROM skills WHERE name = ?",
+                "SELECT id, origin, content_hash, origin_ref FROM skills "
+                "WHERE name = ?",
                 (skill.name,),
             ).fetchone()
             if row is None:
@@ -132,6 +152,7 @@ class LocalSkillStore:
                 existing_hash = str(row[2])
                 if existing_origin != "pack":
                     return False, False
+                _warn_if_other_pack(skill.name, row[3], pack_name)
                 if existing_hash == content_hash or not update_existing:
                     return False, False
                 conn.execute(

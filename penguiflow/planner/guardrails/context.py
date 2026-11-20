@@ -10,14 +10,32 @@ from typing import Any, Literal
 
 @dataclass(slots=True)
 class GuardrailContext:
-    """Context for a guardrail evaluation session."""
+    """Context for a guardrail evaluation session.
+
+    One context serves every run of a planner, so strikes are counted per
+    run (``GuardrailEvent.run_id``): one run's violations never show up in
+    another run's ``previous_violations``.
+    """
 
     run_id: str
     tenant_id: str | None = None
     persona_id: str | None = None
     tool_context: dict[str, Any] = field(default_factory=dict)
-    strike_counts: dict[str, int] = field(default_factory=dict)
+    strikes_by_run: dict[str, dict[str, int]] = field(default_factory=dict)
     policy_config: dict[str, Any] = field(default_factory=dict)
+
+    def add_strike(self, run_id: str, category: str) -> None:
+        """Count one strike of ``category`` for ``run_id``."""
+        counts = self.strikes_by_run.setdefault(run_id, {})
+        counts[category] = counts.get(category, 0) + 1
+
+    def strike_total(self, run_id: str) -> int:
+        """Return how many strikes ``run_id`` has."""
+        return sum(self.strikes_by_run.get(run_id, {}).values())
+
+    def clear_run(self, run_id: str) -> None:
+        """Forget ``run_id``'s strikes once the run is over."""
+        self.strikes_by_run.pop(run_id, None)
 
 
 @dataclass(slots=True)
@@ -131,7 +149,7 @@ class ContextSnapshotBuilder:
             max_tool_risk=max_risk,
             requests_system_info=self._check_system_info_request(text),
             requests_capability_change=self._check_capability_request(text),
-            previous_violations=sum(ctx.strike_counts.values()),
+            previous_violations=ctx.strike_total(event.run_id),
         )
 
     def set_tool_risks(

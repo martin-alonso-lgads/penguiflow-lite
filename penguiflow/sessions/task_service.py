@@ -1157,39 +1157,21 @@ class InProcessTaskService(TaskService):
                 "error": "group_not_complete",
                 "pending_tasks": group.pending_task_ids,
             }
-        applied_count = 0
-        rejected_count = 0
-        for patch_id in group.patches:
-            if action == "apply":
-                if await session.apply_pending_patch(
-                    patch_id=patch_id, strategy=strategy
-                ):
-                    applied_count += 1
-            else:
-                from penguiflow.steering import (
-                    SteeringEvent,
-                    SteeringEventType,
-                )
-
-                await session.steer(
-                    SteeringEvent(
-                        session_id=session_id,
-                        task_id="context_patch",
-                        event_type=SteeringEventType.REJECT,
-                        payload={"patch_id": patch_id},
-                        source="user",
-                    )
-                )
-                rejected_count += 1
+        total_patches = len(group.patches)
+        pending_count = sum(
+            patch_id in session.pending_patches for patch_id in group.patches
+        )
+        # The session method also queues a human-gated group's report.
+        await session.apply_group_patches(
+            group_id, action=action, strategy=strategy
+        )
         return {
             "ok": True,
             "group_id": group_id,
             "action": action,
-            "applied_patch_count": applied_count if action == "apply" else 0,
-            "rejected_patch_count": rejected_count
-            if action == "reject"
-            else 0,
-            "total_patches": len(group.patches),
+            "applied_patch_count": pending_count if action == "apply" else 0,
+            "rejected_patch_count": pending_count if action == "reject" else 0,
+            "total_patches": total_patches,
         }
 
     @override

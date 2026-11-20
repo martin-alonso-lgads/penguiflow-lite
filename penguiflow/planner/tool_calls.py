@@ -103,6 +103,76 @@ class _CheckedResult:
     llm_observation: dict[str, Any]
 
 
+_PAUSE_DISABLED_MESSAGE = (
+    "This request needs approval, and this agent cannot pause for it."
+)
+
+
+def _pause_disabled_payload(
+    planner: ReactPlanner, decision: GuardrailDecision
+) -> dict[str, Any]:
+    """Turn a PAUSE into a STOP payload, for planners that cannot pause."""
+    payload = planner.guardrail_decision_payload(decision)
+    prompt = decision.pause.prompt if decision.pause is not None else ""
+    payload.update(
+        action="STOP",
+        requested_action="PAUSE",
+        pause_disabled=True,
+        stop={
+            "error_code": "GUARDRAIL_PAUSE_DISABLED",
+            "user_message": prompt or _PAUSE_DISABLED_MESSAGE,
+            "internal_reason": decision.reason,
+        },
+    )
+    return payload
+
+
+async def _guardrail_block(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    decision: GuardrailDecision,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    action_seq: int,
+    event_error: str | None,
+    streams: Mapping[str, list[dict[str, Any]]] | None,
+) -> ToolCallOutcome | None:
+    """Return the outcome of a STOP or PAUSE decision, else ``None``.
+
+    A PAUSE on a planner built with ``pause_enabled=False`` becomes a STOP
+    whose payload has ``requested_action="PAUSE"`` and
+    ``pause_disabled=True``.
+    """
+    action = decision.action.value
+    if action == "PAUSE" and planner.pause_enabled:
+        return ToolCallOutcome(
+            pause=await _guardrail_pause(planner, trajectory, decision),
+            streams=streams,
+        )
+    if action == "PAUSE":
+        guardrail = _pause_disabled_payload(planner, decision)
+    elif action == "STOP":
+        guardrail = planner.guardrail_decision_payload(decision)
+    else:
+        return None
+    failure_payload = {"guardrail": guardrail}
+    error = f"guardrail_stop:{decision.rule_id}"
+    _emit_tool_result(
+        planner,
+        trajectory,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        action_seq=action_seq,
+        result_json=_safe_json_dumps(
+            {"error": event_error or error, "failure": failure_payload}
+        ),
+    )
+    return ToolCallOutcome(
+        error=error, failure=failure_payload, streams=streams
+    )
+
+
 async def _guardrail_pause(
     planner: ReactPlanner,
     trajectory: Trajectory,
@@ -152,47 +222,44 @@ async def _guardrail_after_tool(
     )
     if not decision or not planner.guardrails_enforced():
         return checked
-    if decision.action.value == "STOP":
-        failure_payload = {
-            "guardrail": planner.guardrail_decision_payload(decision)
-        }
-        error = f"guardrail_stop:{decision.rule_id}"
-        _emit_tool_result(
+    if decision.action.value in {"STOP", "PAUSE"}:
+        blocked = await _guardrail_block(
             planner,
             trajectory,
-            tool_call_id=tool_call_id,
+            decision,
             tool_name=spec.name,
+            tool_call_id=tool_call_id,
             action_seq=action_seq,
-            result_json=_safe_json_dumps(
-                {"error": error, "failure": failure_payload}
-            ),
-        )
-        return ToolCallOutcome(
-            error=error,
-            failure=failure_payload,
+            event_error=None,
             streams=ctx.collect_chunks() or None,
         )
-    if decision.action.value == "PAUSE":
-        return ToolCallOutcome(
-            pause=await _guardrail_pause(planner, trajectory, decision),
-            streams=ctx.collect_chunks() or None,
-        )
+        if blocked is not None:
+            return blocked
     if decision.action.value == "REDACT" and decision.redactions:
-        from .guardrails.utils import apply_redactions_to_text
-
-        redacted_json = apply_redactions_to_text(
-            checked.result_json, decision.redactions
-        )
-        try:
-            redacted_payload = json.loads(redacted_json)
-        except json.JSONDecodeError:
-            return _CheckedResult(
-                redacted_json, checked.observation, checked.llm_observation
-            )
-        return _CheckedResult(
-            redacted_json, redacted_payload, redacted_payload
-        )
+        return _redacted_result(checked, decision)
     return checked
+
+
+def _redacted_result(
+    checked: _CheckedResult, decision: GuardrailDecision
+) -> _CheckedResult:
+    """Apply a REDACT to the tool result the LLM and events will see.
+
+    When the redacted text is no longer JSON, the observation becomes
+    ``{"result": <redacted text>}``, so the original never reaches the LLM.
+    """
+    from .guardrails.utils import apply_redactions_to_text
+
+    redacted_json = apply_redactions_to_text(
+        checked.result_json, decision.redactions or ()
+    )
+    try:
+        redacted_payload = json.loads(redacted_json)
+    except json.JSONDecodeError:
+        redacted_payload = {"result": redacted_json}
+    if not isinstance(redacted_payload, dict):
+        redacted_payload = {"result": redacted_payload}
+    return _CheckedResult(redacted_json, redacted_payload, redacted_payload)
 
 
 async def execute_tool_call(
@@ -330,11 +397,6 @@ async def execute_tool_call(
         step_index,
     )
 
-    if artifact_collector is not None:
-        artifact_collector.collect(spec.name, spec.out_model, observation_json)
-    if source_collector is not None:
-        source_collector.collect(spec.out_model, observation_json)
-
     llm_obs = (
         observation_json
         if was_clamped
@@ -353,6 +415,13 @@ async def execute_tool_call(
     )
     if isinstance(checked, ToolCallOutcome):
         return checked
+    # Collected after the guardrail, so a REDACT also covers them.
+    if artifact_collector is not None:
+        artifact_collector.collect(
+            spec.name, spec.out_model, checked.observation
+        )
+    if source_collector is not None:
+        source_collector.collect(spec.out_model, checked.observation)
     _emit_tool_result(
         planner,
         trajectory,
@@ -456,33 +525,16 @@ async def _guardrail_before_tool(
             )
         )
         if decision and planner.guardrails_enforced():
-            if decision.action.value == "STOP":
-                failure_payload = {
-                    "guardrail": planner.guardrail_decision_payload(decision)
-                }
-                result_json = _safe_json_dumps(
-                    {"error": decision.reason, "failure": failure_payload}
-                )
-                _emit_tool_result(
-                    planner,
-                    trajectory,
-                    tool_call_id=tool_call_id,
-                    tool_name=spec.name,
-                    action_seq=action_seq,
-                    result_json=result_json,
-                )
-                return ToolCallOutcome(
-                    error=f"guardrail_stop:{decision.rule_id}",
-                    failure=failure_payload,
-                    streams=None,
-                )
-            if decision.action.value == "PAUSE":
-                return ToolCallOutcome(
-                    pause=await _guardrail_pause(
-                        planner, trajectory, decision
-                    ),
-                    streams=None,
-                )
+            return await _guardrail_block(
+                planner,
+                trajectory,
+                decision,
+                tool_name=spec.name,
+                tool_call_id=tool_call_id,
+                action_seq=action_seq,
+                event_error=decision.reason,
+                streams=None,
+            )
     return None
 
 

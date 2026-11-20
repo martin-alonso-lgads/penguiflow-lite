@@ -401,3 +401,10 @@ async def test_provider_list_paginates_after_applicability_filtering(
     ]
     assert page_one.total == 2
     assert [entry.name for entry in page_two.skills] == ["beta.applicable.two"]
+
+
+def test_skills_config_has_no_summarize_field() -> None:
+    """The unused ``summarize`` option is gone; old configs still load."""
+    config = SkillsConfig.model_validate({"enabled": True, "summarize": True})
+    assert "summarize" not in SkillsConfig.model_fields
+    assert config.enabled is True

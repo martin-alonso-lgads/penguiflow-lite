@@ -14,7 +14,7 @@ Use FAST for set lookups, compiled regexes over short text, and deterministic ch
 
 ## DEEP rules
 
-When `async_enabled=True`, every event that gets past the FAST rules is submitted to the inbox, even when no DEEP rule is registered. With `InMemoryGuardInbox(AsyncRuleEvaluator(registry))`, the evaluator runs the DEEP rules for that event type concurrently.
+When `async_enabled=True`, every event that gets past the FAST rules is submitted to the inbox, even when no DEEP rule is registered. With `InMemoryGuardInbox(AsyncRuleEvaluator(registry))`, the evaluator runs every DEEP rule registered for that event type concurrently.
 
 The gateway then waits `async_wait_ms`, as chosen by the risk router:
 - **The response arrives in time:** its decisions join the FAST ones and are resolved together.
@@ -23,11 +23,11 @@ The gateway then waits `async_wait_ms`, as chosen by the risk router:
 
 **Late decisions.** A response that completes after the gateway stopped waiting is only kept if it holds a STOP. That STOP is applied at the **same run's** first guardrail check after it arrives, whatever that event's type, and wins over everything else at that check. Late PAUSE, RETRY and REDACT decisions are dropped, because the step they reviewed has already happened. When the run finishes, `end_run()` discards whatever is still pending, so a late STOP never reaches another run.
 
-So a DEEP rule can only block in time when the router waits for it. The default router gives `llm_before` no wait unless high-risk tools or risky text are involved, so a DEEP rule there has its RETRY dropped and its STOP applied one check later.
+So a DEEP rule can only block in time when the router waits for it. The default router gives `llm_before` no wait (`llm_before_wait_ms=0.0`) unless high-risk tools or risky text are involved, so a DEEP rule there has its RETRY dropped and its STOP applied at the run's next check. Set `llm_before_wait_ms` to wait for it.
 
 ## `DefaultRiskRouter`
 
-`DefaultRiskRouter(high_risk_wait_ms=200.0, medium_risk_wait_ms=100.0, critical_fail_closed=True)` routes by the snapshot:
+`DefaultRiskRouter(high_risk_wait_ms=200.0, medium_risk_wait_ms=100.0, critical_fail_closed=True, llm_before_wait_ms=0.0)` routes by the snapshot:
 
 | Condition | `async_wait_ms` | `on_timeout` |
 |---|---|---|
@@ -35,11 +35,14 @@ So a DEEP rule can only block in time when the router waits for it. The default 
 | Event's tool is `HIGH` | high (200) | `"pause"` |
 | Event's tool is `MEDIUM` (the default tier) | medium (100) | `"allow"` |
 | Event's tool is `LOW`, or no tool (`llm_before`, `llm_stream_chunk`) | 0 | `"allow"` |
+| Every `llm_before` event | at least `llm_before_wait_ms` (0) | unchanged |
 | `llm_before` while any available tool is `HIGH`/`CRITICAL` | at least medium | `"pause"` if it was `"allow"` |
 | Text asks for the system prompt or instructions | at least medium | unchanged |
 | Text asks to bypass restrictions | at least high | `"pause"` if it was `"allow"` |
 
-For the last two rows the router also sets `required_async_rules={"hf-jailbreak"}`, which makes the evaluator run only the DEEP rule with that id. Other DEEP rules are skipped for that event.
+`router.configure(...)` overrides any of the four settings and keeps the others; a policy pack sets them under `risk_router` (`high_risk_wait_ms`, `medium_risk_wait_ms`, `critical_fail_closed`, `llm_before_wait_ms`).
+
+For the last two rows the router also sets `required_async_rules={"hf-jailbreak"}`. Required rules don't narrow evaluation: every DEEP rule registered for the event type still runs. A required rule that isn't registered is logged as `guardrail_required_rule_missing` (WARNING, with `event_type` and `rule_ids`).
 
 Tool tiers come from the context builder; unknown tools are `MEDIUM`:
 
@@ -65,7 +68,9 @@ gateway = GuardrailGateway(
 )
 ```
 
-### Custom router: wait for a DEEP judge on `llm_before`
+### Wait for a DEEP judge on `llm_before`
+
+`DefaultRiskRouter(llm_before_wait_ms=300.0)` waits at least 300 ms on every `llm_before` event and keeps the rest of the default routing. A custom router covers what the default can't, for example a fixed 300 ms wait that keeps `on_timeout="allow"` even when high-risk tools are available:
 
 ```python
 from penguiflow.planner.guardrails import (
@@ -77,7 +82,7 @@ from penguiflow.planner.guardrails import (
 
 
 class WaitBeforeLlm:
-    """Default routing, plus a 300 ms wait before each LLM call."""
+    """Default routing, but a fixed 300 ms wait before each LLM call."""
 
     def __init__(self) -> None:
         self._default = DefaultRiskRouter()
@@ -145,15 +150,15 @@ class LlmJudgeRule:
         )
 ```
 
-`AsyncRuleEvaluator` swallows exceptions raised by a DEEP rule, and the rule then simply returns nothing. `async_fail_open` does not see those errors, so handle them inside the rule if a failure must block.
+If a DEEP rule raises (here, a judge timeout), `AsyncRuleEvaluator` raises `AsyncRuleEvaluationError`, exported from `penguiflow.planner.guardrails`. It carries the decisions of the rules that didn't fail in `.decisions` and the exceptions by rule id in `.errors`. `InMemoryGuardInbox` turns it into a response with those decisions plus an `error`, so `async_fail_open` applies (see below). Catch errors inside the rule if a failure needs its own decision.
 
 There is no two-stage rule type. For "cheap check first, deep check when unsure", register a FAST rule and a DEEP rule. A FAST STOP already prevents the DEEP submission, and the DEEP rule can pre-filter cheaply itself, as above.
 
 ## `async_fail_open`
 
-This setting covers inbox failures only: `submit` or `await_response` raising, or a `SteeringGuardResponse` with `error` set.
-- `True` (the default) logs `guardrail_async_submit_failed` or `guardrail_async_error` and skips the async check.
-- `False` returns STOP with `rule_id="__async_error__"`, `severity=CRITICAL` and `error_code="GUARDRAIL_ASYNC_ERROR"`.
+This setting covers inbox failures: `submit` or `await_response` raising, or a `SteeringGuardResponse` with `error` set (which `InMemoryGuardInbox` sets when a DEEP rule raises).
+- `True` (the default) logs `guardrail_async_submit_failed` or `guardrail_async_error` and keeps the response's other decisions.
+- `False` adds a STOP with `rule_id="__async_error__"`, `severity=CRITICAL` and `error_code="GUARDRAIL_ASYNC_ERROR"`.
 
 Timeouts are decided by the router's `on_timeout`, not by this flag.
 
@@ -167,7 +172,7 @@ Timeouts are decided by the router's `on_timeout`, not by this flag.
 | `async await_response(correlation_id, timeout_s) -> SteeringGuardResponse` | Return the response, or raise `TimeoutError`. A timeout must not cancel or forget the evaluation. |
 | `drain_responses(run_id) -> list[SteeringGuardResponse]` | Sync. Return the completed responses of events submitted with that `run_id`, and forget them. Responses that `await_response` already returned may be included; the gateway ignores them. |
 
-`SteeringGuardEvent` carries `event_type`, `run_id`, `payload` (the event payload plus `text_content`, `tool_name` and `tool_args`), `context_snapshot` (as a dict) and `required_rules`. `SteeringGuardResponse(correlation_id, decisions=[...], error=None)` carries the result.
+`SteeringGuardEvent` carries `event_type`, `run_id`, `payload` (the event payload plus `text_content`, `tool_name` and `tool_args`), `context_snapshot` (as a dict) and `required_rules` (rules the router asks for; not a filter: run every registered DEEP rule for the event type). `SteeringGuardResponse(correlation_id, decisions=[...], error=None)` carries the result; when a rule fails, keep the other decisions and set `error`, so `async_fail_open` applies.
 
 ```python
 from penguiflow.steering.guard_inbox import (
@@ -198,13 +203,13 @@ class RemoteGuardInbox(SteeringGuardInbox):
 ## Operational defaults
 
 - Keep most rules FAST, and keep each one well under `sync_timeout_ms`. Compile regexes at module level.
-- Give a DEEP rule that must block a router wait: set a tool risk tier or use a custom router. Otherwise treat it as a late STOP or as monitoring.
+- Give a DEEP rule that must block a router wait: set `llm_before_wait_ms`, set a tool risk tier, or use a custom router. Otherwise treat it as a late STOP or as monitoring.
 - Raise `sync_timeout_ms` only as far as your latency budget allows; every FAST rule pays it on every event.
 
 | Mistake | Symptom | Fix |
 |---|---|---|
 | Slow FAST rule | Random `GUARDRAIL_SYNC_TIMEOUT` STOPs (fail-closed) | Speed it up or make it DEEP |
-| DEEP rule expected to block `llm_before` | RETRY never applies; STOP arrives one step late | Custom router with `async_wait_ms > 0` for that event |
-| DEEP rule raises | Silently allows | Catch errors in the rule and return a decision |
-| `async_fail_open=False` with a flaky inbox | Runs stop with `GUARDRAIL_ASYNC_ERROR` | Fix the inbox, or fail open and alert on the log events |
-| Custom DEEP rule plus risky user text | Rule skipped for that event | `DefaultRiskRouter` sets `required_async_rules={"hf-jailbreak"}`; use a custom router |
+| DEEP rule expected to block `llm_before` | RETRY never applies; STOP arrives one step late | `DefaultRiskRouter(llm_before_wait_ms=...)`, or a custom router with `async_wait_ms > 0` for that event |
+| DEEP rule raises | `guardrail_async_error` logged (fail-open) or STOP `GUARDRAIL_ASYNC_ERROR` (fail-closed) | Catch errors in the rule and return a decision |
+| `async_fail_open=False` with a flaky inbox or rule | Runs stop with `GUARDRAIL_ASYNC_ERROR` | Fix the inbox or rule, or fail open and alert on the log events |
+| Risky user text with no `hf-jailbreak` rule | `guardrail_required_rule_missing` warnings | Register a DEEP rule with that id, or ignore them: the other DEEP rules still run |

@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from .trajectory import Trajectory
 
 
+_RUN_STATE_KEY = "tool_run_state"
+"""Trajectory metadata key of the tools' shared run state."""
+
+
 class _PlannerContext(ToolContext):
     __slots__ = (
         "_artifact_chunks",
@@ -75,6 +79,15 @@ class _PlannerContext(ToolContext):
         )
         self._meta_warned = False
         self._kv: SessionKVFacade | None = None
+
+    @property
+    @override
+    def run_state(self) -> MutableMapping[str, Any]:
+        state = self._trajectory.metadata.get(_RUN_STATE_KEY)
+        if not isinstance(state, dict):
+            state = {}
+            self._trajectory.metadata[_RUN_STATE_KEY] = state
+        return state
 
     @property
     def llm_context(self) -> Mapping[str, Any]:

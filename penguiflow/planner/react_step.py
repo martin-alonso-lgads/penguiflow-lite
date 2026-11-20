@@ -28,10 +28,10 @@ logger = logging.getLogger("penguiflow.planner")
 
 
 def _prepend_system_message(
-    messages: list[dict[str, str]], content: str
-) -> list[dict[str, str]]:
+    messages: list[dict[str, Any]], content: str
+) -> list[dict[str, Any]]:
     """Insert a system message before the first non-system message."""
-    patched: list[dict[str, str]] = []
+    patched: list[dict[str, Any]] = []
     inserted = False
     for msg in messages:
         if not inserted and msg.get("role") != "system":
@@ -44,11 +44,11 @@ def _prepend_system_message(
 
 
 @dataclass(slots=True)
-class _StepState:
+class StepState:
     """Messages and errors carried across a step's repair attempts."""
 
-    base_messages: list[dict[str, str]]
-    messages: list[dict[str, str]]
+    base_messages: list[dict[str, Any]]
+    messages: list[dict[str, Any]]
     had_pending_steering: bool
     last_error: str | None = None
     last_raw: str | None = None
@@ -175,7 +175,7 @@ async def step(planner: ReactPlanner, trajectory: Trajectory) -> PlannerAction:
 
 async def _init_step_state(
     planner: ReactPlanner, trajectory: Trajectory
-) -> _StepState:
+) -> StepState:
     """Build the step's messages, including any arg repair guidance."""
     had_pending_steering = bool(trajectory.steering_inputs)
     base_messages = list(await planner.build_messages(trajectory))
@@ -200,7 +200,7 @@ async def _init_step_state(
             "has_arg_repair": arg_repair_message is not None,
         },
     )
-    return _StepState(
+    return StepState(
         base_messages=base_messages,
         messages=messages,
         had_pending_steering=had_pending_steering,
@@ -237,10 +237,25 @@ def _stream_allowed(
     )
 
 
-def _guardrail_stop_action(
-    decision: GuardrailDecision, thought: str
+GUARDRAIL_STOP_KEY = "guardrail_stop"
+"""Trajectory metadata key of an LLM-side guardrail STOP's decision."""
+
+
+def guardrail_stop_action(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    decision: GuardrailDecision,
+    thought: str,
 ) -> PlannerAction:
-    """Build the final action that ends the run on a guardrail STOP."""
+    """Build the final action that ends the run on a guardrail STOP.
+
+    The decision is kept in ``trajectory.metadata[GUARDRAIL_STOP_KEY]``,
+    so the run loop finishes with ``reason="no_path"`` and
+    ``metadata["guardrail"]``, the same as a tool-side STOP.
+    """
+    trajectory.metadata[GUARDRAIL_STOP_KEY] = (
+        planner.guardrail_decision_payload(decision)
+    )
     stop_message = decision.stop.user_message if decision.stop else None
     return PlannerAction(
         next_node="final_response",
@@ -249,34 +264,22 @@ def _guardrail_stop_action(
     )
 
 
-def _log_guardrail_decision(
-    planner: ReactPlanner, decision: GuardrailDecision
-) -> None:
-    """Log a guardrail decision (and, when not enforced, its shadow)."""
-    logger.info(
-        "guardrail_decision",
-        extra={
-            "action": decision.action.value,
-            "rule_id": decision.rule_id,
-            "reason": decision.reason,
-            "enforced": planner.guardrails_enforced(),
-        },
-    )
-    if not planner.guardrails_enforced():
-        logger.info(
-            "guardrail_decision_shadow",
-            extra={
-                "action": decision.action.value,
-                "rule_id": decision.rule_id,
-                "reason": decision.reason,
-            },
-        )
+def stream_stop_decision(planner: ReactPlanner) -> GuardrailDecision | None:
+    """Return the enforced STOP a streamed chunk triggered, if any."""
+    decision = planner.guardrail_stream_decision
+    if (
+        decision is not None
+        and planner.guardrails_enforced()
+        and decision.action.value == "STOP"
+    ):
+        return decision
+    return None
 
 
 def _apply_guardrail_retry(
     planner: ReactPlanner,
     trajectory: Trajectory,
-    state: _StepState,
+    state: StepState,
     retry: RetrySpec,
     *,
     rule_id: str,
@@ -301,10 +304,13 @@ def _apply_guardrail_retry(
         )
 
 
-async def _guardrail_before_llm(
-    planner: ReactPlanner, trajectory: Trajectory, state: _StepState
+async def guardrail_before_llm(
+    planner: ReactPlanner, trajectory: Trajectory, state: StepState
 ) -> PlannerAction | None:
-    """Evaluate the ``llm_before`` guardrail; return an action to stop."""
+    """Evaluate the ``llm_before`` guardrail; return an action to stop.
+
+    A RETRY rewrites ``state.messages`` with its corrective message.
+    """
     latest_user = next(
         (
             msg.get("content")
@@ -320,13 +326,12 @@ async def _guardrail_before_llm(
             trajectory=trajectory,
         )
     )
-    if decision is None:
-        return None
-    _log_guardrail_decision(planner, decision)
-    if not planner.guardrails_enforced():
+    if decision is None or not planner.guardrails_enforced():
         return None
     if decision.action.value == "STOP":
-        return _guardrail_stop_action(decision, "guardrail_stop")
+        return guardrail_stop_action(
+            planner, trajectory, decision, "guardrail_stop"
+        )
     if decision.action.value == "RETRY" and decision.retry is not None:
         _apply_guardrail_retry(
             planner,
@@ -341,7 +346,7 @@ async def _guardrail_before_llm(
 async def _complete_action(
     planner: ReactPlanner,
     trajectory: Trajectory,
-    state: _StepState,
+    state: StepState,
     *,
     response_format: Mapping[str, Any] | None,
     stream: _ActionStream,
@@ -388,7 +393,7 @@ async def _complete_action(
 async def _attempt_step(
     planner: ReactPlanner,
     trajectory: Trajectory,
-    state: _StepState,
+    state: StepState,
     attempt: int,
 ) -> PlannerAction | None:
     """Run one LLM attempt; return ``None`` when it needs a repair retry."""
@@ -398,12 +403,13 @@ async def _attempt_step(
             list(state.base_messages),
             prompts.render_repair_message(state.last_error),
         )
-    stream = _ActionStream(planner, trajectory, planner.action_seq)
-    stream.start()
     if planner.guardrails_enabled():
-        stop = await _guardrail_before_llm(planner, trajectory, state)
+        # Before the stream opens, so a STOP leaves no stream handler open.
+        stop = await guardrail_before_llm(planner, trajectory, state)
         if stop is not None:
             return stop
+    stream = _ActionStream(planner, trajectory, planner.action_seq)
+    stream.start()
     llm_result = await _complete_action(
         planner,
         trajectory,
@@ -412,13 +418,11 @@ async def _attempt_step(
         stream=stream,
     )
     raw, cost = _coerce_llm_response(llm_result)
-    decision = planner.guardrail_stream_decision
-    if (
-        decision is not None
-        and planner.guardrails_enforced()
-        and decision.action.value == "STOP"
-    ):
-        return _guardrail_stop_action(decision, "guardrail_stream_stop")
+    stream_stop = stream_stop_decision(planner)
+    if stream_stop is not None:
+        return guardrail_stop_action(
+            planner, trajectory, stream_stop, "guardrail_stream_stop"
+        )
     state.last_raw = raw
     planner.cost_tracker.record_main_call(cost)
 
@@ -437,7 +441,7 @@ async def _attempt_step(
 def _parse_action(
     planner: ReactPlanner,
     trajectory: Trajectory,
-    state: _StepState,
+    state: StepState,
     *,
     raw: str,
     attempt: int,

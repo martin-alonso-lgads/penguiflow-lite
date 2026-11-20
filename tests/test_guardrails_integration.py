@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 from pydantic import BaseModel
@@ -16,15 +16,18 @@ from penguiflow.node import Node
 from penguiflow.planner import PlannerFinish, PlannerPause, ReactPlanner
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
+    GatewayConfig,
     GuardrailAction,
     GuardrailDecision,
     GuardrailEvent,
     GuardrailGateway,
     GuardrailSeverity,
     PauseSpec,
+    RedactionSpec,
     RuleCost,
     RuleRegistry,
     SecretRedactionRule,
+    StopSpec,
     ToolAllowlistRule,
 )
 from penguiflow.planner.guardrails.protocols import GuardrailRule
@@ -35,6 +38,8 @@ from penguiflow.steering import InMemoryGuardInbox
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+
+    from penguiflow.catalog import NodeSpec
 
 
 class _StubClient(JSONLLMClient):
@@ -392,3 +397,233 @@ async def test_late_deep_stop_never_reaches_the_next_run() -> None:
     assert second.reason == "answer_complete"
     assert "guardrail" not in second.metadata
     assert len(set(rule.run_ids)) == 2
+
+
+class _RecordingStubClient(_StubClient):
+    """Stub client that also records the messages of every call."""
+
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        super().__init__(responses)
+        self.calls: list[list[Mapping[str, Any]]] = []
+
+    @override
+    async def complete(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        response_format: Mapping[str, Any] | None = None,
+        stream: bool = False,
+        on_stream_chunk: Callable[[str, bool], None] | None = None,
+    ) -> tuple[str, float]:
+        self.calls.append(list(messages))
+        return await super().complete(
+            messages=messages,
+            response_format=response_format,
+            stream=stream,
+            on_stream_chunk=on_stream_chunk,
+        )
+
+
+class _FixedDecisionRule(GuardrailRule):
+    """FAST rule returning one fixed decision for the given events."""
+
+    version = "1"
+    enabled = True
+    cost = RuleCost.FAST
+    severity = GuardrailSeverity.HIGH
+
+    def __init__(
+        self,
+        rule_id: str,
+        event_types: frozenset[str],
+        decide: Callable[[GuardrailEvent], GuardrailDecision | None],
+    ) -> None:
+        self.rule_id = rule_id
+        self.supports_event_types = event_types
+        self._decide = decide
+        self.events: list[str] = []
+
+    @override
+    async def evaluate(
+        self, event: GuardrailEvent, context_snapshot: object
+    ) -> GuardrailDecision | None:
+        self.events.append(event.event_type)
+        return self._decide(event)
+
+
+def _gateway(
+    rule: GuardrailRule, *, mode: Literal["shadow", "enforce"] = "enforce"
+) -> GuardrailGateway:
+    guard_registry = RuleRegistry()
+    guard_registry.register(rule)
+    return GuardrailGateway(
+        registry=guard_registry,
+        guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(guard_registry)),
+        config=GatewayConfig(mode=mode),
+    )
+
+
+def _demo_catalog() -> list[NodeSpec]:
+    registry = ModelRegistry()
+    registry.register("demo", ToolArgs, ToolOut)
+    return build_catalog([Node(demo_tool, name="demo")], registry)
+
+
+def _stop(event: GuardrailEvent) -> GuardrailDecision:
+    return GuardrailDecision(
+        action=GuardrailAction.STOP,
+        rule_id="blocker",
+        reason=f"blocked {event.event_type}",
+        stop=StopSpec(user_message="Blocked by policy."),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["tool_call_start", "tool_call_result"])
+async def test_guardrail_pause_without_pause_support_stops(
+    event_type: str,
+) -> None:
+    """With pause disabled, a guardrail PAUSE ends the run as a STOP."""
+    rule = _ApprovalRule(event_type)
+    planner = ReactPlanner(
+        llm_client=_StubClient(
+            [
+                {
+                    "thought": "call demo",
+                    "next_node": "demo",
+                    "args": {"value": "hi"},
+                }
+            ]
+        ),
+        catalog=_demo_catalog(),
+        max_iters=2,
+        pause_enabled=False,
+        guardrail_gateway=_gateway(rule),
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    guardrail = result.metadata["guardrail"]
+    assert guardrail["action"] == "STOP"
+    assert guardrail["requested_action"] == "PAUSE"
+    assert guardrail["pause_disabled"] is True
+    assert result.payload["raw_answer"] == "Approve the demo call?"
+
+
+@pytest.mark.asyncio
+async def test_llm_before_stop_records_guardrail_metadata() -> None:
+    """An ``llm_before`` STOP finishes like a tool STOP, with metadata."""
+    client = _RecordingStubClient([])
+    rule = _FixedDecisionRule("blocker", frozenset({"llm_before"}), _stop)
+    planner = ReactPlanner(
+        llm_client=client,
+        catalog=_demo_catalog(),
+        max_iters=2,
+        guardrail_gateway=_gateway(rule),
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.metadata["guardrail"]["rule_id"] == "blocker"
+    assert result.payload["raw_answer"] == "Blocked by policy."
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_logs_every_event_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Shadow mode logs the decisions of tool events too, without acting."""
+    rule = _FixedDecisionRule(
+        "blocker",
+        frozenset({"llm_before", "tool_call_start", "tool_call_result"}),
+        _stop,
+    )
+    planner = ReactPlanner(
+        llm_client=_StubClient(
+            [
+                {
+                    "thought": "call demo",
+                    "next_node": "demo",
+                    "args": {"value": "hi"},
+                },
+                _answer("done"),
+            ]
+        ),
+        catalog=_demo_catalog(),
+        max_iters=3,
+        guardrail_gateway=_gateway(rule, mode="shadow"),
+    )
+
+    with caplog.at_level("INFO", logger="penguiflow.planner"):
+        result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "answer_complete"
+    shadowed = [
+        getattr(record, "event_type", None)
+        for record in caplog.records
+        if record.getMessage() == "guardrail_decision_shadow"
+    ]
+    assert shadowed == [
+        "llm_before",
+        "tool_call_start",
+        "tool_call_result",
+        "llm_before",
+    ]
+
+
+def _break_json(event: GuardrailEvent) -> GuardrailDecision | None:
+    text = event.text_content or ""
+    start = text.find("sk-")
+    if start < 0:
+        return None
+    # Redact the secret and its closing quote, leaving invalid JSON.
+    end = text.index('"', start) + 1
+    return GuardrailDecision(
+        action=GuardrailAction.REDACT,
+        rule_id="breaker",
+        reason="secret",
+        redactions=(
+            RedactionSpec(path="result", start_offset=start, end_offset=end),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_redaction_never_reaches_the_llm() -> None:
+    """A REDACT that breaks the JSON still hides the original result."""
+    registry = ModelRegistry()
+    registry.register("secret", ToolArgs, ToolOut)
+    catalog = build_catalog([Node(secret_tool, name="secret")], registry)
+    client = _RecordingStubClient(
+        [
+            {
+                "thought": "call secret",
+                "next_node": "secret",
+                "args": {"value": "hi"},
+            },
+            _answer("done"),
+        ]
+    )
+    rule = _FixedDecisionRule(
+        "breaker", frozenset({"tool_call_result"}), _break_json
+    )
+    planner = ReactPlanner(
+        llm_client=client,
+        catalog=catalog,
+        max_iters=3,
+        guardrail_gateway=_gateway(rule),
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    observation = result.metadata["steps"][0]["observation"]
+    assert "sk-abc" not in json.dumps(observation)
+    assert "[REDACTED]" in json.dumps(observation)
+    assert "sk-abc" not in json.dumps(client.calls[-1])

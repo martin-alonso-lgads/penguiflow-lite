@@ -33,8 +33,9 @@ def test_context_snapshot_builder_signals() -> None:
             "available_tools": ["danger"],
             "contains_untrusted": True,
         },
-        strike_counts={"jb": 2},
     )
+    ctx.add_strike("run", "jb")
+    ctx.add_strike("run", "jb")
     event = GuardrailEvent(
         event_type="llm_before",
         run_id="run",

@@ -164,7 +164,7 @@ def test_convert_utcp_tools_respects_filter() -> None:
 async def test_call_triggers_reconnect_on_new_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """call() should reconnect when event loop changes."""
+    """call() connects again, with its ctx, when the event loop changes."""
     registry = ModelRegistry()
     config = build_config()
     node = ToolNode(config=config, registry=registry)
@@ -172,24 +172,23 @@ async def test_call_triggers_reconnect_on_new_loop(
     # Simulate connected on different loop
     node.connected = True
     node.connected_loop = MagicMock()  # Different from current loop
+    ctx = FakeToolContext()
+    seen: list[object | None] = []
+    client = MagicMock()
+    client.call_tool = AsyncMock(return_value={"ok": True})
 
-    # Mock reconnection
-    reconnect_called = False
-
-    async def mock_force_reconnect() -> None:
-        nonlocal reconnect_called
-        reconnect_called = True
+    async def mock_connect(ctx: object | None = None) -> None:
+        seen.append(ctx)
         node.connected = True
         node.connected_loop = asyncio.get_running_loop()
-        node.mcp_client = MagicMock()
-        node.mcp_client.call_tool = AsyncMock(return_value={"ok": True})
-        node.tool_name_map["test.ping"] = "ping"
+        node.mcp_client = client
 
-    monkeypatch.setattr(node, "force_reconnect", mock_force_reconnect)
+    monkeypatch.setattr(node, "connect", mock_connect)
     node.tool_name_map["test.ping"] = "ping"
 
-    await node.call("test.ping", {}, FakeToolContext())
-    assert reconnect_called
+    await node.call("test.ping", {}, ctx)
+    assert seen == [ctx]
+    client.call_tool.assert_awaited_once_with("ping", {})
 
 
 # ─── Test MCP result serialization edge cases ────────────────────────────────

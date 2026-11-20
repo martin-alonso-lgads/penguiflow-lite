@@ -156,8 +156,8 @@ async def on_health_changed(old: MemoryHealth, new: MemoryHealth) -> None:
 `MemoryBudget` enforces token caps. When exceeded:
 
 - `truncate_oldest` removes older turns first (default).
-- `truncate_summary` shrinks the rolling summary first.
-- `error` raises `MemoryBudgetExceeded` (useful for hard-bound environments).
+- `truncate_summary` shrinks the rolling summary first, then removes turns like `truncate_oldest` when that is not enough.
+- `error` raises `MemoryBudgetExceeded` and leaves memory unchanged (useful for hard-bound environments). Pending `rolling_summary` turns don't count toward it.
 
 > [!WARNING]
 > Do not do long blocking I/O in hooks (e.g., synchronous DB writes). If you need durability, prefer a `StateStore`

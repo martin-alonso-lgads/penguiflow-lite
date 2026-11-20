@@ -1,6 +1,6 @@
 # `GuardrailGateway` and Decisions
 
-Source: `penguiflow/planner/guardrails/` (`gateway.py`, `models.py`, `context.py`, `protocols.py`, `rules.py`) and the planner hooks in `penguiflow/planner/react_step.py` and `penguiflow/planner/tool_calls.py`.
+Source: `penguiflow/planner/guardrails/` (`gateway.py`, `models.py`, `context.py`, `protocols.py`, `rules.py`) and the planner hooks in `penguiflow/planner/react_step.py`, `react_step_native.py` and `tool_calls.py`.
 
 ## Wiring
 
@@ -34,7 +34,7 @@ planner = ReactPlanner(..., guardrail_gateway=gateway)
 - `SteeringGuardInbox` is an ABC. `InMemoryGuardInbox(AsyncRuleEvaluator(registry))` is the only shipped implementation; pass it the same registry.
 - Other `GuardrailGateway` fields: `decision_policy` (default `DefaultDecisionPolicy()`), `risk_router` (default `DefaultRiskRouter()`, see `rules-fast-vs-deep.md`), and `context_builder` (default `ContextSnapshotBuilder()`, which holds the tool risk tiers).
 - `guardrail_conversation_history_turns=N` on `ReactPlanner` (default `1`) copies the last N short-term-memory turns into `event.payload["conversation_history"]` as `[{"user": ..., "assistant": ...}]`. It is empty without `short_term_memory`.
-- Each `run()` gets its own guardrail run id, stored in `trajectory.metadata["guardrail_run_id"]`. `resume()` keeps it. When a run finishes (not when it pauses), the planner calls `gateway.end_run(run_id)`, which discards that run's late async responses.
+- Each `run()` gets its own guardrail run id, stored in `trajectory.metadata["guardrail_run_id"]`. `resume()` keeps it. When a run finishes (not when it pauses), the planner calls `gateway.end_run(run_id, ctx)` with its `GuardrailContext`, which discards that run's late async responses and its strikes.
 
 ## `GatewayConfig`
 
@@ -47,7 +47,7 @@ A dataclass; the settings apply to the whole gateway, not per rule.
 | `sync_parallel` | `True` | Run the FAST rules concurrently (`asyncio.gather`). |
 | `async_enabled` | `True` | Submit each evaluated event to the inbox for DEEP rules. |
 | `sync_fail_open` | `False` | A FAST rule that raises or times out: `True` skips it, `False` returns STOP (`GUARDRAIL_SYNC_ERROR` or `GUARDRAIL_SYNC_TIMEOUT`). |
-| `async_fail_open` | `True` | An inbox failure (`submit` or `await_response` raises, or a response has `error` set): `True` logs `guardrail_async_submit_failed` or `guardrail_async_error` and skips the check; `False` returns STOP with `rule_id="__async_error__"` and `error_code="GUARDRAIL_ASYNC_ERROR"`. |
+| `async_fail_open` | `True` | An inbox failure (`submit` or `await_response` raises, or a response has `error` set, as `InMemoryGuardInbox` does when a DEEP rule raises): `True` logs `guardrail_async_submit_failed` or `guardrail_async_error` and keeps the response's other decisions; `False` adds a STOP with `rule_id="__async_error__"` and `error_code="GUARDRAIL_ASYNC_ERROR"`. |
 
 An async **timeout** is not an inbox failure: the risk router's `on_timeout` decides it.
 
@@ -73,9 +73,9 @@ GuardrailEvent(
 | `tool_call_result` | After a tool succeeds | The result JSON the LLM will see, after the observation clamp | `tool_call_id`, `action_seq` |
 | `llm_stream_chunk` | Each streamed LLM chunk | The chunk text | `phase`, `channel` |
 
-Every event also carries `conversation_history`, plus `last_assistant` and `task_scope` when available. `llm_stream_chunk` is evaluated only in `enforce` mode, with an `event_callback` set and streaming on (`stream_final_response=True` and a streaming-capable client).
+Every event also carries `conversation_history`, plus `last_assistant` and `task_scope` when available. `llm_stream_chunk` is evaluated in both modes, with an `event_callback` set and streaming on (`stream_final_response=True` and a streaming-capable client). In `shadow` mode the chunk is emitted unchanged.
 
-In `tool_call_mode="native"`, `llm_before` is not evaluated, and a stream STOP only drops chunks; it does not end the run.
+In `tool_call_mode="native"` the events are the same: `llm_before` runs before each LLM call, and streamed chunks are checked before the step returns, so a chunk STOP ends the run.
 
 ## Context snapshot and `GuardrailContext`
 
@@ -83,7 +83,7 @@ Rules receive a `ContextSnapshotV1` built by the gateway's `ContextSnapshotBuild
 
 Tools default to `ToolRiskTier.MEDIUM`. Set tiers with `ContextSnapshotBuilder(tool_risk_registry={...})` or `gateway.context_builder.set_tool_risks({...})`.
 
-The planner keeps one `GuardrailContext` per planner instance. `previous_violations` is the sum of its `strike_counts`, which the `increment_strike` effect raises; the counts outlive a single run.
+The planner keeps one `GuardrailContext` per planner instance and counts strikes per run in `strikes_by_run` (`{run_id: {category: count}}`), through `add_strike(run_id, category)`, `strike_total(run_id)` and `clear_run(run_id)`. `previous_violations` is `strike_total(event.run_id)`: only the current run's strikes count. They survive pause and resume, and `end_run` clears them when the run finishes.
 
 ## `GuardrailDecision`
 
@@ -115,7 +115,7 @@ Other fields: `decision_id` (auto), `correlation_id`, `was_sync` (the gateway se
 | `RetrySpec` | `max_attempts=2`, `corrective_message=""` | Only honoured at `llm_before`. |
 | `RedactionSpec` | `path` (required), `replacement="[REDACTED]"`, `entity_type`, `start_offset`, `end_offset` | Applied by offsets into `text_content`. `path` is a label; a spec without both offsets is ignored. |
 
-Effects: only `increment_strike` does something (it counts under `rule_id.split("-")[0]`). `flag_trajectory` and `emit_alert` are accepted but are no-ops.
+Effects: only `increment_strike` does something (it adds a strike for the run under `rule_id.split("-")[0]`). `flag_trajectory` and `emit_alert` are accepted but are no-ops.
 
 ## What each action does
 
@@ -123,14 +123,15 @@ In `enforce` mode:
 
 | Event | STOP | PAUSE | RETRY | REDACT |
 |---|---|---|---|---|
-| `llm_before` | Run ends; the answer is `stop.user_message` (`reason="answer_complete"`, step thought `guardrail_stop:<rule_id>`) | Ignored | Inserts `corrective_message` as a system message into this LLM call and emits `guardrail_retry`, up to `max_attempts` times per run | Ignored |
+| `llm_before` | Run finishes `reason="no_path"`; the answer is `stop.user_message` | Ignored | Inserts `corrective_message` as a system message into this LLM call and emits `guardrail_retry`, up to `max_attempts` times per run | Ignored |
 | `tool_call_start` | Tool skipped; run finishes `reason="no_path"` | Run pauses, tool not run | Ignored | Ignored |
 | `tool_call_result` | Run finishes `no_path` (the tool already ran) | Run pauses | Ignored | Result JSON redacted before the LLM sees it |
-| `llm_stream_chunk` | Chunk dropped; after the LLM call the run ends with `stop.user_message` | Chunk dropped | Ignored | Chunk text redacted |
+| `llm_stream_chunk` | Chunk dropped; after the LLM call the run finishes `no_path` with `stop.user_message` | Chunk dropped | Ignored | Chunk text redacted |
 
-- **Tool STOP:** `result.payload["raw_answer"]` is `stop.user_message` and `result.metadata["guardrail"]` holds the decision. The `tool_call_result` event's `result_json` carries `{"error": ..., "failure": {"guardrail": ...}}`. In a parallel plan, a STOP only fails that branch.
-- **PAUSE:** `run()` returns `PlannerPause(reason="approval_required")` with `payload["guardrail"] = {"action": "PAUSE", "rule_id", "reason", "decision_id", "severity", "effects", "stop": None, "pause": {"scope", "approver_roles", "prompt", "timeout_s"}}`. No `tool_call_result` event is emitted. A PAUSE needs `pause_enabled=True` (the default); otherwise `run()` raises `RuntimeError`.
-- **REDACT on `tool_call_result`:** if the redacted text is no longer valid JSON, only the emitted event is redacted, and the LLM still sees the original. Keep replacements inside JSON string values, and free of quotes and backslashes.
+- **STOP:** every STOP, LLM-side (`llm_before`, a stream chunk, a late DEEP STOP landing there) or tool-side, finishes the same way: `reason="no_path"`, `result.payload["raw_answer"]` is `stop.user_message`, `result.metadata["guardrail"]` holds the decision and `result.metadata["error"]` is `guardrail_stop:<rule_id>`. A tool STOP's `tool_call_result` event `result_json` carries `{"error": ..., "failure": {"guardrail": ...}}`. In a parallel plan, a tool STOP only fails that branch.
+- **PAUSE:** `run()` returns `PlannerPause(reason="approval_required")` with `payload["guardrail"] = {"action": "PAUSE", "rule_id", "reason", "decision_id", "severity", "effects", "stop": None, "pause": {"scope", "approver_roles", "prompt", "timeout_s"}}`. No `tool_call_result` event is emitted.
+- **PAUSE without pause support:** on a planner built with `pause_enabled=False`, a PAUSE at `tool_call_start` or `tool_call_result` (including the router's `on_timeout="pause"` PAUSE) becomes a STOP. The run finishes `no_path`, `raw_answer` is `pause.prompt` (or a default message), and `metadata["guardrail"]` holds the decision with `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
+- **REDACT on `tool_call_result`:** if the redacted text is no longer valid JSON, the observation the LLM sees (and the step's observation) becomes `{"result": "<redacted text>"}`; the original is never passed on. Keep replacements inside JSON string values, and free of quotes and backslashes, to keep the structure. Trajectory `artifacts` and `sources` are collected after the guardrail, from the redacted observation.
 
 ## Decision resolution
 
@@ -320,9 +321,10 @@ To reject, don't resume the token: this rule treats any resumed run as approved.
 
 ## Observability
 
-- `llm_before` decisions are logged as `guardrail_decision`, plus `guardrail_decision_shadow` in shadow mode. Tool and stream decisions are not logged.
-- Look for the `guardrail_retry` planner event, `result.metadata["guardrail"]` (tool STOP) and `PlannerPause.payload["guardrail"]`.
-- To count hits for every event type (for example during a shadow rollout), log from the decision policy. `resolve` runs whenever at least one rule returned a decision:
+- Every rule decision, at every event type (`llm_before`, `tool_call_start`, `tool_call_result`, `llm_stream_chunk`), is logged as `guardrail_decision` on the `penguiflow.planner` logger (INFO), with `extra` keys `event_type`, `run_id`, `action`, `rule_id`, `reason` and `enforced`. Gateway defaults (`rule_id` `__default__` or `__skip__`: no rule decided) are not logged. In shadow mode a decision other than ALLOW is also logged as `guardrail_decision_shadow`.
+- The gateway and evaluator log `guardrail_async_submit_failed`, `guardrail_async_error` (fail-open inbox or DEEP rule failures) and `guardrail_required_rule_missing` at WARNING on their module loggers under `penguiflow.planner.guardrails`.
+- Look for the `guardrail_retry` planner event, `result.metadata["guardrail"]` (any STOP) and `PlannerPause.payload["guardrail"]`.
+- To log other fields (`tool_name`, `severity`), log from the decision policy. `resolve` runs whenever at least one rule returned a decision:
 
 ```python
 import logging

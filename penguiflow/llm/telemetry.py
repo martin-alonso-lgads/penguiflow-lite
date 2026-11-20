@@ -157,6 +157,64 @@ def set_telemetry_hooks(hooks: TelemetryHooks) -> None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class LLMCallTelemetry:
+    """Emits the telemetry events of one LLM call.
+
+    ``start`` sends ``request_start``; each backoff retry sends ``retry``;
+    the call ends with ``request_end`` (cost and attempts) or ``error``.
+    Events go to :func:`get_telemetry_hooks` unless ``hooks`` is given.
+
+    Attributes:
+        provider: Provider name, e.g. ``"openai"``.
+        model: Model id.
+        mode: Output mode or request kind, when known.
+        attempts: Attempts made so far.
+        enabled: Whether to emit at all.
+        hooks: Where events go.
+    """
+
+    provider: str
+    model: str
+    mode: str | None = None
+    attempts: int = 1
+    enabled: bool = True
+    hooks: TelemetryHooks | None = None
+
+    def _emit(self, event_type: str, **extra: object) -> None:
+        if not self.enabled:
+            return
+        hooks = self.hooks or get_telemetry_hooks()
+        hooks.emit(
+            LLMEvent(
+                event_type=event_type,
+                timestamp=datetime.now(tz=UTC),
+                provider=self.provider,
+                model=self.model,
+                extra=dict(extra) or None,
+            )
+        )
+
+    def start(self, **extra: object) -> None:
+        """Emit ``request_start``."""
+        self._emit("request_start", mode=self.mode, **extra)
+
+    def retry(self, attempt: int, error: BaseException) -> None:
+        """Emit ``retry`` before retry number ``attempt`` (1-based)."""
+        self.attempts = attempt + 1
+        self._emit("retry", attempt=attempt, reason=str(error))
+
+    def end(self, cost: float) -> None:
+        """Emit ``request_end`` with the call's cost and attempt count."""
+        self._emit(
+            "request_end", cost=cost, attempts=self.attempts, mode=self.mode
+        )
+
+    def error(self, error: BaseException) -> None:
+        """Emit ``error`` for a call that failed."""
+        self._emit("error", error=str(error), error_type=type(error).__name__)
+
+
 def default_logger_callback(event: LLMEvent) -> None:
     """Default callback that logs events at DEBUG level."""
     if event.event_type == "request_end":

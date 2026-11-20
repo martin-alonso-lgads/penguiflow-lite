@@ -61,6 +61,7 @@ from .models import (
     UpdateType,
     _utc_now,
     merge_strategy_from_name,
+    parse_merge_strategy,
 )
 from .persistence import (
     InMemorySessionStateStore,
@@ -142,6 +143,8 @@ class PendingContextPatch:
         patch: The underlying :class:`ContextPatch` payload to merge if
             approved.
         strategy: The merge strategy the patch was submitted with.
+        payload: The task's raw result payload, merged with the patch.
+        group_id: The task group the patch's task belongs to, if any.
         created_at: Unix timestamp (seconds) when the patch was queued.
     """
 
@@ -149,6 +152,8 @@ class PendingContextPatch:
     task_id: str
     patch: ContextPatch
     strategy: MergeStrategy
+    payload: object = None
+    group_id: str | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -794,19 +799,25 @@ class StreamingSession:
         Args:
             generator: Async callable to generate proactive messages.
             enabled: Master switch for proactive reporting.
-            strategies: Merge strategies that trigger reports (default: APPEND,
-                REPLACE).
+            strategies: Merge strategies that trigger reports, as names in
+                any case (default: APPEND, REPLACE). Stored upper-case.
             max_queued: Maximum queued reports before dropping oldest.
             timeout_s: Timeout for proactive message generation.
             max_hops: Maximum proactive recursion hops before disabling
                 background spawning.
             fallback_notification: Fall back to notification panel if
                 generation fails.
+
+        Raises:
+            ValueError: If a name in ``strategies`` is not a merge strategy.
         """
         self._proactive_generator = generator
         self._proactive_config = {
             "enabled": enabled,
-            "strategies": strategies or ["APPEND", "REPLACE"],
+            "strategies": [
+                parse_merge_strategy(name).name
+                for name in strategies or ["APPEND", "REPLACE"]
+            ],
             "max_queued": max_queued,
             "timeout_s": timeout_s,
             "max_hops": max_hops,
@@ -882,9 +893,8 @@ class StreamingSession:
         if config is None or not config.get("enabled"):
             return
         # Check if merge strategy triggers proactive reporting
-        strategy_name = merge_strategy.value.upper()
         allowed_strategies = config.get("strategies", ["APPEND", "REPLACE"])
-        if strategy_name not in allowed_strategies:
+        if merge_strategy.name not in allowed_strategies:
             return
         max_hops = int(config.get("max_hops", 2) or 0)
         hops_remaining = (
@@ -1385,7 +1395,7 @@ class StreamingSession:
         patch_id = event.payload.get("patch_id")
         if isinstance(patch_id, str) and patch_id in self._pending_patches:
             if event.event_type == SteeringEventType.REJECT:
-                await self._reject_pending_patch(patch_id, event)
+                self._reject_pending_patch(patch_id, trace_id=event.trace_id)
             else:
                 await self.apply_pending_patch(patch_id=patch_id)
             return True
@@ -1694,7 +1704,7 @@ class StreamingSession:
             patch: The context patch produced by the completed task.
             strategy: The merge strategy to apply.
             payload: The task's raw result payload, stored alongside the patch
-                for ``APPEND``/``REPLACE`` strategies.
+                (for ``HUMAN_GATED``, once the patch is approved).
             group_id: The task group this patch's task belongs to, if any.
 
         Returns:
@@ -1729,6 +1739,8 @@ class StreamingSession:
                 task_id=patch.task_id,
                 patch=patch,
                 strategy=strategy,
+                payload=payload,
+                group_id=group_id,
             )
             self.publish(
                 StateUpdate(
@@ -1843,6 +1855,8 @@ class StreamingSession:
         await self.apply_context_patch(
             patch=pending.patch,
             strategy=strategy or MergeStrategy.APPEND,
+            payload=pending.payload,
+            group_id=pending.group_id,
         )
         self.publish(
             StateUpdate(
@@ -1859,17 +1873,18 @@ class StreamingSession:
         )
         return True
 
-    async def _reject_pending_patch(
-        self, patch_id: str, event: SteeringEvent
-    ) -> None:
+    def _reject_pending_patch(
+        self, patch_id: str, *, trace_id: str | None = None
+    ) -> bool:
+        """Drop a pending patch and publish that it was rejected."""
         pending = self._pending_patches.pop(patch_id, None)
         if pending is None:
-            return
+            return False
         self.publish(
             StateUpdate(
                 session_id=self.session_id,
                 task_id=pending.task_id,
-                trace_id=event.trace_id,
+                trace_id=trace_id,
                 update_type=UpdateType.NOTIFICATION,
                 content={
                     "severity": "warning",
@@ -1878,6 +1893,7 @@ class StreamingSession:
                 },
             )
         )
+        return True
 
     async def _run_task(
         self,
@@ -2363,13 +2379,17 @@ class StreamingSession:
         action: Literal["apply", "reject"] = "apply",
         strategy: MergeStrategy | None = None,
     ) -> bool:
-        """Apply or reject all pending patches for a task group."""
+        """Apply or reject all pending patches for a task group.
+
+        Each rejected patch publishes a "Context patch rejected"
+        notification. Approving a human-gated group then queues its
+        synthesis report.
+        """
         group = self._groups.get(group_id)
         if group is None:
             return False
         for patch_id in list(group.patches):
-            pending = self._pending_patches.get(patch_id)
-            if pending is None:
+            if patch_id not in self._pending_patches:
                 continue
             if action == "apply":
                 await self.apply_pending_patch(
@@ -2377,7 +2397,7 @@ class StreamingSession:
                     strategy=strategy or MergeStrategy.APPEND,
                 )
             else:
-                self._pending_patches.pop(patch_id, None)
+                self._reject_pending_patch(patch_id)
         group.patches.clear()
         # Now that patches are applied, we can generate the synthesis report
         if (

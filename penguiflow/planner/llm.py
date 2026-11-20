@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ..llm.errors import LLMRateLimitError
 from ..llm.profiles import get_profile
+from ..llm.telemetry import LLMCallTelemetry
 from ..llm.types import TextPart
 from . import prompts
 from .models import (
@@ -25,6 +26,7 @@ from .models import (
     ReflectionCritique,
 )
 from .trajectory import (
+    BackgroundTaskResult,
     Trajectory,
     TrajectorySummary,
     extract_background_results,
@@ -736,6 +738,15 @@ def _stream_cost(
     return cost
 
 
+def _response_format_type(
+    response_format: Mapping[str, Any] | None,
+) -> str:
+    """Return the requested output mode, for telemetry."""
+    if isinstance(response_format, Mapping):
+        return str(response_format.get("type") or "text")
+    return "text"
+
+
 class _LiteLLMJSONClient:
     def __init__(
         self,
@@ -810,15 +821,45 @@ class _LiteLLMJSONClient:
             )
         )
 
+        telemetry = LLMCallTelemetry(
+            provider="litellm",
+            model=model_name,
+            mode=_response_format_type(response_format),
+        )
+        telemetry.start()
+        try:
+            content, cost = await self._complete_with_retries(
+                litellm=litellm,
+                params=params,
+                stream_to=on_stream_chunk if allow_streaming else None,
+                on_reasoning_chunk=on_reasoning_chunk,
+                telemetry=telemetry,
+            )
+        except Exception as exc:
+            telemetry.error(exc)
+            raise
+        telemetry.end(cost)
+        return content, cost
+
+    async def _complete_with_retries(
+        self,
+        *,
+        litellm: ModuleType,
+        params: dict[str, Any],
+        stream_to: Callable[[str, bool], None] | None,
+        on_reasoning_chunk: Callable[[str, bool], None] | None,
+        telemetry: LLMCallTelemetry,
+    ) -> tuple[str, float]:
+        """Call LiteLLM, retrying timeouts, rate limits and outages."""
         last_error: Exception | None = None
         for attempt in range(self._max_retries):
             try:
                 async with asyncio.timeout(self._timeout_s):
-                    if allow_streaming and on_stream_chunk is not None:
+                    if stream_to is not None:
                         return await self._complete_streaming(
                             litellm=litellm,
                             on_reasoning_chunk=on_reasoning_chunk,
-                            on_stream_chunk=on_stream_chunk,
+                            on_stream_chunk=stream_to,
                             params=params,
                         )
 
@@ -837,10 +878,13 @@ class _LiteLLMJSONClient:
                         "timeout_s": self._timeout_s,
                     },
                 )
+                if attempt + 1 < self._max_retries:
+                    telemetry.retry(attempt + 1, exc)
             except Exception as exc:
                 last_error = exc
                 if not await self._retry_after(exc, attempt):
                     raise
+                telemetry.retry(attempt + 1, exc)
 
         logger.error(
             "llm_retries_exhausted",
@@ -1465,6 +1509,58 @@ def _with_run_guidance(
     return system_prompt
 
 
+_BACKGROUND_RESULTS_LIMIT = 20
+_BACKGROUND_FACTS_MAX_CHARS = 2000
+_BACKGROUND_ARTIFACT_KEYS = (
+    "id",
+    "artifact_id",
+    "name",
+    "type",
+    "mime_type",
+    "size_bytes",
+    "summary",
+)
+
+
+def _background_results_digest(
+    trajectory: Trajectory,
+) -> list[dict[str, Any]]:
+    """Return the merged background results the LLM should see.
+
+    Each result keeps its summary, facts and artifact references; the raw
+    payload is left out (``tasks.get`` returns it). The newest results come
+    last, at most ``_BACKGROUND_RESULTS_LIMIT`` of them.
+    """
+    results = sorted(
+        trajectory.get_unconsumed_background().values(),
+        key=lambda result: result.completed_at,
+    )[-_BACKGROUND_RESULTS_LIMIT:]
+    return [_background_result_digest(result) for result in results]
+
+
+def _background_result_digest(result: BackgroundTaskResult) -> dict[str, Any]:
+    facts: object = dict(result.facts)
+    facts_json = json.dumps(facts, ensure_ascii=False, default=str)
+    if len(facts_json) > _BACKGROUND_FACTS_MAX_CHARS:
+        facts = {
+            "truncated": True,
+            "preview": facts_json[:_BACKGROUND_FACTS_MAX_CHARS],
+        }
+    digest: dict[str, Any] = {
+        "task_id": result.task_id,
+        "status": result.status,
+        "summary": result.summary,
+        "facts": facts,
+        "artifacts": [
+            {k: item[k] for k in _BACKGROUND_ARTIFACT_KEYS if k in item}
+            for item in result.artifacts
+        ],
+    }
+    if result.group_id is not None:
+        digest["group_id"] = result.group_id
+    return digest
+
+
 def _base_messages(
     trajectory: Trajectory,
     *,
@@ -1492,6 +1588,16 @@ def _base_messages(
                 "role": "system",
                 "content": prompts.render_read_only_conversation_memory(
                     conversation_memory
+                ),
+            }
+        )
+    background = _background_results_digest(trajectory)
+    if background:
+        messages.append(
+            {
+                "role": "system",
+                "content": prompts.render_read_only_background_results(
+                    background
                 ),
             }
         )

@@ -39,7 +39,11 @@ from .tools import (
     UIInteractionResult,
     UISelectOptionArgs,
 )
-from .validate import ValidationLimits, validate_component_payload
+from .validate import (
+    RichOutputValidationError,
+    ValidationLimits,
+    validate_component_payload,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -166,10 +170,19 @@ class RichOutputRuntime:
         return f"{base}\n\n{appendix}"
 
     def describe_component(self, name: str) -> dict[str, Any]:
-        """Return a component's registry entry; raise KeyError if unknown."""
+        """Return an allowed component's registry entry.
+
+        Raises:
+            KeyError: If ``name`` is not a registered component.
+            RichOutputValidationError: If the allowlist excludes ``name``
+                (code ``component_not_allowed``).
+        """
         component = self.registry.raw.get("components", {}).get(name)
         if not isinstance(component, Mapping):
             raise KeyError(name)
+        if self.allowlist and name not in self.allowlist:
+            msg = f"Component '{name}' is not allowed."
+            raise RichOutputValidationError(msg, code="component_not_allowed")
         return dict(component)
 
     def registry_payload(self) -> dict[str, Any]:

@@ -62,6 +62,7 @@ from penguiflow.rich_output.tools import (
     UIFormArgs,
     UISelectOptionArgs,
 )
+from penguiflow.rich_output.validate import RichOutputValidationError
 
 from .tool_context_doubles import FakeToolContext
 
@@ -1052,6 +1053,25 @@ async def test_describe_component_returns_component_schema() -> None:
         DescribeComponentArgs(name="markdown"), ctx
     )
     assert result.component["name"] == "markdown"
+
+
+@pytest.mark.asyncio
+async def test_describe_component_rejects_component_outside_allowlist() -> (
+    None
+):
+    """Describe component refuses a component the allowlist excludes."""
+    configure_rich_output(
+        RichOutputConfig(
+            enabled=True,
+            allowlist=["markdown"],
+            max_payload_bytes=2000,
+            max_total_bytes=2000,
+        )
+    )
+    ctx = DummyContext()
+    with pytest.raises(RichOutputValidationError) as excinfo:
+        await describe_component(DescribeComponentArgs(name="echarts"), ctx)
+    assert excinfo.value.code == "component_not_allowed"
 
 
 @pytest.mark.asyncio

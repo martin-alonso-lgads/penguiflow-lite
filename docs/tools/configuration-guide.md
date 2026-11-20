@@ -18,23 +18,36 @@ ToolNode supports `${VAR}` syntax for environment variable substitution in confi
 ```python
 from penguiflow.tools import ToolNode, ExternalToolConfig, TransportType, AuthType
 
+# Stdio server: credentials go to the subprocess through env
 github = ToolNode(
     config=ExternalToolConfig(
         name="github",
         transport=TransportType.MCP,
         connection="npx -y @modelcontextprotocol/server-github",
         env={
-            "GITHUB_TOKEN": "${GITHUB_TOKEN}",       # Substituted from environment
-            "GITHUB_ORG": "${MY_ORG}",               # Custom env var name
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}",  # Substituted from environment
+            "GITHUB_ORG": "${MY_ORG}",                          # Custom env var name
         },
+    ),
+    registry=registry,
+)
+
+# URL server: credentials go in auth headers
+search = ToolNode(
+    config=ExternalToolConfig(
+        name="search",
+        transport=TransportType.MCP,
+        connection="https://mcp.example.com/mcp",
         auth_type=AuthType.BEARER,
         auth_config={
-            "token": "${GITHUB_TOKEN}",             # Also works in auth_config
+            "token": "${SEARCH_TOKEN}",             # Also works in auth_config
         },
     ),
     registry=registry,
 )
 ```
+
+A stdio command gets no HTTP headers, so `ExternalToolConfig` rejects any `auth_type` other than `NONE` on one: pass its credentials in `env`, or connect to the server's URL.
 
 ### Fail-Fast Behavior
 
@@ -313,7 +326,7 @@ ExternalToolConfig(
     name="github",
     transport=TransportType.MCP,
     connection="npx -y @modelcontextprotocol/server-github",  # Command to run
-    env={"GITHUB_TOKEN": "${GITHUB_TOKEN}"},                  # Passed to subprocess
+    env={"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},  # Passed to subprocess
 )
 ```
 
@@ -363,6 +376,8 @@ ExternalToolConfig(
 
 ## Authentication Configuration
 
+Auth headers reach MCP servers connected by URL, sent when the MCP session opens. ToolNode sends no auth headers to UTCP/HTTP/CLI sources: their `auth_config` and `env` values are passed to the utcp client as variables (named by their keys) for the UTCP manual's call templates to reference.
+
 ### No Authentication
 
 ```python
@@ -409,11 +424,13 @@ ExternalToolConfig(
 ExternalToolConfig(
     name="github",
     transport=TransportType.MCP,
-    connection="npx -y @modelcontextprotocol/server-github",
+    connection="https://mcp.example.com/github",  # MCP over a URL only
     auth_type=AuthType.OAUTH2_USER,
     # auth_config not needed - OAuthManager handles it
 )
 ```
+
+`OAUTH2_USER` works only with an MCP URL connection; a stdio command or a UTCP/HTTP/CLI transport fails validation. One ToolNode serves every user: it opens one MCP session per user (keyed by `tool_context["tenant_id"]` and `["user_id"]`), with that user's token. `ExternalToolConfig.session_pool` (`SessionPoolConfig(max_sessions=64, idle_timeout_s=900.0)`) closes idle sessions.
 
 Requires `OAuthManager` at ToolNode creation:
 
@@ -505,6 +522,7 @@ from penguiflow.tools import (
     OAuthManager,
     OAuthProviderConfig,
 )
+from penguiflow.planner import ToolContext
 from penguiflow.registry import ModelRegistry
 
 # Shared registry
@@ -532,7 +550,7 @@ github = ToolNode(
         name="github",
         description="GitHub repository management",
         transport=TransportType.MCP,
-        connection="npx -y @modelcontextprotocol/server-github",
+        connection="https://mcp.example.com/github",
         auth_type=AuthType.OAUTH2_USER,
         timeout_s=30.0,
         max_concurrency=10,
@@ -583,9 +601,10 @@ weather = ToolNode(
     registry=registry,
 )
 
-# Connect all ToolNodes
-async def setup():
-    await github.connect()
+# Connect all ToolNodes. The OAUTH2_USER node needs a ToolContext whose
+# tool_context carries a user_id; other users' sessions open on their first call.
+async def setup(ctx: ToolContext):
+    await github.connect(ctx)
     await stripe.connect()
     await weather.connect()
 

@@ -39,6 +39,9 @@ class DummyCtx(FakeToolContext):
         super().__init__(tool_context=tool_context)
 
 
+URL_CONNECTION = "https://mcp.example.com/mcp"
+
+
 def build_config(**overrides: object) -> ExternalToolConfig:
     """Build an MCP tool config, with ``overrides`` applied."""
     base: dict[str, object] = {
@@ -233,6 +236,7 @@ async def test_resolve_auth_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_API_KEY", "secret123")
     registry = ModelRegistry()
     config = build_config(
+        connection=URL_CONNECTION,
         auth_type=AuthType.API_KEY,
         auth_config={"api_key": "${TEST_API_KEY}", "header": "X-Custom-Key"},
     )
@@ -251,6 +255,7 @@ async def test_resolve_auth_api_key_default_header(
     monkeypatch.setenv("MY_KEY", "myapikey")
     registry = ModelRegistry()
     config = build_config(
+        connection=URL_CONNECTION,
         auth_type=AuthType.API_KEY,
         auth_config={"api_key": "${MY_KEY}"},
     )
@@ -267,6 +272,7 @@ async def test_resolve_auth_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BEARER_TOKEN", "token456")
     registry = ModelRegistry()
     config = build_config(
+        connection=URL_CONNECTION,
         auth_type=AuthType.BEARER,
         auth_config={"token": "${BEARER_TOKEN}"},
     )
@@ -281,7 +287,9 @@ async def test_resolve_auth_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_resolve_user_oauth_no_manager() -> None:
     """OAuth without auth_manager should raise ToolAuthError."""
     registry = ModelRegistry()
-    config = build_config(auth_type=AuthType.OAUTH2_USER)
+    config = build_config(
+        connection=URL_CONNECTION, auth_type=AuthType.OAUTH2_USER
+    )
     node = ToolNode(config=config, registry=registry, auth_manager=None)
     ctx = DummyCtx(tool_context={"user_id": "user1"})
 
@@ -293,7 +301,9 @@ async def test_resolve_user_oauth_no_manager() -> None:
 async def test_resolve_user_oauth_no_user_id() -> None:
     """OAuth without user_id should raise ToolAuthError."""
     registry = ModelRegistry()
-    config = build_config(auth_type=AuthType.OAUTH2_USER)
+    config = build_config(
+        connection=URL_CONNECTION, auth_type=AuthType.OAUTH2_USER
+    )
 
     fake_manager = MagicMock()
     node = ToolNode(
@@ -679,8 +689,8 @@ def test_create_result_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_utcp_tool_with_headers() -> None:
-    """UTCP tool call should pass headers when supported."""
+async def test_call_utcp_tool_passes_no_headers() -> None:
+    """UTCP tool calls pass only the tool name and arguments."""
     registry = ModelRegistry()
     config = build_config(transport=TransportType.UTCP)
     node = ToolNode(config=config, registry=registry)
@@ -689,28 +699,7 @@ async def test_call_utcp_tool_with_headers() -> None:
     mock_client.call_tool = AsyncMock(return_value={"success": True})
     node.utcp_client = mock_client
 
-    result = await node.call_utcp_tool(
-        "test_tool", {"arg": "val"}, {"X-Auth": "key"}
-    )
-
-    mock_client.call_tool.assert_called_once_with(
-        "test_tool", {"arg": "val"}, headers={"X-Auth": "key"}
-    )
-    assert result == {"success": True}
-
-
-@pytest.mark.asyncio
-async def test_call_utcp_tool_without_headers() -> None:
-    """UTCP tool call without headers should work."""
-    registry = ModelRegistry()
-    config = build_config(transport=TransportType.UTCP)
-    node = ToolNode(config=config, registry=registry)
-
-    mock_client = AsyncMock()
-    mock_client.call_tool = AsyncMock(return_value={"success": True})
-    node.utcp_client = mock_client
-
-    result = await node.call_utcp_tool("test_tool", {"arg": "val"}, {})
+    result = await node.call_utcp_tool("test_tool", {"arg": "val"})
 
     mock_client.call_tool.assert_called_once_with("test_tool", {"arg": "val"})
     assert result == {"success": True}
@@ -725,31 +714,31 @@ async def test_call_utcp_tool_no_client() -> None:
     node.utcp_client = None
 
     with pytest.raises(ToolNodeError, match="not initialised"):
-        await node.call_utcp_tool("test", {}, {})
+        await node.call_utcp_tool("test", {})
 
 
 @pytest.mark.asyncio
-async def test_call_utcp_tool_fallback_no_headers() -> None:
-    """UTCP call should fallback if client doesn't support headers."""
+async def test_call_utcp_tool_type_error_is_not_retried_without_args() -> None:
+    """A TypeError raised by the tool reaches the caller after one call."""
     registry = ModelRegistry()
     config = build_config(transport=TransportType.UTCP)
     node = ToolNode(config=config, registry=registry)
+    calls: list[tuple[str, dict[str, object]]] = []
 
-    # Mock client that raises TypeError when headers are passed
-    async def mock_call_tool(
-        *_args: str | dict[str, object], **kwargs: dict[str, object]
-    ) -> dict[str, bool]:
-        if "headers" in kwargs:
-            msg = "call_tool() got unexpected keyword argument 'headers'"
-            raise TypeError(msg)
-        return {"fallback": True}
+    async def failing_call_tool(
+        tool_name: str, tool_args: dict[str, object]
+    ) -> object:
+        calls.append((tool_name, tool_args))
+        msg = "bad argument inside the tool"
+        raise TypeError(msg)
 
     mock_client = MagicMock()
-    mock_client.call_tool = mock_call_tool
+    mock_client.call_tool = failing_call_tool
     node.utcp_client = mock_client
 
-    result = await node.call_utcp_tool("test", {}, {"X-Auth": "key"})
-    assert result == {"fallback": True}
+    with pytest.raises(TypeError, match="inside the tool"):
+        await node.call_utcp_tool("test", {"x": 1})
+    assert calls == [("test", {"x": 1})]
 
 
 # ─── Test force_reconnect ────────────────────────────────────────────────────
@@ -759,18 +748,25 @@ async def test_call_utcp_tool_fallback_no_headers() -> None:
 async def test_force_reconnect_clears_old_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_force_reconnect should clear old connection state."""
+    """force_reconnect closes the old client, then connects with ctx."""
     registry = ModelRegistry()
     node = ToolNode(config=build_config(), registry=registry)
     node.connected = True
-    node.mcp_client = MagicMock()
+    old_client = AsyncMock()
+    node.mcp_client = old_client
+    ctx = DummyCtx()
+    seen: list[object | None] = []
 
     # Mock connect to avoid actual connection
-    async def mock_connect() -> None:
+    async def mock_connect(ctx: object | None = None) -> None:
+        seen.append(ctx)
         node.connected = True
 
     monkeypatch.setattr(node, "connect", mock_connect)
 
-    await node.force_reconnect()
+    await node.force_reconnect(ctx)
 
+    old_client.__aexit__.assert_awaited_once()
+    assert node.mcp_session_count == 0
+    assert seen == [ctx]
     assert node.connected is True

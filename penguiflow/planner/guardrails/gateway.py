@@ -188,14 +188,22 @@ class GuardrailGateway:
             )
         return self._resolve(all_decisions, event, context_snapshot, ctx)
 
-    def end_run(self, run_id: str) -> None:
-        """Forget the late async responses of a finished run.
+    def end_run(
+        self, run_id: str, ctx: GuardrailContext | None = None
+    ) -> None:
+        """Forget a finished run's late async responses and strikes.
 
         The planner calls this when a run finishes, not when it pauses,
         so a response that arrives after the run ended is discarded.
+
+        Args:
+            run_id: The finished run.
+            ctx: The context the run's strikes were counted on.
         """
         self._late_ids.pop(run_id, None)
         self.guard_inbox.drain_responses(run_id)
+        if ctx is not None:
+            ctx.clear_run(run_id)
 
     def _resolve(
         self,
@@ -207,7 +215,7 @@ class GuardrailGateway:
         final = self.decision_policy.resolve(
             decisions, event, context_snapshot
         )
-        self._process_effects(final, ctx)
+        self._process_effects(final, ctx, event.run_id)
         return final
 
     def _late_stops(self, run_id: str) -> list[GuardrailDecision]:
@@ -264,14 +272,22 @@ class GuardrailGateway:
     def _response_decisions(
         self, response: SteeringGuardResponse, run_id: str
     ) -> list[GuardrailDecision]:
-        """Return a response's decisions, or the async failure decision."""
-        if response.error is not None:
-            return self._async_failure(
-                "guardrail_async_error", run_id, response.error
-            )
+        """Return a response's decisions, plus any async failure decision.
+
+        A response with an ``error`` (a rule or the evaluator failed) keeps
+        the decisions it has, and ``async_fail_open`` decides whether the
+        failure adds a STOP.
+        """
         for decision in response.decisions:
             decision.was_sync = False
-        return list(response.decisions)
+        decisions = list(response.decisions)
+        if response.error is not None:
+            decisions.extend(
+                self._async_failure(
+                    "guardrail_async_error", run_id, response.error
+                )
+            )
+        return decisions
 
     def _async_failure(
         self, log_event: str, run_id: str, detail: str
@@ -399,16 +415,11 @@ class GuardrailGateway:
         return self._response_decisions(response, run_id)
 
     def _process_effects(
-        self, decision: GuardrailDecision, ctx: GuardrailContext
+        self, decision: GuardrailDecision, ctx: GuardrailContext, run_id: str
     ) -> None:
         for effect in decision.effects:
             if effect == "increment_strike":
-                category = decision.rule_id.split("-")[0]
-                ctx.strike_counts[category] = (
-                    ctx.strike_counts.get(category, 0) + 1
-                )
-            elif effect == "flag_trajectory" or effect == "emit_alert":
-                pass
+                ctx.add_strike(run_id, decision.rule_id.split("-")[0])
 
 
 def _timeout_decisions(

@@ -174,13 +174,6 @@ class SkillsConfig(BaseModel):
             "Token budget for formatted skill context injected into prompts."
         ),
     )
-    summarize: bool = Field(
-        default=False,
-        description=(
-            "Whether to summarize skill content when it exceeds the token "
-            "budget."
-        ),
-    )
     redact_pii: bool = Field(
         default=True,
         description=(

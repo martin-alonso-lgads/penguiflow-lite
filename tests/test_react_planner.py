@@ -3763,3 +3763,121 @@ def test_json_schema_sanitizer_preserves_structure() -> None:
     assert (
         sanitized == schema
     )  # Should be identical since no constraints to remove
+
+
+@pytest.mark.asyncio()
+async def test_rolling_summary_reaches_store_and_prompt() -> None:
+    """With a state store, the rolling summary is persisted and shown."""
+
+    class Store(RecordingStateStore):
+        """State store that keeps every saved memory state."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.data: dict[str, dict[str, Any]] = {}
+            self.saved: list[dict[str, Any]] = []
+
+        async def save_memory_state(
+            self, key: str, state: dict[str, Any]
+        ) -> None:
+            self.data[key] = state
+            self.saved.append(state)
+
+        async def load_memory_state(self, key: str) -> dict[str, Any] | None:
+            return self.data.get(key)
+
+    class Client(JSONLLMClient):
+        """Answers each run and summarizes on the summary schema."""
+
+        def __init__(self) -> None:
+            self.prompts: list[list[Mapping[str, Any]]] = []
+            self.summaries = 0
+
+        @override
+        async def complete(
+            self,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            response_format: Mapping[str, Any] | None = None,
+            stream: bool = False,
+            on_stream_chunk: Callable[[str, bool], None] | None = None,
+        ) -> tuple[str, float]:
+            schema = (response_format or {}).get("json_schema") or {}
+            if schema.get("name") == "short_term_memory_summary":
+                self.summaries += 1
+                text = f"<session_summary>S{self.summaries}</session_summary>"
+                return json.dumps({"summary": text}), 0.0
+            self.prompts.append(list(messages))
+            answer: dict[str, object] = {
+                "thought": "finish",
+                "next_node": None,
+                "args": {"raw_answer": f"a{len(self.prompts)}"},
+            }
+            return json.dumps(answer), 0.0
+
+    store = Store()
+    client = Client()
+    planner = make_planner(
+        client,
+        state_store=store,
+        short_term_memory=ShortTermMemoryConfig(
+            strategy="rolling_summary",
+            budget=MemoryBudget(full_zone_turns=1),
+            retry_attempts=0,
+            retry_backoff_base_s=0.0,
+        ),
+    )
+    key = MemoryKey(tenant_id="t", user_id="u", session_id="s")
+
+    for index in range(5):
+        await planner.run(f"q{index}", memory_key=key)
+
+    last_memory = _extract_read_only_conversation_memory(client.prompts[-1])
+    assert last_memory is not None
+    assert str(last_memory.get("summary", "")).startswith("<session_summary>")
+    assert max(len(state["pending"]) for state in store.saved) <= 1
+    assert any(state["summary"] for state in store.saved)
+
+
+@pytest.mark.asyncio()
+async def test_rich_output_total_budget_spans_the_run() -> None:
+    """``max_total_bytes`` counts every render of the run, not per call."""
+    reset_runtime()
+    config = RichOutputConfig(
+        enabled=True,
+        allowlist=["markdown"],
+        max_payload_bytes=1000,
+        max_total_bytes=250,  # One ~150-byte render fits, two don't.
+    )
+    registry = ModelRegistry()
+    catalog = build_catalog(
+        list(attach_rich_output_nodes(registry, config=config)), registry
+    )
+
+    def render(text: str) -> dict[str, object]:
+        return {
+            "thought": "render",
+            "next_node": "render_component",
+            "args": {"component": "markdown", "props": {"content": text}},
+        }
+
+    client = StubClient(
+        [
+            render("a" * 100),
+            render("b" * 100),
+            {
+                "thought": "done",
+                "next_node": None,
+                "args": {"raw_answer": "ok"},
+            },
+        ]
+    )
+    planner = ReactPlanner(llm_client=client, catalog=catalog, max_iters=4)
+
+    result = await planner.run("render twice")
+    reset_runtime()
+
+    assert isinstance(result, PlannerFinish)
+    steps = result.metadata["steps"]
+    assert steps[0].get("error") is None
+    assert "budget exceeded" in str(steps[1].get("error")).lower()

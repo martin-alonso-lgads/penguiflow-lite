@@ -86,7 +86,7 @@ Key knobs:
 
 - `enabled`: master switch
 - `default_loading_mode`: default loading mode for tools built via `build_catalog(...)` (often set to `deferred`)
-- `always_loaded_patterns`: globs for tools that must remain visible (e.g., `tool_search`, `tool_get`, `tasks.*`, `finish`)
+- `always_loaded_patterns`: globs for tools that must remain visible (default `["tasks.*", "tool_search", "tool_get"]`)
 - `activation_scope`:
   - `"run"`: activations live only for the current run/resume token
   - `"session"`: activations persist for `tool_context["session_id"]`
@@ -102,7 +102,7 @@ For large catalogs:
 
 - Enable tool discovery: `ToolSearchConfig(enabled=True, default_loading_mode="deferred")`
 - Keep an explicit always-visible core set:
-  - `tool_search`, `tool_get`, `finish`, `tasks.*` (if tasks are enabled)
+  - `tool_search`, `tool_get`, `tasks.*` (if tasks are enabled)
 - Use `activation_scope="session"` for interactive chat sessions (requires `tool_context["session_id"]`)
 - Use `ToolVisibilityPolicy` for per-tenant/per-user filtering; keep `ToolPolicy` for global guardrails.
 

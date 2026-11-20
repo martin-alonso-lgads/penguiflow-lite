@@ -306,9 +306,8 @@ class RemoteTransport(Protocol):
             The remote agent's result wrapped in a :class:`RemoteCallResult`.
 
         Raises:
-            Exception: Implementations should raise on transport failure;
-                PenguiFlow logs the error via ``remote_call_error`` events and
-                re-raises it to the caller.
+            Exception: Implementations should raise on transport failure; the
+                error reaches the caller unchanged.
         """
 
     def stream(

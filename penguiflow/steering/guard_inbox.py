@@ -94,16 +94,26 @@ class InMemoryGuardInbox(SteeringGuardInbox):
         event: SteeringGuardEvent,
         future: asyncio.Future[SteeringGuardResponse],
     ) -> None:
+        from penguiflow.planner.guardrails.async_eval import (
+            AsyncRuleEvaluationError,
+        )
+
         try:
             decisions = await self._evaluator.evaluate(event)
             response = SteeringGuardResponse(
                 correlation_id=event.correlation_id,
                 decisions=decisions,
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except AsyncRuleEvaluationError as exc:
             response = SteeringGuardResponse(
                 correlation_id=event.correlation_id,
+                decisions=exc.decisions,
                 error=str(exc),
+            )
+        except Exception as exc:
+            response = SteeringGuardResponse(
+                correlation_id=event.correlation_id,
+                error=f"{type(exc).__name__}: {exc}",
             )
 
         if not future.done():

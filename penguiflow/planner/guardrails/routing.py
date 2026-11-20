@@ -29,11 +29,25 @@ class DefaultRiskRouter(RiskRouter):
         high_risk_wait_ms: float = 200.0,
         medium_risk_wait_ms: float = 100.0,
         critical_fail_closed: bool = True,
+        llm_before_wait_ms: float = 0.0,
     ) -> None:
-        """Route with the given waits and critical-risk behavior."""
+        """Route with the given waits and critical-risk behavior.
+
+        Args:
+            high_risk_wait_ms: Wait for DEEP rules on high and critical risk
+                tool calls.
+            medium_risk_wait_ms: Wait on medium risk tool calls and on
+                system-info requests.
+            critical_fail_closed: STOP (instead of PAUSE) when a critical
+                risk tool call's DEEP rules time out.
+            llm_before_wait_ms: Least wait on every ``llm_before`` event.
+                With 0 (the default) a DEEP decision on the user input
+                arrives late: only a STOP applies, at the next check.
+        """
         self._high_wait = high_risk_wait_ms
         self._medium_wait = medium_risk_wait_ms
         self._critical_fail_closed = critical_fail_closed
+        self._llm_before_wait = llm_before_wait_ms
 
     def configure(
         self,
@@ -41,6 +55,7 @@ class DefaultRiskRouter(RiskRouter):
         high_risk_wait_ms: float | None = None,
         medium_risk_wait_ms: float | None = None,
         critical_fail_closed: bool | None = None,
+        llm_before_wait_ms: float | None = None,
     ) -> None:
         """Override the given routing settings, keeping the others."""
         if high_risk_wait_ms is not None:
@@ -49,6 +64,8 @@ class DefaultRiskRouter(RiskRouter):
             self._medium_wait = medium_risk_wait_ms
         if critical_fail_closed is not None:
             self._critical_fail_closed = critical_fail_closed
+        if llm_before_wait_ms is not None:
+            self._llm_before_wait = llm_before_wait_ms
 
     @override
     def route(
@@ -69,14 +86,16 @@ class DefaultRiskRouter(RiskRouter):
             elif risk == ToolRiskTier.MEDIUM:
                 wait_ms = self._medium_wait
 
-        if (
-            event.event_type == "llm_before"
-            and context_snapshot.max_tool_risk
-            in (ToolRiskTier.CRITICAL, ToolRiskTier.HIGH)
-        ):
-            wait_ms = max(wait_ms, self._medium_wait)
-            on_timeout = "pause" if on_timeout == "allow" else on_timeout
+        if event.event_type == "llm_before":
+            wait_ms = max(wait_ms, self._llm_before_wait)
+            if context_snapshot.max_tool_risk in (
+                ToolRiskTier.CRITICAL,
+                ToolRiskTier.HIGH,
+            ):
+                wait_ms = max(wait_ms, self._medium_wait)
+                on_timeout = "pause" if on_timeout == "allow" else on_timeout
 
+        # Ask for the jailbreak classifier on top of the other DEEP rules.
         if context_snapshot.requests_system_info:
             required_rules.add("hf-jailbreak")
             wait_ms = max(wait_ms, self._medium_wait)

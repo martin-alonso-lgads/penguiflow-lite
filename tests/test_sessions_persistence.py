@@ -176,3 +176,62 @@ async def test_state_store_session_adapter_roundtrip() -> None:
     core_store.events.extend([extra, bad_payload])
     updates = await adapter.list_updates("s1")
     assert len(updates) == 1
+
+
+@pytest.fixture(params=["in_memory", "adapter"])
+def session_store(
+    request: pytest.FixtureRequest,
+) -> InMemorySessionStateStore | StateStoreSessionAdapter:
+    """A fresh session store of each implementation."""
+    if request.param == "in_memory":
+        return InMemorySessionStateStore()
+    return StateStoreSessionAdapter(InMemoryStateStore())
+
+
+@pytest.mark.asyncio
+async def test_update_cursor_on_other_task_applies_before_task_filter(
+    session_store: InMemorySessionStateStore | StateStoreSessionAdapter,
+) -> None:
+    """A ``since_id`` on another task's update still moves the cursor."""
+    updates = [
+        StateUpdate(
+            session_id="s1",
+            task_id=task_id,
+            update_type=UpdateType.STATUS_CHANGE,
+            content={"n": index},
+        )
+        for index, task_id in enumerate(["a", "a", "b", "a"])
+    ]
+    for update in updates:
+        await session_store.save_update(update)
+
+    listed = await session_store.list_updates(
+        "s1", task_id="a", since_id=updates[2].update_id
+    )
+
+    assert [u.update_id for u in listed] == [updates[3].update_id]
+
+
+@pytest.mark.asyncio
+async def test_steering_cursor_on_other_task_applies_before_task_filter(
+    session_store: InMemorySessionStateStore | StateStoreSessionAdapter,
+) -> None:
+    """A steering ``since_id`` on another task still moves the cursor."""
+    events = [
+        SteeringEvent(
+            session_id="s1",
+            task_id=task_id,
+            event_type=SteeringEventType.REDIRECT,
+            payload={"instruction": str(index)},
+            source="user",
+        )
+        for index, task_id in enumerate(["a", "a", "b", "a"])
+    ]
+    for event in events:
+        await session_store.save_steering(event)
+
+    listed = await session_store.list_steering(
+        "s1", task_id="a", since_id=events[2].event_id
+    )
+
+    assert [e.event_id for e in listed] == [events[3].event_id]

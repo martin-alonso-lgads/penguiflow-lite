@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
+from pydantic import ValidationError
 from typing_extensions import override
 
 from penguiflow.artifacts import NoOpArtifactStore
@@ -26,6 +27,9 @@ from penguiflow.sessions.task_service import (
 from penguiflow.sessions.task_tools import (
     SUBAGENT_FLAG_KEY,
     TASK_SERVICE_KEY,
+    TasksApplyGroupArgs,
+    TasksApplyPatchArgs,
+    TasksSpawnArgs,
     build_task_tool_specs,
 )
 
@@ -587,3 +591,33 @@ async def test_tasks_get_group() -> None:
     assert result.group_id == "g1"
     assert result.name == "test-group"
     assert result.status == "open"
+
+
+@pytest.mark.parametrize("name", ["APPEND", "Append", "append"])
+def test_spawn_args_accept_merge_strategy_in_any_case(name: str) -> None:
+    """Merge strategy names are accepted in any case."""
+    args = TasksSpawnArgs.model_validate(
+        {"query": "x", "merge_strategy": name, "group_merge_strategy": name}
+    )
+    assert args.merge_strategy == MergeStrategy.APPEND
+    assert args.group_merge_strategy == MergeStrategy.APPEND
+
+
+def test_patch_and_group_args_accept_upper_case_strategy() -> None:
+    """Apply-patch and apply-group strategies take upper-case names too."""
+    patch = TasksApplyPatchArgs.model_validate(
+        {"patch_id": "p1", "strategy": "HUMAN_GATED"}
+    )
+    group = TasksApplyGroupArgs.model_validate(
+        {"group_id": "g1", "strategy": "REPLACE"}
+    )
+    assert patch.strategy == MergeStrategy.HUMAN_GATED
+    assert group.strategy == MergeStrategy.REPLACE
+
+
+def test_spawn_args_reject_unknown_merge_strategy() -> None:
+    """An unknown strategy name is still a validation error."""
+    with pytest.raises(ValidationError):
+        TasksSpawnArgs.model_validate(
+            {"query": "x", "merge_strategy": "merge"}
+        )

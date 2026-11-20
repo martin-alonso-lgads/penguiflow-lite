@@ -1,6 +1,6 @@
 ---
 name: penguiflow-background-tasks
-description: Run background work from a PenguiFlow ReactPlanner — add the `tasks.*` tools with `build_task_tool_specs()`, back them with `InProcessTaskService(sessions=SessionManager(limits=SessionLimits(...)), planner_factory=..., tool_job_factory=...)` (or your own `TaskService`), pass `tool_context["task_service"]` and `session_id`, spawn subagents (`query`) or tool jobs (`tool_name` + `tool_args`), pick a lowercase merge strategy (`human_gated`/`append`/`replace`), group tasks, let tools opt in with `extra["background"]`, and configure `BackgroundTasksConfig` (prompt guidance, tool background, group defaults). Use when a user says "background task", "spawn a subagent", "async tool", "task groups", "proactive report", or names `BackgroundTasksConfig`, `tasks.spawn`, `task.subagent`, `TaskService`.
+description: Run background work from a PenguiFlow ReactPlanner — add the `tasks.*` tools with `build_task_tool_specs()`, back them with `InProcessTaskService(sessions=SessionManager(limits=SessionLimits(...)), planner_factory=..., tool_job_factory=...)` (or your own `TaskService`), pass `tool_context["task_service"]` and `session_id`, spawn subagents (`query`) or tool jobs (`tool_name` + `tool_args`), pick a merge strategy (`human_gated`/`append`/`replace`, any case), group tasks, let tools opt in with `extra["background"]`, and configure `BackgroundTasksConfig` (prompt guidance, tool background, group defaults). Use when a user says "background task", "spawn a subagent", "async tool", "task groups", "proactive report", or names `BackgroundTasksConfig`, `tasks.spawn`, `task.subagent`, `TaskService`.
 ---
 
 # PenguiFlow Background Tasks
@@ -74,13 +74,13 @@ A subagent starts from the **session's** context (`session.update_context(...)`)
 
 Other args: `priority`, `merge_strategy`, `propagate_on_cancel` (`cascade`/`isolate`), `notify_on_complete`, `context_depth` (`full`/`summary`/`none`, subagents only), `task_id`/`idempotency_key`, and the group args. The `task.subagent` / `task.tool` action opcodes are rewritten into `tasks.spawn` calls.
 
-### 4) Pick a merge strategy (per task, lowercase)
+### 4) Pick a merge strategy (per task)
 | `merge_strategy` | What happens when the task completes |
 |---|---|
 | `human_gated` (default) | The result is held as a pending patch and a `CHECKPOINT` update (`kind: "context_patch"`, `patch_id`) is published. Approve with `tasks.apply_patch(patch_id=..., action="apply")`, `task_service.apply_patch(...)`, or an `APPROVE` steering event whose payload carries the `patch_id`. |
-| `append` / `replace` | The result goes straight into the session's `background_results`. The in-process service treats both the same way. |
+| `append` / `replace` | The result goes straight into the session's `background_results`. Both behave the same: the latest result per task wins. |
 
-Merged results are in `session.get_background_results()`. The planner does **not** put them in the foreground prompt. The model reads them with `tasks.get(task_id=..., include_result=True)`, and proactive reporting tells the user about them (`references/config-and-policies.md`). Call `tasks.acknowledge_background` to drop consumed results.
+Merged results are in `session.get_background_results()`. Strategy names are accepted in any case (`"APPEND"`, `"append"`); the enum values are lowercase. The planner shows merged results to the foreground LLM as a read-only `<read_only_background_results>` system message (summary, facts and artifact references, newest 20; the raw payload stays out, and `tasks.get(task_id=..., include_result=True)` returns it). Proactive reporting tells the user about them (`references/config-and-policies.md`). Call `tasks.acknowledge_background` to drop consumed results, which also removes them from the prompt.
 
 ### 5) Group related tasks
 Spawn with the same `group="market_q3"` in one turn, seal with `group_sealed=True` on the last spawn or `tasks.seal_group(group=...)`, and approve a human-gated group with `tasks.apply_group(group_id=..., action="apply")`. A new group takes its merge and report strategies from `background_config` unless the spawn sets `group_merge_strategy` / `group_report`. Details: `references/groups-and-merge.md`.
@@ -102,7 +102,7 @@ The call then returns `{"task_id": ..., "status": "PENDING", "message": "spawned
 - **`background_tasks_unavailable` / `tool_background_unavailable`**: the service has no subagent planner factory, or no `tool_job_factory`.
 - **`task_limit_exceeded` / `background_task_limit_exceeded` / `pending_patch_limit_exceeded`**: a `SessionLimits` cap was hit.
 - **Task FAILED with error `timeout`**: it ran longer than `SessionLimits.max_task_runtime_s`.
-- **Spawn fails validation**: a job without `tool_args`, an uppercase `merge_strategy`, or `retain_turn=True` with a human-gated strategy.
+- **Spawn fails validation**: a job without `tool_args`, an unknown `merge_strategy`, or `retain_turn=True` with a human-gated strategy.
 - **`ValidationError` building `BackgroundTasksConfig`**: a removed field; move it (see `references/config-and-policies.md`).
 - **Results pile up**: tasks are `human_gated` and nobody approves them. Build the approval UI, or use `append` for trusted tasks.
 - **`tasks.apply_group` returns `group_not_complete`**: the group isn't sealed, or some tasks are still running.

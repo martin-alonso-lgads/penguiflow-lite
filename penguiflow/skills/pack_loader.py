@@ -149,6 +149,14 @@ def _default_skill_name(
     return f"pack.{pack_name}.{_slugify(base)}"
 
 
+def _unique_name(name: str, seen_names: set[str]) -> str:
+    """Return ``name_2``, ``name_3``, ... : the first one not yet used."""
+    suffix = 2
+    while f"{name}_{suffix}" in seen_names:
+        suffix += 1
+    return f"{name}_{suffix}"
+
+
 class SkillPackLoader:
     """Loads skill definitions from a pack of markdown/YAML/JSON files."""
 
@@ -197,7 +205,18 @@ class SkillPackLoader:
             name = _default_skill_name(data, pack_name=pack.name, path=path)
         name = name.strip()
         if name in seen_names:
-            name = f"{name}_{idx + 1}"
+            unique = _unique_name(name, seen_names)
+            logger.warning(
+                "skill_pack_duplicate_name",
+                extra={
+                    "pack": pack.name,
+                    "path": str(path),
+                    "entry": idx,
+                    "skill_name": name,
+                    "renamed_to": unique,
+                },
+            )
+            name = unique
         seen_names.add(name)
         data["name"] = name
         try:

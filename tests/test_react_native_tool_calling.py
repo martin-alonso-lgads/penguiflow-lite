@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -15,7 +16,20 @@ from penguiflow.llm.profiles import ModelProfile, register_profile
 from penguiflow.llm.protocol import NativeToolCallResult
 from penguiflow.llm.types import ToolCallPart
 from penguiflow.node import Node
-from penguiflow.planner import ReactPlanner
+from penguiflow.planner import PlannerFinish, ReactPlanner
+from penguiflow.planner.guardrails import (
+    AsyncRuleEvaluator,
+    GuardrailAction,
+    GuardrailDecision,
+    GuardrailEvent,
+    GuardrailGateway,
+    GuardrailSeverity,
+    RetrySpec,
+    RuleCost,
+    RuleRegistry,
+    StopSpec,
+)
+from penguiflow.planner.guardrails.protocols import GuardrailRule
 from penguiflow.planner.models import (
     JSONLLMClient,
     NativeToolsLLMClient,
@@ -28,6 +42,7 @@ from penguiflow.planner.react_step_native import (
     resolve_native_eligibility,
 )
 from penguiflow.registry import ModelRegistry
+from penguiflow.steering import InMemoryGuardInbox
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -973,3 +988,135 @@ class TestNativeStructuredFinal:
         ]
         assert repaired and repaired[0].extra["repaired"] is True
         assert len(client.complete_calls) == 1  # one repair turn issued
+
+
+class _NativeGuardRule(GuardrailRule):
+    """FAST guardrail rule with one fixed decision per event type."""
+
+    rule_id = "native-guard"
+    version = "1"
+    enabled = True
+    cost = RuleCost.FAST
+    severity = GuardrailSeverity.HIGH
+
+    def __init__(
+        self, decisions: Mapping[str, GuardrailDecision | None]
+    ) -> None:
+        self.supports_event_types = frozenset(decisions)
+        self._decisions = dict(decisions)
+        self.texts: list[tuple[str, str | None]] = []
+
+    @override
+    async def evaluate(
+        self, event: GuardrailEvent, context_snapshot: object
+    ) -> GuardrailDecision | None:
+        self.texts.append((event.event_type, event.text_content))
+        decision = self._decisions.get(event.event_type)
+        if event.event_type == "llm_stream_chunk" and "BAD" not in (
+            event.text_content or ""
+        ):
+            return None
+        return decision
+
+
+def _native_gateway(rule: GuardrailRule) -> GuardrailGateway:
+    registry = RuleRegistry()
+    registry.register(rule)
+    return GuardrailGateway(
+        registry=registry,
+        guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(registry)),
+    )
+
+
+def _native_stop() -> GuardrailDecision:
+    return GuardrailDecision(
+        action=GuardrailAction.STOP,
+        rule_id="native-guard",
+        reason="blocked",
+        stop=StopSpec(user_message="Blocked by policy."),
+    )
+
+
+class TestNativeGuardrails:
+    """Guardrails in native tool-calling mode."""
+
+    @pytest.mark.asyncio
+    async def test_llm_before_stop_ends_run_without_calling_llm(self) -> None:
+        """An ``llm_before`` STOP ends the run before the LLM is called."""
+        client = StubNativeClient([NativeToolCallResult(content="never")])
+        rule = _NativeGuardRule({"llm_before": _native_stop()})
+        planner = make_native_planner(
+            client, max_iters=2, guardrail_gateway=_native_gateway(rule)
+        )
+
+        result = await planner.run("hi")
+
+        assert isinstance(result, PlannerFinish)
+        assert result.reason == "no_path"
+        assert result.metadata["guardrail"]["rule_id"] == "native-guard"
+        assert client.tool_declarations == []
+
+    @pytest.mark.asyncio
+    async def test_llm_before_retry_adds_corrective_message(self) -> None:
+        """An ``llm_before`` RETRY sends its corrective message."""
+        client = StubNativeClient([NativeToolCallResult(content="ok")])
+        retry = GuardrailDecision(
+            action=GuardrailAction.RETRY,
+            rule_id="native-guard",
+            reason="rephrase",
+            retry=RetrySpec(corrective_message="Stay on topic."),
+        )
+        rule = _NativeGuardRule({"llm_before": retry})
+        planner = make_native_planner(
+            client, max_iters=2, guardrail_gateway=_native_gateway(rule)
+        )
+
+        await planner.run("hi")
+
+        sent = client.tools_call_messages[0]
+        assert any(m.get("content") == "Stay on topic." for m in sent)
+
+    @pytest.mark.asyncio
+    async def test_stream_stop_ends_the_run(self) -> None:
+        """A STOP on a streamed chunk replaces the streamed answer."""
+        events: list[PlannerEvent] = []
+        client = StubNativeClient([NativeToolCallResult(content="BAD answer")])
+        rule = _NativeGuardRule({"llm_stream_chunk": _native_stop()})
+        planner = make_native_planner(
+            client,
+            max_iters=2,
+            stream_final_response=True,
+            event_callback=events.append,
+            guardrail_gateway=_native_gateway(rule),
+        )
+
+        result = await planner.run("hi")
+
+        assert isinstance(result, PlannerFinish)
+        assert result.reason == "no_path"
+        assert result.payload["raw_answer"] == "Blocked by policy."
+        assert ("llm_stream_chunk", "BAD answer") in rule.texts
+
+    def test_stream_chunks_are_emitted_before_the_run_returns(self) -> None:
+        """Guarded chunks are flushed within the run, not left queued."""
+        events: list[PlannerEvent] = []
+        client = StubNativeClient(
+            [NativeToolCallResult(content="Fine answer")]
+        )
+        rule = _NativeGuardRule({"llm_stream_chunk": None})
+        planner = make_native_planner(
+            client,
+            max_iters=2,
+            stream_final_response=True,
+            event_callback=events.append,
+            guardrail_gateway=_native_gateway(rule),
+        )
+
+        asyncio.run(planner.run("hi"))
+
+        streamed = "".join(
+            str(e.extra.get("text", ""))
+            for e in events
+            if e.event_type == "llm_stream_chunk"
+        )
+        assert "Fine answer" in streamed

@@ -137,8 +137,10 @@ The `StreamingSession` manages the lifecycle of tasks and provides the execution
 
 #### Merge Strategies
 - **HUMAN_GATED**: Results require human approval before merging
-- **APPEND**: Results are appended to existing context
-- **REPLACE**: Results replace existing context
+- **APPEND**: Results are merged as soon as the task completes (latest result per task)
+- **REPLACE**: Currently the same as APPEND
+
+Merged results are shown to the foreground LLM as a read-only `<read_only_background_results>` system message until acknowledged.
 
 ## Data Flow and Interactions
 

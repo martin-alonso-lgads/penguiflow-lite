@@ -398,6 +398,7 @@ def _init_memory(
     planner.memory_config = ShortTermMemoryConfig()
     planner.memory_singleton = None
     planner.memory_by_key = {}
+    planner.memory_persist_tasks = {}
     planner.memory_ephemeral_key = None
     planner.memory_summarizer_client = None
     planner.memory_summarizer = None

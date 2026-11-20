@@ -51,6 +51,7 @@ from .models import (
     ToolSearchConfig,
     ToolVisibilityPolicy,
 )
+from .react_step import GUARDRAIL_STOP_KEY
 from .react_utils import _serialize_validation_errors
 from .streaming import _StreamingArgsExtractor
 from .tool_aliasing import build_aliased_tool_catalog, rewrite_action_node
@@ -1191,7 +1192,7 @@ def _end_guardrail_run(
     gateway = planner.guardrail_gateway
     run_id = _guardrail_run_id(trajectory)
     if gateway is not None and run_id is not None:
-        gateway.end_run(run_id)
+        gateway.end_run(run_id, planner.guardrail_context)
 
 
 def _fire_persistence_tasks(
@@ -2008,12 +2009,9 @@ async def _revise_answer(
                     event_type="llm_stream_chunk",
                     ts=planner.time_source(),
                     trajectory_step=len(trajectory.steps),
-                    extra={
-                        "text": args_text,
-                        "done": False,
-                        "phase": "revision",
-                        "revision_idx": _revision_idx + 1,
-                    },
+                    extra=revision_chunk_extra(
+                        args_text, done=False, revision_idx=_revision_idx + 1
+                    ),
                 )
             )
 
@@ -2023,12 +2021,9 @@ async def _revise_answer(
                     event_type="llm_stream_chunk",
                     ts=planner.time_source(),
                     trajectory_step=len(trajectory.steps),
-                    extra={
-                        "text": "",
-                        "done": True,
-                        "phase": "revision",
-                        "revision_idx": _revision_idx + 1,
-                    },
+                    extra=revision_chunk_extra(
+                        "", done=True, revision_idx=_revision_idx + 1
+                    ),
                 )
             )
 
@@ -2458,6 +2453,54 @@ async def run_loop(
         planner.active_tracker = None
 
 
+def revision_chunk_extra(
+    text: str, *, done: bool, revision_idx: int
+) -> dict[str, Any]:
+    """Return the ``extra`` of a streamed reflection-revision chunk.
+
+    The ``revision`` channel makes sessions project the chunk as answer
+    text (``UpdateType.RESULT``), like the first answer's chunks.
+    """
+    return {
+        "text": text,
+        "done": done,
+        "phase": "revision",
+        "channel": "revision",
+        "revision_idx": revision_idx,
+    }
+
+
+def _finish_guardrail_stop(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    guardrail_payload: Mapping[str, Any],
+    tracker: _ConstraintTracker,
+    *,
+    error: str,
+) -> PlannerFinish:
+    """End the run on a guardrail STOP, recording the decision.
+
+    Tool-side and LLM-side STOPs both finish with ``reason="no_path"``,
+    the stop message as ``raw_answer`` and ``metadata["guardrail"]``.
+    """
+    stop_message = None
+    stop_info = guardrail_payload.get("stop")
+    if isinstance(stop_info, Mapping):
+        stop_message = stop_info.get("user_message")
+    return planner.finish(
+        trajectory,
+        reason="no_path",
+        payload={
+            "raw_answer": stop_message or "Unable to complete the request.",
+            "guardrail": dict(guardrail_payload),
+        },
+        thought=str(guardrail_payload.get("reason") or "guardrail_stop"),
+        constraints=tracker,
+        error=error,
+        metadata_extra={"guardrail": dict(guardrail_payload)},
+    )
+
+
 async def _run_step(
     planner: ReactPlanner, trajectory: Trajectory, state: _LoopState
 ) -> PlannerFinish | PlannerPause | None:
@@ -2481,6 +2524,15 @@ async def _run_step(
     step_start_ts, current_action_seq = _emit_step_start(planner, trajectory)
 
     action = await _select_action(planner, trajectory, state)
+    guardrail_stop = trajectory.metadata.pop(GUARDRAIL_STOP_KEY, None)
+    if isinstance(guardrail_stop, Mapping):
+        return _finish_guardrail_stop(
+            planner,
+            trajectory,
+            guardrail_stop,
+            state.tracker,
+            error=f"guardrail_stop:{guardrail_stop.get('rule_id')}",
+        )
 
     # Normalize aliased tool names to their real names (RFC alignment)
     tool_aliases = getattr(planner, "tool_aliases", {})
@@ -3209,24 +3261,12 @@ async def _execute_tool_step(
             isinstance(guardrail_payload, Mapping)
             and guardrail_payload.get("action") == "STOP"
         ):
-            stop_message = None
-            stop_info = guardrail_payload.get("stop")
-            if isinstance(stop_info, Mapping):
-                stop_message = stop_info.get("user_message")
-            return planner.finish(
+            return _finish_guardrail_stop(
+                planner,
                 trajectory,
-                reason="no_path",
-                payload={
-                    "raw_answer": stop_message
-                    or "Unable to complete the request.",
-                    "guardrail": dict(guardrail_payload),
-                },
-                thought=str(
-                    guardrail_payload.get("reason") or "guardrail_stop"
-                ),
-                constraints=state.tracker,
+                guardrail_payload,
+                state.tracker,
                 error=outcome.error,
-                metadata_extra={"guardrail": dict(guardrail_payload)},
             )
         trajectory.steps.append(
             TrajectoryStep(

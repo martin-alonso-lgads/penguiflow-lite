@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from penguiflow.planner import PlannerEvent
+from penguiflow.planner.react_runtime import revision_chunk_extra
 from penguiflow.sessions.models import UpdateType
 from penguiflow.sessions.projections import PlannerEventProjector
 
@@ -73,3 +74,14 @@ def test_top_level_channel_wins_over_meta() -> None:
 
     assert update_type is UpdateType.THINKING
     assert content["channel"] == "thinking"
+
+
+@pytest.mark.parametrize("done", [False, True])
+def test_reflection_revision_chunks_project_as_result(*, done: bool) -> None:
+    """The planner's revision chunks are answer text, not thinking."""
+    extra = revision_chunk_extra("better answer", done=done, revision_idx=1)
+
+    update_type, _content = _project("llm_stream_chunk", extra)
+
+    assert extra["channel"] == "revision"
+    assert update_type == UpdateType.RESULT

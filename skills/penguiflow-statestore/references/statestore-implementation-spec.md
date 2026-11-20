@@ -1057,7 +1057,7 @@ result = _background_result_from_patch(patch, payload=payload, group_id=group_id
 self._context.background_results[result.task_id] = result
 ```
 
-Results are not written into `llm_context`. Legacy `llm_context["background_results"]` / `["background_result"]` entries are migrated into this mapping, and new task snapshots render the mapping back into the snapshot's `llm_context["background_results"]` as a list of payloads.
+Results are not written into `llm_context`. Legacy `llm_context["background_results"]` / `["background_result"]` entries are migrated into this mapping, and new task snapshots render the mapping back into the snapshot's `llm_context["background_results"]` as a list of payloads. The planner moves them into `Trajectory.background_results` and shows the unconsumed ones to the LLM as a read-only `<read_only_background_results>` system message (summary, facts and artifact references, without the raw payload).
 
 ### HUMAN_GATED Strategy
 

@@ -48,7 +48,7 @@ service = A2AService(
 ```
 Each A2A task drives one planner run:
 - The query is the joined text parts of the message (JSON of the data parts if there is no text).
-- `tool_context` gets `tenant`, `session_id` (= A2A `contextId`), `a2a_task_id`, `a2a_context_id`, `a2a` (the request envelope) and `delivery_channel="a2a"`. Using `contextId` as `session_id` serializes runs within one conversation and runs different conversations in parallel.
+- `tool_context` gets `tenant_id` and `tenant` (both the request tenant, or `A2AConfig.default_tenant`), `session_id` (= A2A `contextId`), `a2a_task_id`, `a2a_context_id`, `a2a` (the request envelope) and `delivery_channel="a2a"`. Using `contextId` as `session_id` serializes runs within one conversation and runs different conversations in parallel.
 - `PlannerFinish(answer_complete)` → `completed`, answer text as artifact `output-0` (full payload in `artifact.metadata["planner_payload"]`). `no_path` / `budget_exhausted` / exceptions → `failed`.
 - `PlannerPause` → `input-required` with the pause `prompt` as the status message; the next `SendMessage` to that `taskId` resumes the planner with the message text as `user_input`.
 - `CancelTask` cancels the run through its `SteeringInbox` → `cancelled`.

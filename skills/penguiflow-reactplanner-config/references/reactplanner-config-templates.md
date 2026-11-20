@@ -55,7 +55,7 @@ ALWAYS_VISIBLE_PATTERNS = [
 Notes:
 - `ToolSearchConfig.always_loaded_patterns` uses glob patterns (via `fnmatch`).
 - Only add rich output tools to the always-visible set if rich output is enabled.
-- There is no `finish` tool: the planner ends a run with the `final_response` opcode, which isn't in the catalog and can't be hidden. (The default `always_loaded_patterns` still lists `"finish"`; it is harmless.)
+- There is no `finish` tool: the planner ends a run with the `final_response` opcode, which isn't in the catalog and can't be hidden. The default `always_loaded_patterns` is `["tasks.*", "tool_search", "tool_get"]`.
 
 ## Native LLM: minimal configuration
 

@@ -756,7 +756,7 @@ class ToolSearchConfig(BaseModel):
         ),
     )
     always_loaded_patterns: list[str] = Field(
-        default=["tasks.*", "tool_search", "tool_get", "finish"],
+        default=["tasks.*", "tool_search", "tool_get"],
         description=(
             "Name patterns for tools that are always loaded regardless of "
             "loading mode."

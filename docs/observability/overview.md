@@ -87,7 +87,7 @@ See:
 
 ### LLM layer: `LLMEvent`
 
-The native LLM layer exposes low-overhead hook-based telemetry through `TelemetryHooks`.
+The native LLM layer exposes low-overhead hook-based telemetry through `TelemetryHooks`. The hooks see both `LLMClient` calls and the planner's own LLM calls (`NativeLLMAdapter` and the LiteLLM client), each as `request_start`, then `retry` per backoff retry, then `request_end` (with `cost` and `attempts`) or `error`.
 
 Typical LLM events include:
 

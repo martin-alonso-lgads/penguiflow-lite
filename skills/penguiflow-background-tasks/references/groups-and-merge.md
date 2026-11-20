@@ -28,14 +28,14 @@ Each task's result still merges by that task's own `merge_strategy` (default `hu
 - **The report.** A `human_gated` group publishes a `CHECKPOINT` (`kind: "group_approval"`) instead of a synthesized report.
 - **`retain_turn`.** Waiting happens only for `append`/`replace` groups. The spawn args reject `retain_turn=True` when the strategy is `human_gated`.
 
-Human-gated patches from a group's tasks are collected in `TaskGroup.patches`. `tasks.apply_group(group_id=..., action="apply" | "reject", strategy=None)` handles them all at once, and only once the group is complete (otherwise `group_not_complete`).
+Human-gated patches from a group's tasks are collected in `TaskGroup.patches`. `tasks.apply_group(group_id=..., action="apply" | "reject", strategy=None)` handles them all at once, and only once the group is complete (otherwise `group_not_complete`). It goes through `session.apply_group_patches`: each rejected patch publishes a "Context patch rejected" notification, and approving a human-gated group switches it to `append` and queues its synthesis report.
 
 ## Merge strategies
 
-Values are lowercase (`MergeStrategy.HUMAN_GATED == "human_gated"`).
+Values are lowercase (`MergeStrategy.HUMAN_GATED == "human_gated"`); the `tasks.*` tool args and the proactive `strategies` accept names in any case (`parse_merge_strategy` in `penguiflow.sessions.models` does the parsing).
 
 ### `human_gated` (default)
-The patch waits in `session.pending_patches` as a `PendingContextPatch`: `patch_id`, `task_id`, `patch`, `strategy`, `created_at`. The session publishes a `CHECKPOINT` update with this content: `kind: "context_patch"`, `patch_id`, `task_id`, `digest`, `diverged`, `prompt`, `options: ["approve", "reject"]`.
+The patch waits in `session.pending_patches` as a `PendingContextPatch`: `patch_id`, `task_id`, `patch`, `strategy`, `payload`, `group_id`, `created_at`. On approval the merged result keeps the task's `payload` and `group_id`. The session publishes a `CHECKPOINT` update with this content: `kind: "context_patch"`, `patch_id`, `task_id`, `digest`, `diverged`, `prompt`, `options: ["approve", "reject"]`.
 
 To approve or reject, use one of:
 - the tool `tasks.apply_patch(patch_id=..., action="apply" | "reject")`;
@@ -45,7 +45,7 @@ To approve or reject, use one of:
 An approved patch is merged as `append` unless you pass `strategy`. Use this strategy for anything whose result changes what the user sees or what the agent does next.
 
 ### `append` / `replace`
-The result is stored at once as a `BackgroundTaskResult` in the session's `background_results[task_id]`, with `summary` (from the digest), `payload`, `facts` and `artifacts`. The in-process session handles both strategies the same way. Use them for trusted, idempotent enrichment.
+The result is stored at once as a `BackgroundTaskResult` in the session's `background_results[task_id]`, with `summary` (from the digest), `payload`, `facts` and `artifacts`. Both strategies behave the same: a task's later result replaces its earlier one. Use them for trusted, idempotent enrichment.
 
 ### Context divergence
 A patch remembers the context version and hash its task started from. If the session context changed since then, the patch gets `context_diverged=True`, and a warning `NOTIFICATION` ("Context changed") is published.

@@ -187,6 +187,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger("penguiflow.planner")
 
 
+_DEFAULT_GUARDRAIL_RULE_IDS = frozenset({"__default__", "__skip__"})
+
+
+def _log_guardrail_decision(
+    decision: GuardrailDecision, event: GuardrailEvent, *, enforced: bool
+) -> None:
+    """Log a rule's decision (and, when not enforced, its shadow)."""
+    if decision.rule_id in _DEFAULT_GUARDRAIL_RULE_IDS:
+        return  # No rule decided anything.
+    extra = {
+        "event_type": event.event_type,
+        "run_id": event.run_id,
+        "action": decision.action.value,
+        "rule_id": decision.rule_id,
+        "reason": decision.reason,
+    }
+    logger.info("guardrail_decision", extra={**extra, "enforced": enforced})
+    if not enforced and decision.action.value != "ALLOW":
+        logger.info("guardrail_decision_shadow", extra=extra)
+
+
 class _GuardrailStreamHandler:
     """Serializes guardrail evaluation for streamed LLM chunks."""
 
@@ -414,6 +435,7 @@ class ReactPlanner:
     max_consecutive_arg_failures: int
     max_iters: int
     memory_by_key: dict[str, ShortTermMemory]
+    memory_persist_tasks: dict[str, asyncio.Task[None]]
     memory_config: ShortTermMemoryConfig
     memory_ephemeral_key: MemoryKey | None
     memory_singleton: ShortTermMemory | None
@@ -809,6 +831,7 @@ class ReactPlanner:
                 # same memory map so callers that reuse a single ReactPlanner
                 # can still access `_memory_by_key` after a run.
                 planner.memory_by_key = self.memory_by_key
+                planner.memory_persist_tasks = self.memory_persist_tasks
                 self._session_planners[session_id] = planner
             return lock, planner
 
@@ -1503,14 +1526,23 @@ class ReactPlanner:
     async def evaluate_guardrail(
         self, event: GuardrailEvent
     ) -> GuardrailDecision | None:
-        """Evaluate a guardrail event, if guardrails are enabled."""
+        """Evaluate a guardrail event, if guardrails are enabled.
+
+        Every decision a rule made is logged as ``guardrail_decision``; in
+        shadow mode a decision that would have changed the run is also
+        logged as ``guardrail_decision_shadow``.
+        """
         if not self.guardrails_enabled():
             return None
         gateway = self.guardrail_gateway
         ctx = self.guardrail_context
         if gateway is None or ctx is None:
             return None
-        return await gateway.evaluate(ctx, event)
+        decision = await gateway.evaluate(ctx, event)
+        _log_guardrail_decision(
+            decision, event, enforced=self.guardrails_enforced()
+        )
+        return decision
 
     def guardrail_decision_payload(
         self, decision: GuardrailDecision
@@ -1557,10 +1589,15 @@ class ReactPlanner:
     def enqueue_llm_stream_chunk(
         self, trajectory: Trajectory, payload: dict[str, Any]
     ) -> None:
-        """Queue an LLM stream chunk, via the guardrail stream if enabled."""
+        """Queue an LLM stream chunk, via the guardrail stream if enabled.
+
+        With guardrails (enforced or shadow) the chunk is evaluated before
+        it is emitted; the caller must ``await finalize_guardrail_stream()``
+        once the LLM call is over.
+        """
         if self.event_callback is None:
             return
-        if not self.guardrails_enabled() or not self.guardrails_enforced():
+        if not self.guardrails_enabled():
             self.emit_event(
                 PlannerEvent(
                     event_type="llm_stream_chunk",
@@ -1591,6 +1628,8 @@ class ReactPlanner:
             trajectory=trajectory,
         )
         decision = await self.evaluate_guardrail(event)
+        if not self.guardrails_enforced():
+            decision = None  # Shadow mode: evaluated and logged only.
         if decision and decision.action.value == "STOP":
             self.guardrail_stream_decision = decision
             return

@@ -566,7 +566,7 @@ async def _process_component_payload(
 
     try:
         runtime.validate_component(
-            component, resolved_props, tool_context=ctx.tool_context
+            component, resolved_props, tool_context=ctx.run_state
         )
     except RichOutputValidationError as exc:
         hint = _validation_hint(exc, component, source_tool=source_tool)
@@ -781,7 +781,7 @@ async def ui_form(args: UIFormArgs, ctx: ToolContext) -> UIInteractionResult:
     _ensure_enabled()
 
     props = args.model_dump(by_alias=True, exclude_none=True)
-    runtime.validate_component("form", props, tool_context=ctx.tool_context)
+    runtime.validate_component("form", props, tool_context=ctx.run_state)
 
     await ctx.pause(
         "await_input",
@@ -808,7 +808,7 @@ async def ui_confirm(
     _ensure_enabled()
 
     props = args.model_dump(by_alias=True, exclude_none=True)
-    runtime.validate_component("confirm", props, tool_context=ctx.tool_context)
+    runtime.validate_component("confirm", props, tool_context=ctx.run_state)
 
     await ctx.pause(
         "await_input",
@@ -836,7 +836,7 @@ async def ui_select_option(
 
     props = args.model_dump(by_alias=True, exclude_none=True)
     runtime.validate_component(
-        "select_option", props, tool_context=ctx.tool_context
+        "select_option", props, tool_context=ctx.run_state
     )
 
     await ctx.pause(

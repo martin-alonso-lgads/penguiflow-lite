@@ -95,7 +95,7 @@ A guardrail rule that returns `PAUSE` on `tool_call_start` (before the tool runs
     }
 }
 ```
-Show `pause["prompt"]` and check `pause["approver_roles"]` in your UI. `timeout_s` is informational: nothing expires the pause, so enforce it yourself if you need it. Resume as usual. The tool call that triggered the pause has no result in the trajectory, so the model may call it again, and the rule is evaluated again. Guardrail pauses need `pause_enabled=True` like any other pause.
+Show `pause["prompt"]` and check `pause["approver_roles"]` in your UI. `timeout_s` is informational: nothing expires the pause, so enforce it yourself if you need it. Resume as usual. The tool call that triggered the pause has no result in the trajectory, so the model may call it again, and the rule is evaluated again. With `pause_enabled=False`, a guardrail PAUSE doesn't pause: it becomes a STOP, and the run finishes `no_path` with the pause prompt as `raw_answer` and `metadata["guardrail"]` showing `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
 
 ### 5) Make `resume_token` survive restarts
 Pause records live in memory on the planner by default. For multi-worker or restart-prone deployments, give the planner a `StateStore` that implements `SupportsPlannerState`:

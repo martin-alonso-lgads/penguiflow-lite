@@ -27,7 +27,7 @@ The planner detects the methods by duck typing. When it has a `state_store` and 
 
 The `key` argument is the `MemoryKey` composite (`"{tenant_id}:{user_id}:{session_id}"`), but the contract allows arbitrary composite keys — see "Reserved keyspace" below. `state` is the `DefaultShortTermMemory.to_dict()` snapshot (`version`, `health`, `summary`, `turns`, `pending`, `backlog`, `config_snapshot`).
 
-**Caution with `rolling_summary`:** the state is saved right after the turn is added, before the background summarization finishes, and the next run's load replaces the in-process state. In the current code the summary therefore never reaches the store or the prompt, and older turns pile up in `pending_turns` until `total_max_tokens` trims them. With a `state_store`, prefer `truncation`.
+**With `rolling_summary`:** the state is saved right after the turn is added, and saved again in the background once the summarization is done. The next run on the same planner waits for that second save before it loads, so the summary reaches both the store and the prompt. Across processes the store is last-write-wins: a worker that loads before another worker's summary save completes sees the turns as `pending_turns` and summarizes them itself.
 
 ## Reserved keyspace: `kv:v1:`
 

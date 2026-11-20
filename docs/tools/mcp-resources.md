@@ -45,6 +45,8 @@ ToolNode also exposes programmatic methods:
 - `await tool_node.subscribe_resource(uri, callback=None)`
 - `await tool_node.unsubscribe_resource(uri)`
 
+With `AuthType.OAUTH2_USER`, each user has their own MCP session: pass `ctx=` to `list_resources`, `list_resource_templates`, `subscribe_resource` and `unsubscribe_resource` so the call uses that user's session (`read_resource` already takes `ctx`). A subscription belongs to its session and ends when that session closes (`close()`, a reconnect, or a per-user session being replaced or evicted); subscribe again afterwards.
+
 ### Caching and artifacts
 
 `read_resource` uses a `ResourceCache`:
@@ -53,6 +55,8 @@ ToolNode also exposes programmatic methods:
 - binary and large text are stored as artifacts (`{"artifact": <ArtifactRef>}`)
 
 The inline threshold defaults to `ExternalToolConfig.artifact_extraction.resources.inline_text_if_under_chars`.
+
+Each MCP session has its own cache, so with `OAUTH2_USER` one user's reads are never served to another. Cached reads expire after `resources.cache_ttl_seconds` (default `3600`, `0` = no expiry), and `resources.cache_reads_to_artifacts=False` turns the read cache off.
 
 ## Operational defaults
 

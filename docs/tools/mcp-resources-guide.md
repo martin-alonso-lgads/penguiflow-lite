@@ -159,10 +159,12 @@ from penguiflow.tools.resources import ResourceCacheConfig
 cache_config = ResourceCacheConfig(
     enabled=True,                       # Enable caching
     max_entries=1000,                   # Maximum cached entries
-    ttl_seconds=3600,                   # Cache TTL (1 hour)
+    ttl_seconds=3600,                   # Cache TTL (1 hour, 0 = no expiry)
     inline_text_if_under_chars=10_000,  # Inline small text
 )
 ```
+
+ToolNode builds its caches from `ExternalToolConfig.artifact_extraction.resources` (see **ResourceHandlingConfig** below): `cache_reads_to_artifacts` sets `enabled`, `cache_ttl_seconds` sets `ttl_seconds`, and `inline_text_if_under_chars` is passed through. It keeps one cache per MCP session. With `AuthType.OAUTH2_USER` each user has their own session, so one user's inline text is never served to another; every other auth type shares one session and one cache.
 
 ### How Caching Works
 
@@ -171,6 +173,7 @@ cache_config = ResourceCacheConfig(
 3. **Binary content**: Stored in ArtifactStore, cache stores ArtifactRef
 4. **Small text**: Inlined directly in cache entry
 5. **Large text**: Stored in ArtifactStore as artifact
+6. **Expiry**: Entries older than `ttl_seconds` are fetched again (`0` = no expiry)
 
 ```python
 from penguiflow.tools.resources import ResourceCache
@@ -191,7 +194,7 @@ result = await cache.get_or_fetch(
 
 ### Cache Invalidation
 
-The cache invalidates entries when receiving MCP notifications:
+The cache invalidates entries when receiving MCP notifications. In a ToolNode, a server's `notifications/resources/updated` invalidates the cache of the session that received it; `node.handle_resource_updated(uri)` invalidates the URI in every session's cache. A session's cache goes away when the session closes.
 
 ```python
 # Manual invalidation
@@ -237,9 +240,9 @@ from penguiflow.tools.config import ResourceHandlingConfig
 
 config = ResourceHandlingConfig(
     enabled=True,                        # Enable resource link handling
-    auto_read_if_size_under_bytes=50000, # Auto-read small resources (0 = never)
     inline_text_if_under_chars=10_000,   # Inline small text responses
-    cache_reads_to_artifacts=True,       # Cache to artifact store
+    cache_reads_to_artifacts=True,       # Cache reads (False = read from the server every time)
+    cache_ttl_seconds=3600,              # Cached read lifetime (0 = until an update or the session closes)
 )
 ```
 
@@ -258,7 +261,6 @@ config = ExternalToolConfig(
     artifact_extraction=ArtifactExtractionConfig(
         resources=ResourceHandlingConfig(
             enabled=True,
-            auto_read_if_size_under_bytes=100_000,
             inline_text_if_under_chars=5_000,
             cache_reads_to_artifacts=True,
         ),
@@ -275,14 +277,15 @@ from penguiflow.tools.presets import get_artifact_preset
 
 # Filesystem preset has resource-friendly settings
 preset = get_artifact_preset("filesystem")
-# auto_read_if_size_under_bytes=100_000
 # inline_text_if_under_chars=50_000
 # cache_reads_to_artifacts=True
 ```
 
 ## Subscriptions
 
-ToolNode supports resource subscriptions for real-time updates:
+ToolNode supports resource subscriptions for real-time updates. With a ToolNode, call `await node.subscribe_resource(uri, callback, ctx=ctx)` (pass `ctx` with `OAUTH2_USER`). The subscription belongs to the caller's MCP session and is dropped (and logged) when that session closes: on `close()`, on a reconnect, and when a per-user session is replaced or evicted. Subscribe again afterwards.
+
+The subscription manager underneath can also be used directly:
 
 ```python
 from penguiflow.tools.resources import ResourceSubscriptionManager
@@ -336,8 +339,9 @@ await sub_manager.subscribe(
 Beyond generated tools, you can access resources programmatically:
 
 ```python
-# List resources
-resources = await node.list_resources()
+# List resources (with OAUTH2_USER, pass ctx=ctx to use the caller's session;
+# the list is per user)
+resources = await node.list_resources(ctx=ctx)
 
 # List templates
 templates = await node.list_resource_templates()
@@ -390,17 +394,17 @@ ResourceCacheConfig(
 )
 ```
 
-### 2. Use Auto-Read Wisely
+### 2. Match the Read Cache to Freshness Needs
 
 ```python
-# For filesystem access with small files
+# Resources that change often
 ResourceHandlingConfig(
-    auto_read_if_size_under_bytes=50_000,  # Auto-read < 50KB
+    cache_ttl_seconds=60,  # Re-read after a minute
 )
 
-# For large binary resources
+# Always read from the server
 ResourceHandlingConfig(
-    auto_read_if_size_under_bytes=0,  # Never auto-read
+    cache_reads_to_artifacts=False,
 )
 ```
 

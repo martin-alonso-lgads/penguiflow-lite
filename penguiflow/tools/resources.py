@@ -30,6 +30,7 @@ __all__ = [
     "ResourceCacheConfig",
     "ResourceContents",
     "ResourceInfo",
+    "ResourceSubscriptionManager",
     "ResourceTemplateInfo",
 ]
 
@@ -149,8 +150,8 @@ class ResourceCacheConfig(BaseModel):
     max_entries: int = 1000
     """Maximum number of cached entries."""
 
-    ttl_seconds: int = 3600
-    """Time-to-live for cached entries (1 hour default)."""
+    ttl_seconds: int = Field(default=3600, ge=0)
+    """Seconds a cached entry stays valid (1 hour default, 0 = no expiry)."""
 
     inline_text_if_under_chars: int = 10_000
     """Inline text resources if under this size."""
@@ -185,25 +186,30 @@ class ResourceCache:
     content may be inlined.
 
     The cache invalidates entries on `resources/updated` notifications
-    from the MCP server.
+    from the MCP server, and drops entries older than
+    ``ResourceCacheConfig.ttl_seconds``. A ToolNode keeps one cache per MCP
+    session, so one user's reads are never served to another user.
     """
 
     def __init__(
         self,
         namespace: str,
         config: ResourceCacheConfig | None = None,
+        *,
+        time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize the resource cache.
 
         Args:
             namespace: ToolNode namespace for artifact naming
             config: Cache configuration
+            time_source: Clock used for entry ages and access times.
         """
         self._namespace = namespace
         self._config = config or ResourceCacheConfig()
         self._entries: dict[str, _CacheEntry] = {}
         self._lock = asyncio.Lock()
-        self._time_source = time.monotonic
+        self._time_source = time_source
 
     async def get_or_fetch(
         self,
@@ -228,21 +234,43 @@ class ResourceCache:
             )
 
         async with self._lock:
-            entry = self._entries.get(uri)
-            if entry is not None:
-                # Check if artifact still exists
-                if entry.artifact_ref is not None:
-                    if await ctx.artifacts.exists(entry.artifact_ref.id):
-                        entry.last_accessed = self._time_source()
-                        return {"artifact": entry.artifact_ref.model_dump()}
-                    # Artifact expired/deleted - refetch
-                    del self._entries[uri]
-                elif entry.inline_text is not None:
-                    entry.last_accessed = self._time_source()
-                    return {"text": entry.inline_text}
+            cached = await self._cached_result(uri, ctx)
+        if cached is not None:
+            return cached
 
         # Not in cache or expired - fetch
         return await self._fetch_and_store(uri, read_fn, ctx)
+
+    async def _cached_result(
+        self, uri: str, ctx: ToolContext
+    ) -> dict[str, Any] | None:
+        """Return the live cached result for ``uri``, dropping stale ones."""
+        entry = self._live_entry(uri)
+        if entry is None:
+            return None
+        if entry.artifact_ref is not None:
+            if await ctx.artifacts.exists(entry.artifact_ref.id):
+                entry.last_accessed = self._time_source()
+                return {"artifact": entry.artifact_ref.model_dump()}
+            # Artifact expired/deleted - refetch
+            del self._entries[uri]
+            return None
+        if entry.inline_text is not None:
+            entry.last_accessed = self._time_source()
+            return {"text": entry.inline_text}
+        return None
+
+    def _live_entry(self, uri: str) -> _CacheEntry | None:
+        """Return the entry for ``uri`` unless it outlived the TTL."""
+        entry = self._entries.get(uri)
+        if entry is None:
+            return None
+        ttl = self._config.ttl_seconds
+        if ttl > 0 and self._time_source() - entry.created_at >= ttl:
+            del self._entries[uri]
+            logger.debug("Expired resource cache entry: %s", uri)
+            return None
+        return entry
 
     async def _fetch_and_store(
         self,
@@ -474,6 +502,19 @@ class ResourceSubscriptionManager:
     def subscribed_uris(self) -> list[str]:
         """List of currently subscribed URIs."""
         return list(self._subscriptions.keys())
+
+    def clear(self) -> list[str]:
+        """Forget every subscription without contacting the server.
+
+        Used when the MCP session closes: the server drops a session's
+        subscriptions with it, so a new session must subscribe again.
+
+        Returns:
+            The URIs that were subscribed.
+        """
+        uris = list(self._subscriptions)
+        self._subscriptions.clear()
+        return uris
 
     def is_subscribed(self, uri: str) -> bool:
         """Check if subscribed to a resource.

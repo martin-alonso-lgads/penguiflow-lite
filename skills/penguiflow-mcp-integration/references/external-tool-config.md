@@ -31,10 +31,11 @@ The full configuration surface for `ToolNode` (`penguiflow.tools.config`).
 | Field | Default | Purpose |
 |---|---|---|
 | `timeout_s` | `30.0` (1–300) | Timeout of one call attempt, in seconds. |
-| `max_concurrency` | `10` (1–100) | Semaphore size for parallel calls in this ToolNode. |
+| `max_concurrency` | `10` (1–100) | Semaphore size for parallel calls in this ToolNode, shared by all users. |
 | `retry_policy` | `RetryPolicy()` | `max_attempts=3` (1–10), `wait_exponential_min_s=0.1`, `wait_exponential_max_s=5.0`. |
+| `session_pool` | `SessionPoolConfig()` | Per-user MCP sessions (`OAUTH2_USER` over a URL only): `max_sessions=64` (past it, the least recently used idle session is closed) and `idle_timeout_s=900.0` (close a session unused that long; `0` = never). A session with calls in flight is never closed. |
 
-Retries use exponential backoff between those bounds. They apply to errors that carry an HTTP status of 429 or 500–504. Timeouts (`ToolTimeoutError`), connection errors and MCP tool errors (`ToolClientError`) are not retried. `RetryPolicy.retry_on_status` is not consulted.
+Retries use exponential backoff between those bounds. An error that carries an HTTP status is retried only when the status is in `RetryPolicy.retry_on_status` (default `[429, 500, 502, 503, 504]`; `[]` disables status retries). Errors without a status are retried by category: timeouts (`ToolTimeoutError`) and connection errors (`ToolConnectionError`) are retried, MCP tool errors (`ToolClientError`) and auth errors are not. Each timed-out attempt waits the full `timeout_s`, so the worst case is about `timeout_s × max_attempts`.
 
 Operational guidance:
 - External SaaS: `max_concurrency=3..5`.
@@ -73,7 +74,7 @@ The filter applies to server tools only, not to the generated `{name}.resources_
 | Binary detection | `binary_detection: BinaryDetectionConfig` | Strings of at least `min_size_for_detection` (1000) chars that start with a known base64 signature (PDF, PNG, JPEG, GIF, ZIP, ...) and pass the magic-byte check are stored. |
 | Size safety net | `max_inline_size` (default `10_000` chars), `auto_artifact_large_content` (default `True`) | Longer strings are stored as text artifacts. |
 
-`resources.inline_text_if_under_chars` (default `10_000`) is the inline threshold for **resource reads** (see `resources-and-artifacts.md`). `resources.auto_read_if_size_under_bytes` and `resources.cache_reads_to_artifacts` are accepted but not used by ToolNode. `default_binary_summary` and `default_text_summary` format the summaries the LLM sees.
+`resources.inline_text_if_under_chars` (default `10_000`) is the inline threshold for **resource reads** (see `resources-and-artifacts.md`). `resources.cache_reads_to_artifacts` (default `True`) turns the read cache on; `False` reads from the server every time. `resources.cache_ttl_seconds` (default `3600`) is how long a cached read stays valid (`0` = until an update notification or the session closes). `default_binary_summary` and `default_text_summary` format the summaries the LLM sees.
 
 Shapes that replace extracted values:
 - Large text: `{"artifact": <ArtifactRef dict>, "summary": "...", "preview": "<first 500 chars>..."}`.
@@ -87,6 +88,8 @@ Presets: `get_artifact_preset("github" | "filesystem" | "google-drive" | "tablea
 `connection` can be:
 - A launch command (`npx -y @modelcontextprotocol/server-github`): split with `shlex`, then run as a stdio subprocess with `env`.
 - A URL starting with `http://`, `https://`, `ws://` or `wss://`: connects to a running MCP service.
+
+`ExternalToolConfig.is_url_connection` tells which one `connection` is.
 
 `mcp_transport_mode` (`McpTransportMode`, imported from `penguiflow.tools.config`) for URLs:
 - `AUTO` (default): with no auth headers, fastmcp infers the transport from the URL. With auth headers, ToolNode picks SSE when the URL contains `/sse`, else Streamable HTTP.
@@ -112,14 +115,16 @@ Production recommendation: run MCP servers as managed services (Docker/k8s) and 
 
 **Hard rule**: a `utcp_mode` other than `AUTO` with `transport=TransportType.MCP` raises `ValueError("utcp_mode is only valid for HTTP/UTCP transports")` when the config is built.
 
-### `auth_config` validation
+### Auth validation
 
 The `validate_config` model validator enforces:
 - `auth_type=BEARER` → `auth_config["token"]` must be present.
 - `auth_type=API_KEY` → `auth_config["api_key"]` must be present.
 - `auth_type=COOKIE` → both `auth_config["cookie_name"]` and `auth_config["cookie_value"]` must be present.
+- An MCP stdio command (not a URL) → `auth_type` must be `NONE`. A subprocess gets no HTTP headers; pass credentials with `env={...}`, or connect to the server's URL.
+- `auth_type=OAUTH2_USER` → only with `transport=MCP` over a URL; `UTCP`, `HTTP` and `CLI` sources can't send per-user tokens.
 
-Missing keys fail at construction time (a pydantic `ValidationError`), not at first call.
+Violations fail at construction time (a pydantic `ValidationError`), not at first call.
 
 ## Namespacing
 
@@ -144,13 +149,13 @@ async def run_once(cfg: ExternalToolConfig, ctx: ToolContext) -> object:
     specs = tool_node.get_tools()         # list[NodeSpec] for the planner catalog
     print([spec.name for spec in specs])
     result = await tool_node.call("github.list_issues", {"repo": "acme/app"}, ctx)  # {"result": ...}
-    await tool_node.close()               # tears down the client, clears discovered tools
+    await tool_node.close()               # closes every MCP session, clears discovered tools
     return result
 ```
 
-Pass `specs` to your planner's catalog; the planner skill ([[penguiflow-reactplanner-config]]) handles catalog composition. `call()` accepts the namespaced or the bare tool name and returns `{"result": <output after extraction>}`. `connect()` is idempotent, and `call()` reconnects when the node isn't connected or was connected on another event loop. With `OAUTH2_USER`, connect with `connect(ctx)` (see `oauth-and-hitl.md`).
+Pass `specs` to your planner's catalog; the planner skill ([[penguiflow-reactplanner-config]]) handles catalog composition. `call()` accepts the namespaced or the bare tool name and returns `{"result": <output after extraction>}`. `connect()` is idempotent, and `call()` connects with its own `ctx` when the node isn't connected or was connected on another event loop. With `OAUTH2_USER`, connect with `connect(ctx)` (see `oauth-and-hitl.md`). `force_reconnect(ctx=None)` is `close()` then `connect(ctx)`. `mcp_session_count` is the number of open MCP sessions.
 
-Presets: `POPULAR_MCP_SERVERS` and `get_preset(name)` give ready `ExternalToolConfig`s (`github`, `filesystem`, `postgres`, `slack`, `google-drive`, `duckduckgo`, `brave-search`, `redis`), all `npx`/`uvx` stdio commands. `get_preset` returns the shared instance; customize a copy with `get_preset("postgres").model_copy(update={...})`.
+Presets: `POPULAR_MCP_SERVERS` and `get_preset(name)` give ready `ExternalToolConfig`s (`github`, `filesystem`, `postgres`, `slack`, `duckduckgo`, `brave-search`, `redis`), all `npx`/`uvx` stdio commands with `auth_type=NONE` and credentials as `${VAR}` placeholders in `env` (`github`: `GITHUB_PERSONAL_ACCESS_TOKEN`; `slack`: `SLACK_BOT_TOKEN`, `SLACK_TEAM_ID`; `brave-search`: `BRAVE_API_KEY`). The github, slack and brave-search presets run `@modelcontextprotocol` reference servers that npm marks as deprecated. `get_preset` returns the shared instance; customize a copy with `get_preset("postgres").model_copy(update={...})`.
 
 ## Observability hooks
 

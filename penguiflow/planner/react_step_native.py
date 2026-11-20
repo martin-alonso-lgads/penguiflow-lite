@@ -39,6 +39,12 @@ from ..llm.protocol import NativeToolCallResult
 from ..llm.types import ToolCallPart, ToolSpec
 from .llm import _coerce_llm_response
 from .models import NativeToolsLLMClient, PlannerAction, PlannerEvent
+from .react_step import (
+    StepState,
+    guardrail_before_llm,
+    guardrail_stop_action,
+    stream_stop_decision,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -468,9 +474,52 @@ def _tool_calls_action(
 async def step_native(
     planner: ReactPlanner, trajectory: Trajectory
 ) -> PlannerAction:
-    """Run one native-mode step: declare tools, map the reply to an action."""
+    """Run one native-mode step: declare tools, map the reply to an action.
+
+    Guardrails run as in the prompted step: ``llm_before`` before the LLM
+    call (STOP ends the run, RETRY adds its corrective message), and the
+    streamed chunks are checked before the step returns, so a STOP on a
+    chunk ends the run.
+    """
+    planner.clear_guardrail_stream_decision()
     had_pending_steering = bool(trajectory.steering_inputs)
     messages = await _native_messages(planner, trajectory)
+    if planner.guardrails_enabled():
+        state = StepState(
+            base_messages=messages,
+            messages=list(messages),
+            had_pending_steering=had_pending_steering,
+        )
+        stop = await guardrail_before_llm(planner, trajectory, state)
+        if stop is not None:
+            return stop
+        messages = state.messages
+    try:
+        action = await _native_turn(
+            planner,
+            trajectory,
+            messages,
+            had_pending_steering=had_pending_steering,
+        )
+    finally:
+        # Chunks are checked asynchronously; wait for every verdict.
+        await planner.finalize_guardrail_stream()
+    stream_stop = stream_stop_decision(planner)
+    if stream_stop is not None:
+        return guardrail_stop_action(
+            planner, trajectory, stream_stop, "guardrail_stream_stop"
+        )
+    return action
+
+
+async def _native_turn(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    messages: list[dict[str, Any]],
+    *,
+    had_pending_steering: bool,
+) -> PlannerAction:
+    """Call the LLM with the declared tools and map its reply."""
     tools, alias_to_name = build_native_tools(planner)
     stream = _NativeStream(planner, trajectory, planner.action_seq)
     content, tool_calls = await _complete_native(

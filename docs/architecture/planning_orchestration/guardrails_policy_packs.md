@@ -59,7 +59,9 @@ For example, a team can say: “If confidence is low, call tool X to verify befo
 
 ### STOP: `StopSpec.user_message`
 If a rule returns `STOP` with a `StopSpec.user_message`, the planner will terminate
-and return that message as the final answer (no further LLM/tool calls).
+and return that message as the final answer (no further LLM/tool calls). The run finishes
+with `reason="no_path"` and the decision in `metadata["guardrail"]`, whichever event the
+STOP came from.
 
 This is appropriate for hard policies like system prompt exfiltration, direct tool escalation,
 or high-confidence jailbreak signals.
@@ -147,17 +149,27 @@ tool_risks:
   tools.delete_user: critical
 risk_router:
   high_risk_wait_ms: 500
+  llm_before_wait_ms: 300
 ```
+
+`risk_router` accepts `high_risk_wait_ms`, `medium_risk_wait_ms`, `critical_fail_closed` and
+`llm_before_wait_ms` (the least wait for async rules on every `llm_before` event; default 0).
 
 ## Operational guidance
 
 - Prefer **STOP** for high-confidence safety violations (prompt exfiltration, tool escalation).
 - Prefer **RETRY** for “helpful correction” flows (clarify intent, enforce scope, ask for missing parameters).
 - When building async rules, ensure the risk router waits for them where required (tool risk
-  tiers, `risk_router` waits, or a custom `RiskRouter`). A `STOP` that arrives after the wait is
-  applied at the same run's next guardrail check; late `PAUSE`, `REDACT` and `RETRY` decisions
-  are dropped, so treat those as monitoring/telemetry unless the router waits.
-- `gateway.async.fail_open` governs guard inbox failures (submit or await raising, or a response
-  reporting an error): `true` skips the async check, `false` stops the run with
-  `GUARDRAIL_ASYNC_ERROR`. Async timeouts follow the risk router's `on_timeout`.
+  tiers, `risk_router` waits such as `llm_before_wait_ms`, or a custom `RiskRouter`). A `STOP`
+  that arrives after the wait is applied at the same run's next guardrail check; late `PAUSE`,
+  `REDACT` and `RETRY` decisions are dropped, so treat those as monitoring/telemetry unless the
+  router waits.
+- Every async rule registered for the event type runs. Rules the router asks for
+  (`DefaultRiskRouter` asks for `hf-jailbreak` on system-info and capability-change requests)
+  don't narrow that; one that is not registered is logged as
+  `guardrail_required_rule_missing`.
+- `gateway.async.fail_open` governs guard inbox failures (submit or await raising, an async rule
+  raising, or a response reporting an error): `true` logs the failure and keeps the other
+  rules' decisions, `false` stops the run with `GUARDRAIL_ASYNC_ERROR`. Async timeouts
+  follow the risk router's `on_timeout`.
 

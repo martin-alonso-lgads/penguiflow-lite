@@ -387,23 +387,38 @@ class DefaultShortTermMemory(
             return
 
         async with self._lock:
+            saved = (
+                list(self._turns),
+                list(self._pending),
+                list(self._backlog),
+            )
             self._turns.append(turn)
+            try:
+                self._place_new_turn_locked()
+            except MemoryBudgetExceeded:
+                # Leave memory as it was: the rejected turn is not kept.
+                self._turns, self._pending, self._backlog = saved
+                raise
             await self._maybe_fire_on_turn_added(turn)
 
-            if self._config.strategy == "truncation":
-                self._truncate_to_full_zone_locked()
-                self._enforce_budget_locked()
-                return
-
-            if self._health == MemoryHealth.DEGRADED:
-                self._truncate_to_full_zone_locked(store_backlog=True)
-                self._enforce_budget_locked()
-                self._maybe_schedule_degraded_recovery_locked()
-                return
-
-            self._evict_to_pending_locked()
+    def _place_new_turn_locked(self) -> None:
+        """Move the newest turn's overflow out and enforce the budget."""
+        if self._config.strategy == "truncation":
+            self._truncate_to_full_zone_locked()
             self._enforce_budget_locked()
-            self._maybe_schedule_summarize_locked()
+            return
+
+        if self._health == MemoryHealth.DEGRADED:
+            self._truncate_to_full_zone_locked(store_backlog=True)
+            self._enforce_budget_locked()
+            self._maybe_schedule_degraded_recovery_locked()
+            return
+
+        self._evict_to_pending_locked()
+        # Schedule first: the budget check may raise, and pending turns
+        # must still be summarized.
+        self._maybe_schedule_summarize_locked()
+        self._enforce_budget_locked()
 
     @override
     async def get_llm_context(self) -> Mapping[str, Any]:
@@ -819,34 +834,46 @@ class DefaultShortTermMemory(
         if total_budget <= 0:
             return
         estimator = self._config.token_estimator or default_token_estimator
+        policy = self._config.budget.overflow_policy
+
+        if policy == "error":
+            # Pending turns are about to be summarized, so they don't count.
+            snapshot = self._estimate_payload_snapshot(include_pending=False)
+            if estimator(_compact_json(snapshot)) > total_budget:
+                msg = "memory context exceeded total_max_tokens"
+                raise MemoryBudgetExceeded(msg)
+            return
 
         while True:
             snapshot = self._estimate_payload_snapshot()
-            tokens = estimator(_compact_json(snapshot))
-            if tokens <= total_budget:
+            if estimator(_compact_json(snapshot)) <= total_budget:
                 return
-
-            policy = self._config.budget.overflow_policy
-            if policy == "error":
-                msg = "memory context exceeded total_max_tokens"
-                raise MemoryBudgetExceeded(msg)
-
-            if policy == "truncate_summary" and self._summary:
-                self._truncate_summary_to_budget_locked()
+            if policy == "truncate_summary" and self._shrink_summary_locked():
                 continue
-
             if self._pending:
                 self._pending.pop(0)
                 continue
-
             if self._turns:
                 self._turns.pop(0)
                 continue
-
             self._summary = ""
             return
 
-    def _estimate_payload_snapshot(self) -> dict[str, Any]:
+    def _shrink_summary_locked(self) -> bool:
+        """Cut the summary to its budget; return whether it got shorter.
+
+        A summary already within ``summary_max_tokens``, or one left out of
+        the payload while degraded, cannot help, so the caller drops turns.
+        """
+        if not self._summary or self._health == MemoryHealth.DEGRADED:
+            return False
+        before = self._summary
+        self._truncate_summary_to_budget_locked()
+        return self._summary != before
+
+    def _estimate_payload_snapshot(
+        self, *, include_pending: bool = True
+    ) -> dict[str, Any]:
         include_digest = self._config.include_trajectory_digest
         if self._config.strategy == "truncation":
             return {
@@ -863,7 +890,7 @@ class DefaultShortTermMemory(
                 ]
             }
             if self._health != MemoryHealth.DEGRADED:
-                if self._pending:
+                if self._pending and include_pending:
                     payload["pending_turns"] = [
                         _turn_to_llm_dict(t, include_digest=include_digest)
                         for t in self._pending

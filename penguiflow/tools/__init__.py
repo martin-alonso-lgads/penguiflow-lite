@@ -15,6 +15,7 @@ from .config import (
     ExternalToolConfig,
     ResourceHandlingConfig,
     RetryPolicy,
+    SessionPoolConfig,
     TransportType,
     UtcpMode,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "OAuthProviderConfig",
     "ResourceHandlingConfig",
     "RetryPolicy",
+    "SessionPoolConfig",
     "TokenStore",
     "ToolAuthError",
     "ToolClientError",

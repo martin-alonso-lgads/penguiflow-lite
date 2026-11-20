@@ -135,6 +135,7 @@ from .schema.plan import (
 
 # Telemetry
 from .telemetry import (
+    LLMCallTelemetry,
     LLMEvent,
     TelemetryCallback,
     TelemetryHooks,
@@ -199,6 +200,7 @@ __all__ = [
     # Errors
     "LLMAuthError",
     "LLMCallSpan",
+    "LLMCallTelemetry",
     "LLMCancelledError",
     # Client
     "LLMClient",

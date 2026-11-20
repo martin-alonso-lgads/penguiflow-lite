@@ -395,7 +395,7 @@ The planner that paused a run keeps the pause record in memory too, and resumes 
 
 ### Usage with ToolNode
 
-An `OAUTH2_USER` ToolNode authenticates tool discovery as a user, so it needs `connect(ctx)`: a `ToolContext` whose `tool_context` carries that user's `user_id`. `connect()` without a context raises `ToolAuthError`. So does `call()` on a node that is not connected on the current event loop, because `call()` reconnects without a context; connect on the loop that serves the calls. If the user has no token yet, `connect(ctx)` pauses the run through `ctx.pause(...)` with the OAuth payload, so connect from code that runs inside a planner run, such as a tool.
+An `OAUTH2_USER` ToolNode keeps one MCP session per user, keyed by `tool_context["tenant_id"]` and `["user_id"]` and opened with that user's token, so one ToolNode serves every user. It discovers tools on the first session, so it needs `connect(ctx)`: a `ToolContext` whose `tool_context` carries a `user_id`. `connect()` without a context raises `ToolAuthError`. Other users' sessions open on their first `call()`, which also connects with its own context when the node is not connected on the current event loop. If the user has no token yet, opening their session pauses the run through `ctx.pause(...)` with the OAuth payload, so connect from code that runs inside a planner run, such as a tool. Per-user OAuth needs an MCP server reached over a URL; the config rejects `OAUTH2_USER` with a stdio command.
 
 ```python
 import os
@@ -472,7 +472,7 @@ def build_github_node(pool: asyncpg.Pool) -> tuple[ToolNode, OAuthManager]:
         config=ExternalToolConfig(
             name="github",
             transport=TransportType.MCP,
-            connection="npx -y @modelcontextprotocol/server-github",
+            connection="https://mcp.example.com/github",  # OAUTH2_USER needs a URL
             auth_type=AuthType.OAUTH2_USER,
         ),
         registry=ModelRegistry(),

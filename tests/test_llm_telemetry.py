@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from penguiflow.llm.profiles import ModelProfile
+from penguiflow.llm.protocol import NativeLLMAdapter
 from penguiflow.llm.telemetry import (
     LLMEvent,
     TelemetryHooks,
@@ -14,6 +19,16 @@ from penguiflow.llm.telemetry import (
     get_telemetry_hooks,
     set_telemetry_hooks,
 )
+from penguiflow.llm.types import (
+    CompletionResponse,
+    LLMMessage,
+    TextPart,
+    Usage,
+)
+from penguiflow.planner.llm import _LiteLLMJSONClient
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 class TestLLMEvent:
@@ -504,3 +519,113 @@ class TestDefaultLoggerCallbackEdgeCases:
         with caplog.at_level(logging.DEBUG):
             # Should not raise
             default_logger_callback(event)
+
+
+@pytest.fixture
+def recorded_events() -> Iterator[list[LLMEvent]]:
+    """Install fresh global telemetry hooks that record every event."""
+    previous = get_telemetry_hooks()
+    hooks = TelemetryHooks()
+    events: list[LLMEvent] = []
+    hooks.register(events.append)
+    set_telemetry_hooks(hooks)
+    try:
+        yield events
+    finally:
+        set_telemetry_hooks(previous)
+
+
+def _fake_provider(*, fail: bool = False) -> MagicMock:
+    provider = MagicMock()
+    provider.model = "test-model"
+    provider.provider_name = "test"
+    provider.profile = ModelProfile()
+    if fail:
+        provider.complete = AsyncMock(side_effect=ValueError("bad request"))
+    else:
+        provider.complete = AsyncMock(
+            return_value=CompletionResponse(
+                message=LLMMessage(
+                    role="assistant", parts=[TextPart(text='{"ok": true}')]
+                ),
+                usage=Usage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_native_adapter_emits_telemetry_for_planner_calls(
+    recorded_events: list[LLMEvent],
+) -> None:
+    """The planner's native adapter reports its calls to the hooks."""
+    with patch(
+        "penguiflow.llm.protocol.create_provider",
+        return_value=_fake_provider(),
+    ):
+        adapter = NativeLLMAdapter("test-model")
+        await adapter.complete(messages=[{"role": "user", "content": "hi"}])
+        await adapter.complete_with_tools(
+            messages=[{"role": "user", "content": "hi"}], tools=[]
+        )
+
+    kinds = [
+        (e.event_type, (e.extra or {}).get("mode")) for e in recorded_events
+    ]
+    assert kinds == [
+        ("request_start", "text"),
+        ("request_end", "text"),
+        ("request_start", "native_tools"),
+        ("request_end", "native_tools"),
+    ]
+    assert all(e.provider == "test" for e in recorded_events)
+
+
+@pytest.mark.asyncio
+async def test_native_adapter_emits_error_event(
+    recorded_events: list[LLMEvent],
+) -> None:
+    """A failing planner call ends with an ``error`` event."""
+    with patch(
+        "penguiflow.llm.protocol.create_provider",
+        return_value=_fake_provider(fail=True),
+    ):
+        adapter = NativeLLMAdapter("test-model", max_retries=1)
+        with pytest.raises(ValueError, match="bad request"):
+            await adapter.complete(
+                messages=[{"role": "user", "content": "hi"}]
+            )
+
+    assert [e.event_type for e in recorded_events] == [
+        "request_start",
+        "error",
+    ]
+    assert (recorded_events[-1].extra or {})["error_type"] == "ValueError"
+
+
+@pytest.mark.asyncio
+async def test_litellm_planner_client_emits_telemetry(
+    recorded_events: list[LLMEvent],
+) -> None:
+    """The planner's LiteLLM client reports its calls to the hooks."""
+    litellm = MagicMock()
+    litellm.acompletion = AsyncMock(
+        return_value={
+            "choices": [{"message": {"content": '{"ok": true}'}}],
+            "usage": {"total_tokens": 3},
+            "_hidden_params": {"response_cost": 0.002},
+        }
+    )
+    with patch.dict(sys.modules, {"litellm": litellm}):
+        client = _LiteLLMJSONClient(
+            "gpt-4o", temperature=0.0, json_schema_mode=False
+        )
+        await client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    assert [e.event_type for e in recorded_events] == [
+        "request_start",
+        "request_end",
+    ]
+    end = recorded_events[-1]
+    assert end.provider == "litellm"
+    assert (end.extra or {})["cost"] == 0.002

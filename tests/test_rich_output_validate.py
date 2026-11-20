@@ -182,3 +182,30 @@ def test_nested_component_iterators_cover_invalid_and_valid_shapes() -> None:
     assert list(_iter_accordion_items(accordion)) == [
         ("json", {"data": {"a": 1}})
     ]
+
+
+def test_budget_counts_from_an_empty_mapping() -> None:
+    """An empty budget mapping is counted, not skipped."""
+    registry = get_registry()
+    budget: dict[str, object] = {}
+    limits = ValidationLimits(max_payload_bytes=1000, max_total_bytes=60)
+
+    validate_component_payload(
+        "markdown",
+        {"content": "abc"},
+        registry,
+        allowlist={"markdown"},
+        limits=limits,
+        tool_context=budget,
+    )
+    assert isinstance(budget["_rich_output_bytes"], int)
+    with pytest.raises(RichOutputValidationError, match="budget exceeded"):
+        for _ in range(10):
+            validate_component_payload(
+                "markdown",
+                {"content": "abc"},
+                registry,
+                allowlist={"markdown"},
+                limits=limits,
+                tool_context=budget,
+            )

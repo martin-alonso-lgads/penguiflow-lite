@@ -260,3 +260,12 @@ async def test_parallel_deferred_tool_activation_respects_visibility_policy(
     ]
     assert denied
     assert tool_starts == []
+
+
+def test_always_loaded_patterns_default_names_real_tools() -> None:
+    """The default patterns name only the built-in tools that exist."""
+    assert ToolSearchConfig().always_loaded_patterns == [
+        "tasks.*",
+        "tool_search",
+        "tool_get",
+    ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -146,6 +147,35 @@ def test_oauth_manager_get_auth_request() -> None:
     assert request["scopes"] == ["repo", "user"]
     # State should be stored in pending
     assert request["state"] in manager.pending_states
+
+
+def test_oauth_auth_url_query_is_url_encoded() -> None:
+    """Query values are URL-encoded and survive a round trip."""
+    provider = OAuthProviderConfig(
+        name="google",
+        display_name="Google",
+        auth_url="https://accounts.example.com/o/oauth2/auth?access_type=x",
+        token_url="https://accounts.example.com/token",
+        client_id="id+1",
+        client_secret="secret",
+        redirect_uri="https://app.example.com/cb?next=/home&x=1",
+        scopes=["openid", "https://example.com/auth/drive.readonly"],
+    )
+    manager = OAuthManager(providers={"google": provider})
+    request = manager.get_auth_request("google", "user1", "trace1")
+
+    auth_url = str(request["auth_url"])
+    parsed = urlsplit(auth_url)
+    query = parse_qs(parsed.query, strict_parsing=True)
+    assert auth_url.count("?") == 1
+    assert query["access_type"] == ["x"]
+    assert query["client_id"] == ["id+1"]
+    assert query["redirect_uri"] == [
+        "https://app.example.com/cb?next=/home&x=1"
+    ]
+    assert query["scope"] == ["openid https://example.com/auth/drive.readonly"]
+    assert query["state"] == [request["state"]]
+    assert query["response_type"] == ["code"]
 
 
 def test_oauth_manager_get_auth_request_unknown_provider() -> None:

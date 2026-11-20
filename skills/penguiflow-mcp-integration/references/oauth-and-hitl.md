@@ -80,16 +80,24 @@ def build_github_node(manager: OAuthManager, registry: ModelRegistry) -> ToolNod
     return ToolNode(config=config, registry=registry, auth_manager=manager)
 ```
 
-- `connect()` needs a `ToolContext` for `OAUTH2_USER`: `await node.connect(ctx)`, with `ctx.tool_context["user_id"]` set. A bare `connect()` raises `ToolAuthError`, and so does a `call()` that has to reconnect (it reconnects without a context), so connect before the planner uses the tools.
+- `OAUTH2_USER` needs an MCP server reached over a URL. The config rejects it with a stdio command (a subprocess gets no headers) and with UTCP/HTTP/CLI sources.
+- `connect()` needs a `ToolContext` for `OAUTH2_USER`: `await node.connect(ctx)`, with `ctx.tool_context["user_id"]` set. It opens that user's MCP session and discovers the tools on it. A bare `connect()` raises `ToolAuthError`. `call()` connects with its own `ctx` when the node isn't connected, but the planner's catalog only holds tools discovered before it was built, so connect first.
 - If that user has no token, `connect(ctx)` calls `ctx.pause(...)` with the payload below, and raises `ToolAuthError` if there is still no token afterwards.
 - Without `auth_manager`, any auth attempt raises `ToolAuthError`.
 
-**Per call.** `call()` looks up the calling user's token and pauses the run when it is missing. UTCP/HTTP sources send it as `Authorization: Bearer <token>` on that call. MCP sources send headers only when connecting, so an MCP connection keeps using the token of the user it was connected with. For per-user MCP access, use one ToolNode per user (each with its own `connect(ctx)`).
+**Per call.** `call()` looks up the calling user's token and pauses the run when it is missing. One ToolNode serves every user: it keeps one MCP session per user, keyed by `(tool_context["tenant_id"], tool_context["user_id"])` and opened with that user's token, each with its own resource cache and subscriptions. Tools, prompts and resource templates are discovered once, on the first session; other users' sessions open on their first call. A new token for a user opens a new session, and a `401` from the server (`ToolAuthError` with `status_code=401`) closes it, so the next call reopens it. `max_concurrency` is shared by all users.
+
+Limitation: a server that filters tools per user exposes the first user's tool list to every user. Connect as a user who has every tool, and hide tools per user with a `ToolVisibilityPolicy` at the planner.
+
+**Session limits.** `ExternalToolConfig.session_pool = SessionPoolConfig(max_sessions=64, idle_timeout_s=900.0)` bounds the open sessions: past `max_sessions` the least recently used idle session is closed, and a session unused for `idle_timeout_s` seconds is closed (`0` = never). A session with calls in flight is never closed. `node.mcp_session_count` gives the open sessions.
+
+**Per-user methods.** There is no shared client: `node.mcp_client` is `None`, and setting it raises `ToolNodeError`. The resource, prompt and app methods (`list_resources`, `list_resource_templates`, `subscribe_resource`, `unsubscribe_resource`, `list_prompts`, `get_prompt`, `fetch_app_html`) take `ctx=` to use that user's session; `list_resources(ctx=ctx)` returns that user's `resources/list`.
 
 ### 3. `tool_context` keys
 On every `planner.run(...)` and `planner.resume(...)`:
 - `tool_context["user_id"]`: **required**. Identifies the user owning the token; missing raises `ToolAuthError("user_id required in tool_context for OAuth")`.
 - `tool_context["trace_id"]`: optional. Stored with the pending request and returned by `handle_callback`, so the callback can find the paused run.
+- `tool_context["tenant_id"]`: optional. With `user_id`, it keys the user's MCP session.
 
 In multi-tenant systems, make `user_id` tenant-scoped (`acme:user-123`); the token store only sees `user_id` and the provider.
 
@@ -146,7 +154,7 @@ Without it, a worker restart between pause and resume drops the pending run.
 }
 ```
 
-The pause reason is `"external_event"`. The host UI uses this payload to render the "Connect your GitHub account" prompt. The `auth_url` query values are not URL-encoded, so keep `redirect_uri` and scope names URL-safe.
+The pause reason is `"external_event"`. The host UI uses this payload to render the "Connect your GitHub account" prompt. The `auth_url` query values are URL-encoded (scopes are joined with spaces, sent as `%20`), and are appended with `&` when the provider's `auth_url` already has a query string.
 
 ## Operational defaults
 
@@ -161,13 +169,15 @@ The pause reason is `"external_event"`. The host UI uses this payload to render 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ToolAuthError: ... requires HITL OAuth but no ToolContext provided` | `connect()` without a context, or a `call()` that had to reconnect | `await node.connect(ctx)` before the run |
+| `ValidationError: auth_type=OAUTH2_USER ...` when building the config | `OAUTH2_USER` on a stdio command or a UTCP/HTTP/CLI source | Run the MCP server as a service and connect by URL |
+| `ToolAuthError: ... requires HITL OAuth but no ToolContext provided` | `connect()` or `force_reconnect()` without a context | `await node.connect(ctx)` before the run |
 | `ToolAuthError: user_id required in tool_context for OAuth` | `tool_context` missing `user_id` | Set it on every `run(...)` / `resume(...)` |
 | `ValueError: Unknown OAuth provider` | `providers` key differs from the config `name` | Key providers by the ToolNode name |
 | `ValueError: Invalid or expired OAuth state` | Callback hit another process, the state was already used, or it is older than 10 minutes | Sticky callbacks; restart the auth flow |
 | Pause fires but resume raises `KeyError` | Pause state was in memory and the worker restarted | Implement `save_planner_state`/`load_planner_state` durably |
 | OAuth completed but the tool still pauses | Token stored under another `(user_id, provider)`, or the store isn't shared | Use the same keys; share the store |
-| MCP calls act as the wrong user | MCP sends headers only at connect | One ToolNode per user, or a UTCP/HTTP source |
+| Every user sees the first user's tools | Tools are discovered once, on the first user's session | Connect as a user who has every tool; hide tools per user with a `ToolVisibilityPolicy` |
+| A user's calls keep failing with `401` | The stored token was revoked; a `401` closes the session, not the stored token | `await manager.token_store.delete(user_id, provider)`, so the next call pauses for OAuth again |
 | Tokens visible in prompts | Stored in `llm_context` | Keep them in the token store; audit prompt logs |
 
 ## Observability

@@ -122,7 +122,7 @@ The loader:
 - Skips a Markdown file whose frontmatter is missing or isn't valid YAML, without a warning.
 - Raises `ValueError` for a malformed `.skill.json`, `.skill.yaml` or `.skill.jsonl` file, which fails planner construction.
 - Logs `skill_pack_missing` and loads nothing when `path` doesn't exist.
-- Renames a duplicate `name` within a pack to `<name>_<n>`, where `n` is the entry's 1-based position in its file. Duplicates aren't dropped, and duplicates in different files can end up with the same new name and overwrite each other in the store. Keep names unique.
+- Renames a duplicate `name` within a pack to the first free `<name>_2`, `<name>_3`, ... across all the pack's files, and logs `skill_pack_duplicate_name`. Duplicates aren't dropped. A pack that reuses a name another pack already loaded takes it over in the store, logged as `skill_pack_name_conflict`. Keep names unique.
 
 Across packs, `name` is unique in the store: with `update_existing_pack_skills=True` (the default), a later entry in `skill_packs` overwrites an earlier one with the same name. Runtime providers win over all packs.
 

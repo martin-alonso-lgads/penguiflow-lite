@@ -16,12 +16,20 @@ alternatives:
    Docker, ensure your container image includes Node.js (e.g., use
    node:alpine as base).
 
+Stdio servers get no HTTP headers, so presets pass credentials to the
+subprocess through ``env`` (``${VAR}`` placeholders are read from the host
+environment) with ``auth_type=NONE``. Per-user OAuth (``OAUTH2_USER``) needs
+an MCP server reached over a URL.
+
+The github, slack and brave-search presets run the reference servers from
+``@modelcontextprotocol``, which npm marks as deprecated.
+
 Example for production:
     # Instead of using the preset
     config = ExternalToolConfig(
         name="github",
         transport=TransportType.MCP,
-        connection="http://mcp-github-service:8080/sse",  # Separate service
+        connection="http://mcp-github-service:8080/mcp",  # Separate service
         auth_type=AuthType.OAUTH2_USER,
     )
 """
@@ -47,8 +55,14 @@ POPULAR_MCP_SERVERS = {
         name="github",
         transport=TransportType.MCP,
         connection="npx -y @modelcontextprotocol/server-github",
-        auth_type=AuthType.OAUTH2_USER,
-        description="GitHub repositories, issues, pull requests",
+        env={
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+        },
+        auth_type=AuthType.NONE,  # Token passed via env, not auth_config
+        description=(
+            "GitHub repositories, issues, pull requests (requires "
+            "GITHUB_PERSONAL_ACCESS_TOKEN env var)"
+        ),
     ),
     "filesystem": ExternalToolConfig(
         name="filesystem",
@@ -69,15 +83,15 @@ POPULAR_MCP_SERVERS = {
         name="slack",
         transport=TransportType.MCP,
         connection="npx -y @modelcontextprotocol/server-slack",
-        auth_type=AuthType.OAUTH2_USER,
-        description="Slack channels, messages, users",
-    ),
-    "google-drive": ExternalToolConfig(
-        name="google-drive",
-        transport=TransportType.MCP,
-        connection="npx -y @anthropic/mcp-server-google-drive",
-        auth_type=AuthType.OAUTH2_USER,
-        description="Google Drive files and folders",
+        env={
+            "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}",
+            "SLACK_TEAM_ID": "${SLACK_TEAM_ID}",
+        },
+        auth_type=AuthType.NONE,  # Token passed via env, not auth_config
+        description=(
+            "Slack channels, messages, users (requires SLACK_BOT_TOKEN and "
+            "SLACK_TEAM_ID env vars)"
+        ),
     ),
     "duckduckgo": ExternalToolConfig(
         name="duckduckgo",
@@ -89,7 +103,7 @@ POPULAR_MCP_SERVERS = {
     "brave-search": ExternalToolConfig(
         name="brave-search",
         transport=TransportType.MCP,
-        connection="npx -y @anthropic/mcp-server-brave-search",
+        connection="npx -y @modelcontextprotocol/server-brave-search",
         env={"BRAVE_API_KEY": "${BRAVE_API_KEY}"},
         auth_type=AuthType.NONE,  # Key passed via env, not auth_config
         description=(
@@ -148,7 +162,6 @@ TABLEAU_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=0,  # Never auto-read large resources
         inline_text_if_under_chars=5_000,
         cache_reads_to_artifacts=True,
     ),
@@ -215,7 +228,6 @@ GITHUB_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=50_000,  # Auto-read small files
         inline_text_if_under_chars=10_000,
         cache_reads_to_artifacts=True,
     ),
@@ -271,7 +283,6 @@ FILESYSTEM_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=100_000,  # Auto-read small files
         inline_text_if_under_chars=50_000,
         cache_reads_to_artifacts=True,
     ),
@@ -309,7 +320,6 @@ GOOGLE_DRIVE_ARTIFACT_PRESET = ArtifactExtractionConfig(
     ),
     resources=ResourceHandlingConfig(
         enabled=True,
-        auto_read_if_size_under_bytes=100_000,
         inline_text_if_under_chars=10_000,
         cache_reads_to_artifacts=True,
     ),

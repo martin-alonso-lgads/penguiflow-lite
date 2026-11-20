@@ -17,6 +17,19 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
+def _cursor_start(ids: Sequence[str], since_id: str | None) -> int:
+    """Return the index just after ``since_id`` in ``ids``, or 0.
+
+    The cursor is applied to the whole session's history before any task
+    filter, so a cursor that points at another task's item still counts.
+    """
+    if since_id:
+        for idx, item_id in enumerate(ids):
+            if item_id == since_id:
+                return idx + 1
+    return 0
+
+
 class SessionStateStore(Protocol):
     """Storage for session tasks, updates and steering events."""
 
@@ -278,16 +291,14 @@ class StateStoreSessionAdapter(SessionStateStore):
             payload = event.payload
             if not isinstance(payload, dict):
                 continue
-            update = StateUpdate.model_validate(payload)
-            if task_id is not None and update.task_id != task_id:
-                continue
-            updates.append(update)
-        if since_id:
-            for idx, update in enumerate(updates):
-                if update.update_id == since_id:
-                    updates = updates[idx + 1 :]
-                    break
-        return updates[-limit:]
+            updates.append(StateUpdate.model_validate(payload))
+        start = _cursor_start([u.update_id for u in updates], since_id)
+        selected = [
+            update
+            for update in updates[start:]
+            if task_id is None or update.task_id == task_id
+        ]
+        return selected[-limit:]
 
     @override
     async def list_steering(
@@ -306,16 +317,14 @@ class StateStoreSessionAdapter(SessionStateStore):
             payload = event.payload
             if not isinstance(payload, dict):
                 continue
-            steering = SteeringEvent.model_validate(payload)
-            if task_id is not None and steering.task_id != task_id:
-                continue
-            events.append(steering)
-        if since_id:
-            for idx, steering_event in enumerate(events):
-                if steering_event.event_id == since_id:
-                    events = events[idx + 1 :]
-                    break
-        return events[-limit:]
+            events.append(SteeringEvent.model_validate(payload))
+        start = _cursor_start([e.event_id for e in events], since_id)
+        selected = [
+            event
+            for event in events[start:]
+            if task_id is None or event.task_id == task_id
+        ]
+        return selected[-limit:]
 
 
 __all__ = [

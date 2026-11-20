@@ -39,7 +39,7 @@ Required props, from `registry.json`. The props use camelCase.
 | `accordion` | `items` | `allowMultiple` |
 | `form` / `confirm` / `select_option` | `fields` / `message` / `options` | see `interactive-hitl.md` |
 
-`describe_component(name=...)` returns `{"component": <the full registry entry, with propsSchema and example>}`. It does not check the allowlist, and an unknown name fails the call.
+`describe_component(name=...)` returns `{"component": <the full registry entry, with propsSchema and example>}`. A component outside `RichOutputConfig.allowlist` fails the call with `RichOutputValidationError` (code `component_not_allowed`), and an unknown name fails it too.
 
 ## `render_component`
 
@@ -177,7 +177,7 @@ Before emitting, every renderer checks:
 3. The props match the component's JSON schema (`Invalid props for 'markdown': 'content' is a required property`).
 4. Nested `component` + `props` children of `report`, `grid`, `tabs` and `accordion` pass the same checks, up to depth 6.
 
-A failure becomes a tool error that tells the LLM to call `describe_component` and retry. `max_total_bytes` (default 2,000,000) is tracked in the call's `tool_context`, which the planner copies for each tool call. Under `ReactPlanner` it therefore only bounds a single call; use `max_payload_bytes` for the real limit.
+A failure becomes a tool error that tells the LLM to call `describe_component` and retry. `max_total_bytes` (default 2,000,000) bounds every component rendered in one run: the count lives in `ctx.run_state`, which all tool calls of the run share and which survives pause and resume. `max_payload_bytes` bounds each component.
 
 ## Operational defaults
 

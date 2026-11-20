@@ -29,7 +29,7 @@ Rules:
 - Show `channel == "answer"` to end users; `thinking` belongs in a collapsible panel, if anywhere.
 - A **new `action_seq`** means the planner restarted its answer (e.g. a finish-repair re-streams the corrected answer). Replace, don't append.
 - `PlannerFinish.metadata["answer_action_seq"]` names the sequence that produced the final answer.
-- `revision` chunks (reflection) carry `phase="revision"` and no `channel`, so a filter on `channel == "answer"` skips them and sessions project them as `THINKING`.
+- `revision` chunks (reflection) carry `phase="revision"` and `channel="revision"`, plus `revision_idx`. Sessions project them as `RESULT`, like answer chunks; a UI that filters on `channel == "answer"` should also accept `revision`.
 - These events are only emitted when an `event_callback` is set.
 
 ## `stream_chunk` — progress from inside a tool

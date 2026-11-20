@@ -83,9 +83,10 @@ class McpTransportMode(str, Enum):
 class RetryPolicy(BaseModel):
     """Retry configuration for ``ToolNode`` tool calls (tenacity semantics).
 
-    Consumed by ``ToolNode._call_with_retry``, which retries only on
-    retryable errors (timeouts, connection errors, or ``ToolNodeError``
-    subclasses marked retryable) with exponential backoff between attempts.
+    Consumed by ``ToolNode.call_with_retry``, which retries timeouts,
+    connection errors, errors whose status is in ``retry_on_status`` and
+    other retryable ``ToolNodeError`` categories, with exponential backoff
+    between attempts.
     """
 
     max_attempts: int = Field(
@@ -116,8 +117,36 @@ class RetryPolicy(BaseModel):
     retry_on_status: list[int] = Field(
         default_factory=lambda: [429, 500, 502, 503, 504],
         description=(
-            "HTTP status codes that are treated as retryable when "
-            "surfaced by adapters."
+            "HTTP status codes that are retried. An error that carries a "
+            "status code is retried only when the code is in this list; "
+            "errors without one (timeouts, connection errors) are retried "
+            "by category."
+        ),
+    )
+
+
+class SessionPoolConfig(BaseModel):
+    """Limits for the per-user MCP sessions of an ``OAUTH2_USER`` source.
+
+    Each user gets their own MCP session, opened with their token. These
+    limits close sessions nobody is using; a session with a call in
+    flight is never closed.
+    """
+
+    max_sessions: int = Field(
+        default=64,
+        ge=1,
+        description=(
+            "Maximum open per-user sessions; the least recently used idle "
+            "session is closed past it."
+        ),
+    )
+    idle_timeout_s: float = Field(
+        default=900.0,
+        ge=0.0,
+        description=(
+            "Close a per-user session unused for this many seconds "
+            "(0 = never)."
         ),
     )
 
@@ -174,13 +203,6 @@ class ResourceHandlingConfig(BaseModel):
     enabled: bool = Field(
         default=True, description="Enable resource link handling"
     )
-    auto_read_if_size_under_bytes: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Auto-read resources smaller than this (0 = never auto-read)"
-        ),
-    )
     inline_text_if_under_chars: int = Field(
         default=10_000,
         ge=0,
@@ -188,7 +210,18 @@ class ResourceHandlingConfig(BaseModel):
     )
     cache_reads_to_artifacts: bool = Field(
         default=True,
-        description="Cache resource reads to artifact store",
+        description=(
+            "Cache resource reads: small text inline, the rest as artifact "
+            "references. False reads from the server every time."
+        ),
+    )
+    cache_ttl_seconds: int = Field(
+        default=3600,
+        ge=0,
+        description=(
+            "Seconds a cached resource read stays valid (0 = until the "
+            "server reports an update or the session closes)."
+        ),
     )
 
 
@@ -309,6 +342,23 @@ class AppsConfig(BaseModel):
     )
 
 
+_URL_PREFIXES = ("http://", "https://", "ws://", "wss://")
+
+_REQUIRED_AUTH_KEYS: dict[AuthType, tuple[str, ...]] = {
+    AuthType.BEARER: ("token",),
+    AuthType.API_KEY: ("api_key",),
+    AuthType.COOKIE: ("cookie_name", "cookie_value"),
+}
+
+
+def _check_auth_keys(auth_type: AuthType, auth_config: dict[str, Any]) -> None:
+    """Raise ValueError if ``auth_config`` lacks a key ``auth_type`` needs."""
+    for key in _REQUIRED_AUTH_KEYS.get(auth_type, ()):
+        if key not in auth_config:
+            msg = f"auth_type={auth_type.name} requires auth_config.{key}"
+            raise ValueError(msg)
+
+
 class ExternalToolConfig(BaseModel):
     """Configuration for one external tool source consumed by ``ToolNode``.
 
@@ -394,7 +444,14 @@ class ExternalToolConfig(BaseModel):
         le=100,
         description=(
             "Maximum number of concurrent in-flight tool calls for this "
-            "source."
+            "source, shared by all users."
+        ),
+    )
+    session_pool: SessionPoolConfig = Field(
+        default_factory=SessionPoolConfig,
+        description=(
+            "Limits for per-user MCP sessions (OAUTH2_USER over a URL "
+            "connection only)."
         ),
     )
 
@@ -440,6 +497,11 @@ class ExternalToolConfig(BaseModel):
         description="Custom async function to transform tool outputs",
     )
 
+    @property
+    def is_url_connection(self) -> bool:
+        """Whether ``connection`` is a URL rather than a command."""
+        return self.connection.startswith(_URL_PREFIXES)
+
     @model_validator(mode="after")
     def validate_config(self) -> ExternalToolConfig:
         """Validate transport/auth-specific requirements after field parsing.
@@ -447,42 +509,43 @@ class ExternalToolConfig(BaseModel):
         Raises:
             ValueError: If ``auth_type`` requires keys in ``auth_config`` that
                 are missing (e.g. BEARER needs ``token``, API_KEY needs
-                ``api_key``, COOKIE needs ``cookie_name``/``cookie_value``),
-                or if ``utcp_mode`` is set to a non-default value while
-                ``transport`` is ``MCP`` (``utcp_mode`` only applies to
-                HTTP/UTCP transports).
+                ``api_key``, COOKIE needs ``cookie_name``/``cookie_value``);
+                if ``utcp_mode`` is set to a non-default value while
+                ``transport`` is ``MCP``; if an MCP stdio command (not a URL)
+                is given an ``auth_type`` other than NONE, since a
+                subprocess gets no HTTP headers; or if ``OAUTH2_USER`` is
+                used with a UTCP, HTTP or CLI transport, which cannot send
+                per-user tokens.
 
         Returns:
             The validated ``ExternalToolConfig`` instance (unchanged).
         """
-        if (
-            self.auth_type == AuthType.BEARER
-            and "token" not in self.auth_config
-        ):
-            msg = "auth_type=BEARER requires auth_config.token"
-            raise ValueError(msg)
-        if (
-            self.auth_type == AuthType.API_KEY
-            and "api_key" not in self.auth_config
-        ):
-            msg = "auth_type=API_KEY requires auth_config.api_key"
-            raise ValueError(msg)
-        if self.auth_type == AuthType.COOKIE:
-            if "cookie_name" not in self.auth_config:
-                msg = "auth_type=COOKIE requires auth_config.cookie_name"
-                raise ValueError(msg)
-            if "cookie_value" not in self.auth_config:
-                msg = "auth_type=COOKIE requires auth_config.cookie_value"
-                raise ValueError(msg)
+        _check_auth_keys(self.auth_type, self.auth_config)
+        self._check_transport()
+        return self
 
-        if (
-            self.transport == TransportType.MCP
-            and self.utcp_mode != UtcpMode.AUTO
-        ):
+    def _check_transport(self) -> None:
+        """Reject transport and auth combinations that cannot work."""
+        if self.transport != TransportType.MCP:
+            if self.auth_type == AuthType.OAUTH2_USER:
+                msg = (
+                    "auth_type=OAUTH2_USER is only supported for MCP over a "
+                    "URL connection; UTCP, HTTP and CLI sources cannot send "
+                    "per-user tokens"
+                )
+                raise ValueError(msg)
+            return
+        if self.utcp_mode != UtcpMode.AUTO:
             msg = "utcp_mode is only valid for HTTP/UTCP transports"
             raise ValueError(msg)
-
-        return self
+        if not self.is_url_connection and self.auth_type != AuthType.NONE:
+            msg = (
+                f"auth_type={self.auth_type.name} needs an MCP URL "
+                "connection; a stdio command gets no HTTP headers. Pass "
+                "credentials to the subprocess with env={...} and "
+                "auth_type=NONE, or connect to the server's URL."
+            )
+            raise ValueError(msg)
 
 
 __all__ = [
@@ -498,6 +561,7 @@ __all__ = [
     "PromptsConfig",
     "ResourceHandlingConfig",
     "RetryPolicy",
+    "SessionPoolConfig",
     "TransportType",
     "UtcpMode",
 ]

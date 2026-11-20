@@ -31,10 +31,20 @@ class ToolNodeError(Exception):
         category: ErrorCategory | None = None,
         cause: Exception | None = None,
     ) -> None:
-        """Store the error details; infer the category from the status code."""
+        """Store the error details and resolve the category.
+
+        An explicit ``category`` wins. Otherwise a ``status_code`` decides
+        the category, and without one the class-level category applies.
+        """
         super().__init__(message)
         self.status_code = status_code
-        self.category = category or self._infer_category(status_code)
+        if category is None:
+            category = (
+                type(self).category
+                if status_code is None
+                else self._infer_category(status_code)
+            )
+        self.category = category
         self.__cause__ = cause
 
     def _infer_category(self, status_code: int | None) -> ErrorCategory:
