@@ -20,8 +20,16 @@ from penguiflow.sessions.persistence import (
     InMemorySessionStateStore,
     StateStoreSessionAdapter,
 )
-from penguiflow.state import RemoteBinding, StateStore, StoredEvent
+from penguiflow.sessions.session import StreamingSession
+from penguiflow.state import (
+    RemoteBinding,
+    StateStore,
+    StoredEvent,
+    SupportsTasks,
+)
 from penguiflow.steering import SteeringEvent, SteeringEventType
+
+from .state_store_doubles import RecordingStateStore
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -235,3 +243,96 @@ async def test_steering_cursor_on_other_task_applies_before_task_filter(
     )
 
     assert [e.event_id for e in listed] == [events[3].event_id]
+
+
+class _TaskOnlyStore(RecordingStateStore):
+    """Core store with ``save_task`` and no other session method."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: list[TaskState] = []
+
+    async def save_task(self, state: TaskState) -> None:
+        """Record ``state``."""
+        self.tasks.append(state)
+
+
+class _TasksStore(RecordingStateStore, SupportsTasks):
+    """Core store with ``SupportsTasks`` but no ``SupportsSteering``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: list[TaskState] = []
+        self.updates: list[StateUpdate] = []
+
+    @override
+    async def save_task(self, state: TaskState) -> None:
+        self.tasks.append(state)
+
+    @override
+    async def list_tasks(self, session_id: str) -> Sequence[TaskState]:
+        return [task for task in self.tasks if task.session_id == session_id]
+
+    @override
+    async def save_update(self, update: StateUpdate) -> None:
+        self.updates.append(update)
+
+    @override
+    async def list_updates(
+        self,
+        session_id: str,
+        *,
+        task_id: str | None = None,
+        since_id: str | None = None,
+        limit: int = 500,
+    ) -> Sequence[StateUpdate]:
+        selected = [
+            update
+            for update in self.updates
+            if update.session_id == session_id
+            and (task_id is None or update.task_id == task_id)
+        ]
+        if since_id is not None:
+            ids = [update.update_id for update in selected]
+            if since_id in ids:
+                selected = selected[ids.index(since_id) + 1 :]
+        return selected[:limit]
+
+
+def test_session_rejects_store_without_steering_at_construction() -> None:
+    """A core + ``SupportsTasks`` store fails when the session is built."""
+    with pytest.raises(TypeError, match="save_steering") as raised:
+        StreamingSession("s", state_store=_TasksStore())
+
+    assert "list_steering" in str(raised.value)
+
+
+def test_session_rejects_store_with_only_save_task() -> None:
+    """A store with only ``save_task`` names every missing method."""
+    with pytest.raises(TypeError) as raised:
+        StreamingSession("s", state_store=_TaskOnlyStore())
+
+    message = str(raised.value)
+    for method in (
+        "save_update",
+        "save_steering",
+        "list_tasks",
+        "list_updates",
+        "list_steering",
+    ):
+        assert method in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "store",
+    [InMemorySessionStateStore(), RecordingStateStore()],
+    ids=["session-store", "core-store"],
+)
+async def test_session_accepts_full_and_core_stores(
+    store: InMemorySessionStateStore | RecordingStateStore,
+) -> None:
+    """A full session store, or a core store via the adapter, works."""
+    session = StreamingSession("s", state_store=store)
+
+    await session.hydrate()

@@ -75,7 +75,7 @@ GuardrailEvent(
 
 Every event also carries `conversation_history`, plus `last_assistant` and `task_scope` when available. `llm_stream_chunk` is evaluated in both modes, with an `event_callback` set and streaming on (`stream_final_response=True` and a streaming-capable client). In `shadow` mode the chunk is emitted unchanged.
 
-In `tool_call_mode="native"` the events are the same: `llm_before` runs before each LLM call, and streamed chunks are checked before the step returns, so a chunk STOP ends the run.
+In `tool_call_mode="native"` the events are the same: `llm_before` runs before each LLM call, and streamed chunks are checked before the step returns, so a chunk STOP ends the run and a chunk PAUSE pauses it.
 
 ## Context snapshot and `GuardrailContext`
 
@@ -123,14 +123,14 @@ In `enforce` mode:
 
 | Event | STOP | PAUSE | RETRY | REDACT |
 |---|---|---|---|---|
-| `llm_before` | Run finishes `reason="no_path"`; the answer is `stop.user_message` | Ignored | Inserts `corrective_message` as a system message into this LLM call and emits `guardrail_retry`, up to `max_attempts` times per run | Ignored |
+| `llm_before` | Run finishes `reason="no_path"`; the answer is `stop.user_message` | Run pauses before the LLM call | Inserts `corrective_message` as a system message into this LLM call and emits `guardrail_retry`, up to `max_attempts` times per run | Ignored |
 | `tool_call_start` | Tool skipped; run finishes `reason="no_path"` | Run pauses, tool not run | Ignored | Ignored |
 | `tool_call_result` | Run finishes `no_path` (the tool already ran) | Run pauses | Ignored | Result JSON redacted before the LLM sees it |
-| `llm_stream_chunk` | Chunk dropped; after the LLM call the run finishes `no_path` with `stop.user_message` | Chunk dropped | Ignored | Chunk text redacted |
+| `llm_stream_chunk` | Chunk dropped; after the LLM call the run finishes `no_path` with `stop.user_message` | Chunk dropped; after the LLM call the run pauses (a STOP on any chunk wins) | Ignored | Chunk text redacted |
 
-- **STOP:** every STOP, LLM-side (`llm_before`, a stream chunk, a late DEEP STOP landing there) or tool-side, finishes the same way: `reason="no_path"`, `result.payload["raw_answer"]` is `stop.user_message`, `result.metadata["guardrail"]` holds the decision and `result.metadata["error"]` is `guardrail_stop:<rule_id>`. A tool STOP's `tool_call_result` event `result_json` carries `{"error": ..., "failure": {"guardrail": ...}}`. In a parallel plan, a tool STOP only fails that branch.
+- **STOP:** every STOP, LLM-side (`llm_before`, a stream chunk, a late DEEP STOP landing there) or tool-side, finishes the same way: `reason="no_path"`, `result.payload["raw_answer"]` is `stop.user_message`, `result.metadata["guardrail"]` holds the decision and `result.metadata["error"]` is `guardrail_stop:<rule_id>`. A tool STOP's `tool_call_result` event `result_json` carries `{"error": ..., "failure": {"guardrail": ...}}`. In a parallel plan, a STOP on any branch ends the run once all branches finish (the join is skipped, with `{"status": "skipped", "reason": "guardrail_stop"}`), and so does a STOP on the join; a STOP wins over a branch PAUSE.
 - **PAUSE:** `run()` returns `PlannerPause(reason="approval_required")` with `payload["guardrail"] = {"action": "PAUSE", "rule_id", "reason", "decision_id", "severity", "effects", "stop": None, "pause": {"scope", "approver_roles", "prompt", "timeout_s"}}`. No `tool_call_result` event is emitted.
-- **PAUSE without pause support:** on a planner built with `pause_enabled=False`, a PAUSE at `tool_call_start` or `tool_call_result` (including the router's `on_timeout="pause"` PAUSE) becomes a STOP. The run finishes `no_path`, `raw_answer` is `pause.prompt` (or a default message), and `metadata["guardrail"]` holds the decision with `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
+- **PAUSE without pause support:** on a planner built with `pause_enabled=False`, a PAUSE on any event (including the router's `on_timeout="pause"` PAUSE) becomes a STOP. The run finishes `no_path`, `raw_answer` is `pause.prompt` (or a default message), and `metadata["guardrail"]` holds the decision with `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
 - **REDACT on `tool_call_result`:** if the redacted text is no longer valid JSON, the observation the LLM sees (and the step's observation) becomes `{"result": "<redacted text>"}`; the original is never passed on. Keep replacements inside JSON string values, and free of quotes and backslashes, to keep the structure. Trajectory `artifacts` and `sources` are collected after the guardrail, from the redacted observation.
 
 ## Decision resolution
@@ -154,7 +154,7 @@ All are FAST dataclasses with public fields:
 | `ToolAllowlistRule(denied_tools=..., allowed_tools=...)` | `tool_call_start` | STOP `TOOL_DENIED` or `TOOL_NOT_ALLOWED` |
 | `SecretRedactionRule(patterns=...)` | `tool_call_result`, `llm_stream_chunk` | REDACT secret-shaped tokens by offset |
 
-`load_policy_pack(path, env=...)` and `apply_policy_config(registry, gateway, gateway.context_builder, gateway.risk_router, pack)` set gateway, rule, tool-risk and router settings from YAML; see `docs/architecture/planning_orchestration/guardrails_policy_packs.md`.
+`load_policy_pack(path, env=...)` and `apply_policy_config(registry, gateway, gateway.context_builder, gateway.risk_router, pack)` set gateway, rule, tool-risk and router settings from YAML. Register every rule the pack names first (`apply_policy_config` raises `PolicyPackError` for an unknown rule id); `docs/policies/default.yaml` names `tool-allowlist`, `secret-redaction`, `injection-patterns` and the example `HuggingFaceJailbreakRule` (`hf-jailbreak`), and sets `risk_router.llm_before_wait_ms: 5000` for it. See `docs/architecture/planning_orchestration/guardrails_policy_packs.md`.
 
 ## Authoring a rule
 

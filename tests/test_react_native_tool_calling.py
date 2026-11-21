@@ -16,7 +16,7 @@ from penguiflow.llm.profiles import ModelProfile, register_profile
 from penguiflow.llm.protocol import NativeToolCallResult
 from penguiflow.llm.types import ToolCallPart
 from penguiflow.node import Node
-from penguiflow.planner import PlannerFinish, ReactPlanner
+from penguiflow.planner import PlannerFinish, PlannerPause, ReactPlanner
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
     GuardrailAction,
@@ -24,6 +24,7 @@ from penguiflow.planner.guardrails import (
     GuardrailEvent,
     GuardrailGateway,
     GuardrailSeverity,
+    PauseSpec,
     RetrySpec,
     RuleCost,
     RuleRegistry,
@@ -1037,8 +1038,54 @@ def _native_stop() -> GuardrailDecision:
     )
 
 
+def _native_pause() -> GuardrailDecision:
+    return GuardrailDecision(
+        action=GuardrailAction.PAUSE,
+        rule_id="native-guard",
+        reason="needs approval",
+        pause=PauseSpec(prompt="Approve?"),
+    )
+
+
 class TestNativeGuardrails:
     """Guardrails in native tool-calling mode."""
+
+    @pytest.mark.asyncio
+    async def test_llm_before_pause_pauses_without_calling_llm(self) -> None:
+        """An ``llm_before`` PAUSE pauses the run before the LLM call."""
+        client = StubNativeClient([NativeToolCallResult(content="never")])
+        rule = _NativeGuardRule({"llm_before": _native_pause()})
+        planner = make_native_planner(
+            client, max_iters=2, guardrail_gateway=_native_gateway(rule)
+        )
+
+        result = await planner.run("hi")
+
+        assert isinstance(result, PlannerPause)
+        assert result.reason == "approval_required"
+        assert result.payload["guardrail"]["action"] == "PAUSE"
+        assert client.tool_declarations == []
+
+    @pytest.mark.asyncio
+    async def test_stream_pause_pauses_the_run(self) -> None:
+        """A PAUSE on a streamed chunk pauses the run."""
+        events: list[PlannerEvent] = []
+        client = StubNativeClient([NativeToolCallResult(content="BAD answer")])
+        rule = _NativeGuardRule({"llm_stream_chunk": _native_pause()})
+        planner = make_native_planner(
+            client,
+            max_iters=2,
+            stream_final_response=True,
+            event_callback=events.append,
+            guardrail_gateway=_native_gateway(rule),
+        )
+
+        result = await planner.run("hi")
+
+        assert isinstance(result, PlannerPause)
+        assert result.reason == "approval_required"
+        assert result.payload["guardrail"]["rule_id"] == "native-guard"
+        assert ("llm_stream_chunk", "BAD answer") in rule.texts
 
     @pytest.mark.asyncio
     async def test_llm_before_stop_ends_run_without_calling_llm(self) -> None:

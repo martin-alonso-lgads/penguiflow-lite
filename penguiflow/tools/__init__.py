@@ -29,6 +29,7 @@ from .errors import (
     ToolServerError,
     ToolTimeoutError,
 )
+from .mcp_pool import Principal
 from .node import ToolNode
 from .presets import (
     ARTIFACT_PRESETS,
@@ -66,6 +67,8 @@ __all__ = [
     "InMemoryTokenStore",
     "OAuthManager",
     "OAuthProviderConfig",
+    # Node
+    "Principal",
     "ResourceHandlingConfig",
     "RetryPolicy",
     "SessionPoolConfig",

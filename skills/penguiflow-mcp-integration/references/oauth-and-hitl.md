@@ -85,7 +85,7 @@ def build_github_node(manager: OAuthManager, registry: ModelRegistry) -> ToolNod
 - If that user has no token, `connect(ctx)` calls `ctx.pause(...)` with the payload below, and raises `ToolAuthError` if there is still no token afterwards.
 - Without `auth_manager`, any auth attempt raises `ToolAuthError`.
 
-**Per call.** `call()` looks up the calling user's token and pauses the run when it is missing. One ToolNode serves every user: it keeps one MCP session per user, keyed by `(tool_context["tenant_id"], tool_context["user_id"])` and opened with that user's token, each with its own resource cache and subscriptions. Tools, prompts and resource templates are discovered once, on the first session; other users' sessions open on their first call. A new token for a user opens a new session, and a `401` from the server (`ToolAuthError` with `status_code=401`) closes it, so the next call reopens it. `max_concurrency` is shared by all users.
+**Per call.** `call()` looks up the calling user's token and pauses the run when it is missing. One ToolNode serves every user: it keeps one MCP session per user, keyed by `(tool_context["tenant_id"], tool_context["user_id"])` and opened with that user's token, each with its own resource cache and subscriptions. Tools, prompts and resource templates are discovered once, on the first session; other users' sessions open on their first call. A new token for a user opens a new session, and a `401` from the server (`ToolAuthError` with `status_code=401`, on a call or while the session opens) closes it and deletes the stored token it was opened with, so the next call pauses for OAuth consent again. A token stored since (after a new consent) is kept. `max_concurrency` is shared by all users.
 
 Limitation: a server that filters tools per user exposes the first user's tool list to every user. Connect as a user who has every tool, and hide tools per user with a `ToolVisibilityPolicy` at the planner.
 
@@ -177,7 +177,7 @@ The pause reason is `"external_event"`. The host UI uses this payload to render 
 | Pause fires but resume raises `KeyError` | Pause state was in memory and the worker restarted | Implement `save_planner_state`/`load_planner_state` durably |
 | OAuth completed but the tool still pauses | Token stored under another `(user_id, provider)`, or the store isn't shared | Use the same keys; share the store |
 | Every user sees the first user's tools | Tools are discovered once, on the first user's session | Connect as a user who has every tool; hide tools per user with a `ToolVisibilityPolicy` |
-| A user's calls keep failing with `401` | The stored token was revoked; a `401` closes the session, not the stored token | `await manager.token_store.delete(user_id, provider)`, so the next call pauses for OAuth again |
+| A user is asked for OAuth consent again | The server answered `401`: ToolNode closed the session and deleted the rejected token | Expected for a revoked or expired token. If it repeats right after consent, check that the server accepts the token the provider issues |
 | Tokens visible in prompts | Stored in `llm_context` | Keep them in the token store; audit prompt logs |
 
 ## Observability

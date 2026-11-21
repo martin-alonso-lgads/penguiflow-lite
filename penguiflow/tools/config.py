@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
+from typing_extensions import override
 
 from penguiflow.planner.context import ToolContext
 
@@ -501,6 +502,30 @@ class ExternalToolConfig(BaseModel):
     def is_url_connection(self) -> bool:
         """Whether ``connection`` is a URL rather than a command."""
         return self.connection.startswith(_URL_PREFIXES)
+
+    @override
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        """Return a copy with ``update`` applied, validated like a new config.
+
+        Unlike ``BaseModel.model_copy``, the copy runs every field validator
+        and :meth:`validate_config`, so an update that makes the config
+        invalid (for example ``auth_type=BEARER`` on a stdio preset) raises
+        instead of being silently ignored at connect time.
+
+        Args:
+            update: Field values to change in the copy.
+            deep: Whether to deep-copy the field values first.
+
+        Returns:
+            The validated copy.
+
+        Raises:
+            pydantic.ValidationError: If the copy is not a valid config.
+        """
+        copied = super().model_copy(update=update, deep=deep)
+        return self.model_validate(dict(copied))
 
     @model_validator(mode="after")
     def validate_config(self) -> ExternalToolConfig:

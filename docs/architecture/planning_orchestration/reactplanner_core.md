@@ -160,22 +160,42 @@ See `docs/architecture/planning_orchestration/guardrails_policy_packs.md` for fu
 
 #### Policy Pack wiring
 ```python
+from examples.guardrails.huggingface.rule import HuggingFaceJailbreakRule
 from penguiflow.planner.guardrails import (
-    GuardrailGateway,
-    RuleRegistry,
-    ContextSnapshotBuilder,
+    AsyncRuleEvaluator,
     DefaultRiskRouter,
-    load_policy_pack,
+    GuardrailGateway,
+    InjectionPatternRule,
+    RuleRegistry,
+    SecretRedactionRule,
+    ToolAllowlistRule,
     apply_policy_config,
+    load_policy_pack,
+)
+from penguiflow.steering import InMemoryGuardInbox
+
+# Register every rule the pack names first: apply_policy_config only
+# configures registered rules, and raises PolicyPackError for an unknown id.
+registry = RuleRegistry()
+for rule in (
+    ToolAllowlistRule(),
+    SecretRedactionRule(),
+    InjectionPatternRule(),
+    HuggingFaceJailbreakRule(),  # the pack's DEEP rule
+):
+    registry.register(rule)
+
+router = DefaultRiskRouter()
+gateway = GuardrailGateway(
+    registry=registry,
+    guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(registry)),
+    risk_router=router,
 )
 
-registry = RuleRegistry()
-gateway = GuardrailGateway(registry=registry)
-builder = ContextSnapshotBuilder()
-router = DefaultRiskRouter()
-
-policy = load_policy_pack("docs/policies/default.yaml", env="local")
-apply_policy_config(registry, gateway, builder, router, policy)
+policy = load_policy_pack("docs/policies/default.yaml", env="prod")
+apply_policy_config(
+    registry, gateway, gateway.context_builder, router, policy
+)
 ```
 
 #### Policy Pack shape (YAML)

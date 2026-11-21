@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     from ..skills.provider import SkillProvider, SkillProviderFactory
     from ..state import StateStore
     from ..steering import SteeringInbox
+    from ..tools.mcp_pool import Principal
     from .artifact_handling import (
         _ArtifactCollector,
         _SourceCollector,
@@ -1630,11 +1631,12 @@ class ReactPlanner:
         decision = await self.evaluate_guardrail(event)
         if not self.guardrails_enforced():
             decision = None  # Shadow mode: evaluated and logged only.
-        if decision and decision.action.value == "STOP":
-            self.guardrail_stream_decision = decision
-            return
-        if decision and decision.action.value == "PAUSE":
-            self.guardrail_stream_decision = decision
+        if decision and decision.action.value in {"STOP", "PAUSE"}:
+            # The chunk is dropped; the step ends or pauses the run once
+            # the stream is done. A STOP is never replaced by a PAUSE.
+            current = self.guardrail_stream_decision
+            if current is None or current.action.value != "STOP":
+                self.guardrail_stream_decision = decision
             return
         if (
             decision
@@ -1668,12 +1670,9 @@ class ReactPlanner:
         seen: set[int] = set()
         for spec in self.specs:
             tool_node = spec.extra.get("tool_node")
-            if tool_node is None:
+            if tool_node is None or id(tool_node) in seen:
                 continue
-            tool_node_id = id(tool_node)
-            if tool_node_id in seen:
-                continue
-            seen.add(tool_node_id)
+            seen.add(id(tool_node))
 
             set_callback = getattr(
                 tool_node, "set_resource_updated_callback", None
@@ -1681,30 +1680,45 @@ class ReactPlanner:
             if not callable(set_callback):
                 continue
 
-            namespace = spec.extra.get("namespace")
-            if not namespace:
-                namespace = getattr(
-                    getattr(tool_node, "config", None), "name", "unknown"
-                )
+            namespace = spec.extra.get("namespace") or getattr(
+                getattr(tool_node, "config", None), "name", "unknown"
+            )
+            set_callback(self._resource_update_emitter(str(namespace)))
 
-            def _emit_resource_update(
-                uri: str, *, _namespace: str = str(namespace)
-            ) -> None:
-                step = (
-                    len(self.active_trajectory.steps)
-                    if self.active_trajectory
-                    else 0
-                )
-                self.emit_event(
-                    PlannerEvent(
-                        event_type="resource_updated",
-                        ts=self.time_source(),
-                        trajectory_step=step,
-                        extra={"uri": uri, "namespace": _namespace},
-                    )
-                )
+    def _resource_update_emitter(
+        self, namespace: str
+    ) -> Callable[[str, Principal | None], None]:
+        """Return the callback that turns a ToolNode's updates into events.
 
-            set_callback(_emit_resource_update)
+        An update from one user's MCP session becomes a ``resource_updated``
+        event only in a run of that user (the run's ``tenant_id`` and
+        ``user_id``); otherwise it is dropped. An update with no principal
+        applies to every caller and is always emitted.
+        """
+        from ..tools.mcp_pool import principal_from_tool_context
+
+        def _emit(uri: str, principal: Principal | None) -> None:
+            trajectory = self.active_trajectory
+            if principal is not None and (
+                trajectory is None
+                or principal_from_tool_context(trajectory.tool_context or {})
+                != principal
+            ):
+                logger.debug(
+                    "resource_update_dropped",
+                    extra={"uri": uri, "namespace": namespace},
+                )
+                return
+            self.emit_event(
+                PlannerEvent(
+                    event_type="resource_updated",
+                    ts=self.time_source(),
+                    trajectory_step=len(trajectory.steps) if trajectory else 0,
+                    extra={"uri": uri, "namespace": namespace},
+                )
+            )
+
+        return _emit
 
     def _record_arg_event(
         self,

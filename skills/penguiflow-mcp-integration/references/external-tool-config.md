@@ -111,7 +111,7 @@ Production recommendation: run MCP servers as managed services (Docker/k8s) and 
 `utcp_mode: UtcpMode` controls how `connection` is interpreted:
 - `AUTO` (default): `MANUAL_URL` when `connection` ends with `.json`, `/utcp` or `/.well-known/utcp`, else `BASE_URL`.
 - `MANUAL_URL`: `connection` is a UTCP manual (recommended for full discovery).
-- `BASE_URL`: `connection` is a plain endpoint; ToolNode builds one `POST` call template (`cli` type for `CLI`, `http` otherwise), with limited discovery.
+- `BASE_URL`: `connection` is a plain endpoint; ToolNode builds one `POST` call template (`cli` type for `CLI`, `http` otherwise), with limited discovery. An `http` template carries the static auth (`BEARER`, `API_KEY` or `COOKIE`) as UTCP `api_key` auth, for the discovery request (`auth`) and the tools generated from an OpenAPI spec (`auth_tools`).
 
 **Hard rule**: a `utcp_mode` other than `AUTO` with `transport=TransportType.MCP` raises `ValueError("utcp_mode is only valid for HTTP/UTCP transports")` when the config is built.
 
@@ -155,7 +155,7 @@ async def run_once(cfg: ExternalToolConfig, ctx: ToolContext) -> object:
 
 Pass `specs` to your planner's catalog; the planner skill ([[penguiflow-reactplanner-config]]) handles catalog composition. `call()` accepts the namespaced or the bare tool name and returns `{"result": <output after extraction>}`. `connect()` is idempotent, and `call()` connects with its own `ctx` when the node isn't connected or was connected on another event loop. With `OAUTH2_USER`, connect with `connect(ctx)` (see `oauth-and-hitl.md`). `force_reconnect(ctx=None)` is `close()` then `connect(ctx)`. `mcp_session_count` is the number of open MCP sessions.
 
-Presets: `POPULAR_MCP_SERVERS` and `get_preset(name)` give ready `ExternalToolConfig`s (`github`, `filesystem`, `postgres`, `slack`, `duckduckgo`, `brave-search`, `redis`), all `npx`/`uvx` stdio commands with `auth_type=NONE` and credentials as `${VAR}` placeholders in `env` (`github`: `GITHUB_PERSONAL_ACCESS_TOKEN`; `slack`: `SLACK_BOT_TOKEN`, `SLACK_TEAM_ID`; `brave-search`: `BRAVE_API_KEY`). The github, slack and brave-search presets run `@modelcontextprotocol` reference servers that npm marks as deprecated. `get_preset` returns the shared instance; customize a copy with `get_preset("postgres").model_copy(update={...})`.
+Presets: `POPULAR_MCP_SERVERS` and `get_preset(name)` give ready `ExternalToolConfig`s (`github`, `filesystem`, `postgres`, `slack`, `duckduckgo`, `brave-search`, `redis`), all `npx`/`uvx` stdio commands with `auth_type=NONE` and credentials as `${VAR}` placeholders in `env` (`github`: `GITHUB_PERSONAL_ACCESS_TOKEN`; `slack`: `SLACK_BOT_TOKEN`, `SLACK_TEAM_ID`; `brave-search`: `BRAVE_API_KEY`). The github, slack and brave-search presets run `@modelcontextprotocol` reference servers that npm marks as deprecated. `get_preset` returns the shared instance; customize a copy with `get_preset("postgres").model_copy(update={...})`. `ExternalToolConfig.model_copy` validates the copy like a new config, so an invalid update (for example `auth_type=BEARER` on a stdio preset) raises `ValidationError`.
 
 ## Observability hooks
 
@@ -163,7 +163,7 @@ ToolNode tools run as planner tools, so each call emits the usual planner events
 - `tool_call_start` and `tool_call_end`, both emitted before the tool runs (`tool_call_id`, `tool_name`, `action_seq`; `args_json` on start);
 - `tool_call_result` after it finishes, with `result_json`. A failure's `result_json` holds `{"error": ..., "failure": ...}`; there is no `tool_call_error` event;
 - `artifact_stored` for each upload through `ctx.artifacts`;
-- `resource_updated` (`{"uri", "namespace"}`) for resource update notifications.
+- `resource_updated` (`{"uri", "namespace"}`) for resource update notifications. With `OAUTH2_USER`, an update from a user's session is emitted only in a run of that user.
 
 Events carry `ts`, so compute latency from `tool_call_start` to `tool_call_result`. Track per namespace:
 - Connect duration and discovered tool count.

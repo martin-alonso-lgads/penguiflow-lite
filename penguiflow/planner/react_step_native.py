@@ -42,8 +42,8 @@ from .models import NativeToolsLLMClient, PlannerAction, PlannerEvent
 from .react_step import (
     StepState,
     guardrail_before_llm,
-    guardrail_stop_action,
-    stream_stop_decision,
+    guardrail_block_action,
+    stream_block_decision,
 )
 
 if TYPE_CHECKING:
@@ -477,9 +477,9 @@ async def step_native(
     """Run one native-mode step: declare tools, map the reply to an action.
 
     Guardrails run as in the prompted step: ``llm_before`` before the LLM
-    call (STOP ends the run, RETRY adds its corrective message), and the
-    streamed chunks are checked before the step returns, so a STOP on a
-    chunk ends the run.
+    call (STOP ends the run, PAUSE pauses it, RETRY adds its corrective
+    message), and the streamed chunks are checked before the step returns,
+    so a STOP or PAUSE on a chunk ends or pauses the run.
     """
     planner.clear_guardrail_stream_decision()
     had_pending_steering = bool(trajectory.steering_inputs)
@@ -504,10 +504,10 @@ async def step_native(
     finally:
         # Chunks are checked asynchronously; wait for every verdict.
         await planner.finalize_guardrail_stream()
-    stream_stop = stream_stop_decision(planner)
-    if stream_stop is not None:
-        return guardrail_stop_action(
-            planner, trajectory, stream_stop, "guardrail_stream_stop"
+    stream_block = stream_block_decision(planner)
+    if stream_block is not None:
+        return guardrail_block_action(
+            planner, trajectory, stream_block, "guardrail_stream"
         )
     return action
 

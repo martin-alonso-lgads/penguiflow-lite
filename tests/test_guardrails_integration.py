@@ -12,8 +12,26 @@ from pydantic import BaseModel
 from typing_extensions import override
 
 from penguiflow.catalog import build_catalog
+from penguiflow.llm.profiles import ModelProfile
+from penguiflow.llm.protocol import NativeLLMAdapter
+from penguiflow.llm.providers.base import Provider
+from penguiflow.llm.types import (
+    CancelToken,
+    CompletionResponse,
+    LLMMessage,
+    LLMRequest,
+    StreamCallback,
+    StreamEvent,
+    TextPart,
+    Usage,
+)
 from penguiflow.node import Node
-from penguiflow.planner import PlannerFinish, PlannerPause, ReactPlanner
+from penguiflow.planner import (
+    PlannerEvent,
+    PlannerFinish,
+    PlannerPause,
+    ReactPlanner,
+)
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
     GatewayConfig,
@@ -534,6 +552,94 @@ async def test_llm_before_stop_records_guardrail_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_before_pause_pauses_before_calling_llm() -> None:
+    """An ``llm_before`` PAUSE pauses the run before the LLM is called."""
+    client = _RecordingStubClient([])
+    planner = ReactPlanner(
+        llm_client=client,
+        catalog=_demo_catalog(),
+        max_iters=2,
+        guardrail_gateway=_gateway(_ApprovalRule("llm_before")),
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerPause)
+    assert result.reason == "approval_required"
+    guardrail = result.payload["guardrail"]
+    assert guardrail["action"] == "PAUSE"
+    assert guardrail["rule_id"] == "approval"
+    assert guardrail["pause"]["prompt"] == "Approve the demo call?"
+    assert client.calls == []
+
+
+def _pause_once() -> Callable[[GuardrailEvent], GuardrailDecision | None]:
+    """Return a decision function that pauses only its first event."""
+    seen: list[str] = []
+
+    def decide(event: GuardrailEvent) -> GuardrailDecision | None:
+        if seen:
+            return None
+        seen.append(event.event_type)
+        return GuardrailDecision(
+            action=GuardrailAction.PAUSE,
+            rule_id="approval",
+            reason="needs approval",
+            pause=PauseSpec(prompt="Approve?"),
+        )
+
+    return decide
+
+
+@pytest.mark.asyncio
+async def test_llm_before_pause_resumes_and_calls_llm() -> None:
+    """A run paused at ``llm_before`` resumes, then calls the LLM."""
+    client = _RecordingStubClient([_answer("approved")])
+    rule = _FixedDecisionRule(
+        "approval", frozenset({"llm_before"}), _pause_once()
+    )
+    planner = ReactPlanner(
+        llm_client=client,
+        catalog=_demo_catalog(),
+        max_iters=2,
+        guardrail_gateway=_gateway(rule),
+    )
+
+    paused = await planner.run("hi")
+    assert isinstance(paused, PlannerPause)
+    assert client.calls == []
+    result = await planner.resume(paused.resume_token, user_input="ok")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "answer_complete"
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_before_pause_without_pause_support_stops() -> None:
+    """With pause disabled, an ``llm_before`` PAUSE ends the run."""
+    client = _RecordingStubClient([])
+    planner = ReactPlanner(
+        llm_client=client,
+        catalog=_demo_catalog(),
+        max_iters=2,
+        pause_enabled=False,
+        guardrail_gateway=_gateway(_ApprovalRule("llm_before")),
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    guardrail = result.metadata["guardrail"]
+    assert guardrail["action"] == "STOP"
+    assert guardrail["requested_action"] == "PAUSE"
+    assert guardrail["pause_disabled"] is True
+    assert result.payload["raw_answer"] == "Approve the demo call?"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_shadow_mode_logs_every_event_type(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -627,3 +733,170 @@ async def test_invalid_json_redaction_never_reaches_the_llm() -> None:
     assert "sk-abc" not in json.dumps(observation)
     assert "[REDACTED]" in json.dumps(observation)
     assert "sk-abc" not in json.dumps(client.calls[-1])
+
+
+class _StreamingProvider(Provider):
+    """Provider double that streams a final-response action in chunks."""
+
+    def __init__(self, model: str, chunks: list[str]) -> None:
+        self._model = model
+        self._chunks = chunks
+        self.streamed: list[bool] = []
+
+    @property
+    @override
+    def provider_name(self) -> str:
+        return "fake"
+
+    @property
+    @override
+    def profile(self) -> ModelProfile:
+        return ModelProfile()
+
+    @property
+    @override
+    def model(self) -> str:
+        return self._model
+
+    @override
+    async def complete(
+        self,
+        request: LLMRequest,
+        *,
+        timeout_s: float | None = None,
+        cancel: CancelToken | None = None,
+        stream: bool = False,
+        on_stream_event: StreamCallback | None = None,
+    ) -> CompletionResponse:
+        self.streamed.append(stream and on_stream_event is not None)
+        if stream and on_stream_event is not None:
+            for chunk in self._chunks:
+                on_stream_event(StreamEvent(delta_text=chunk))
+            on_stream_event(StreamEvent(done=True))
+        return CompletionResponse(
+            message=LLMMessage(
+                role="assistant", parts=[TextPart(text="".join(self._chunks))]
+            ),
+            usage=Usage(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+
+
+def _streamed_answer(*answer_parts: str) -> list[str]:
+    """Chunks of a streamed final-response action with that answer."""
+    head = '{"thought": "answer", "next_node": "final_response", '
+    return [f'{head}"args": {{"answer": "', *answer_parts, '"}}']
+
+
+def _streaming_planner(
+    monkeypatch: pytest.MonkeyPatch,
+    rule: GuardrailRule,
+    chunks: list[str],
+    events: list[PlannerEvent],
+) -> tuple[ReactPlanner, _StreamingProvider]:
+    """A prompted-mode planner over a real adapter that streams ``chunks``."""
+    providers: list[_StreamingProvider] = []
+
+    def create_provider(model: str, **_: object) -> _StreamingProvider:
+        providers.append(_StreamingProvider(model, chunks))
+        return providers[-1]
+
+    monkeypatch.setattr(
+        "penguiflow.llm.protocol.create_provider", create_provider
+    )
+    planner = ReactPlanner(
+        llm_client=NativeLLMAdapter("fake-model"),
+        catalog=_demo_catalog(),
+        max_iters=2,
+        stream_final_response=True,
+        event_callback=events.append,
+        guardrail_gateway=_gateway(rule),
+    )
+    (provider,) = providers
+    return planner, provider
+
+
+def _decide_on_chunk(event: GuardrailEvent) -> GuardrailDecision | None:
+    text = event.text_content or ""
+    if "STOPME" in text:
+        return _stop(event)
+    if "PAUSEME" in text:
+        return GuardrailDecision(
+            action=GuardrailAction.PAUSE,
+            rule_id="approver",
+            reason="needs approval",
+            pause=PauseSpec(prompt="Approve?"),
+        )
+    return None
+
+
+def _answer_texts(events: list[PlannerEvent]) -> str:
+    return "".join(
+        str(event.extra.get("text", ""))
+        for event in events
+        if event.event_type == "llm_stream_chunk"
+        and event.extra.get("channel") == "answer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompted_stream_stop_ends_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In prompted mode, a STOP on a streamed chunk ends the run."""
+    events: list[PlannerEvent] = []
+    rule = _FixedDecisionRule(
+        "blocker", frozenset({"llm_stream_chunk"}), _decide_on_chunk
+    )
+    planner, provider = _streaming_planner(
+        monkeypatch, rule, _streamed_answer("STOPME answer"), events
+    )
+
+    result = await planner.run("hi")
+
+    assert provider.streamed == [True]
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.metadata["guardrail"]["rule_id"] == "blocker"
+    assert result.payload["raw_answer"] == "Blocked by policy."
+    assert "STOPME" not in _answer_texts(events)
+
+
+@pytest.mark.asyncio
+async def test_prompted_stream_pause_pauses_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In prompted mode, a PAUSE on a streamed chunk pauses the run."""
+    events: list[PlannerEvent] = []
+    rule = _FixedDecisionRule(
+        "approver", frozenset({"llm_stream_chunk"}), _decide_on_chunk
+    )
+    planner, _ = _streaming_planner(
+        monkeypatch, rule, _streamed_answer("PAUSEME answer"), events
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerPause)
+    assert result.reason == "approval_required"
+    assert result.payload["guardrail"]["rule_id"] == "approver"
+    assert "PAUSEME" not in _answer_texts(events)
+
+
+@pytest.mark.asyncio
+async def test_stream_stop_is_not_replaced_by_a_later_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A STOP on an early chunk still ends the run after a later PAUSE."""
+    events: list[PlannerEvent] = []
+    rule = _FixedDecisionRule(
+        "blocker", frozenset({"llm_stream_chunk"}), _decide_on_chunk
+    )
+    planner, _ = _streaming_planner(
+        monkeypatch, rule, _streamed_answer("STOPME ", "PAUSEME"), events
+    )
+
+    result = await planner.run("hi")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.payload["raw_answer"] == "Blocked by policy."

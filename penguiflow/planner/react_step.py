@@ -10,6 +10,13 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from . import prompts
+from .guardrail_outcomes import (
+    BLOCKING_ACTIONS,
+    GUARDRAIL_PAUSE_KEY,
+    GUARDRAIL_STOP_KEY,
+    pauses_run,
+    stop_payload,
+)
 from .llm import _coerce_llm_response, supports_callback_streaming
 from .migration import normalize_action_with_debug
 from .models import PlannerAction, PlannerEvent
@@ -237,40 +244,44 @@ def _stream_allowed(
     )
 
 
-GUARDRAIL_STOP_KEY = "guardrail_stop"
-"""Trajectory metadata key of an LLM-side guardrail STOP's decision."""
-
-
-def guardrail_stop_action(
+def guardrail_block_action(
     planner: ReactPlanner,
     trajectory: Trajectory,
     decision: GuardrailDecision,
     thought: str,
 ) -> PlannerAction:
-    """Build the final action that ends the run on a guardrail STOP.
+    """Build the action of a step that a guardrail STOP or PAUSE ended.
 
-    The decision is kept in ``trajectory.metadata[GUARDRAIL_STOP_KEY]``,
-    so the run loop finishes with ``reason="no_path"`` and
-    ``metadata["guardrail"]``, the same as a tool-side STOP.
+    The decision is kept in ``trajectory.metadata``: a PAUSE the planner
+    can honour under ``GUARDRAIL_PAUSE_KEY``, anything else under
+    ``GUARDRAIL_STOP_KEY``. The run loop then pauses the run
+    (``reason="approval_required"``) or finishes it (``reason="no_path"``
+    with ``metadata["guardrail"]``), the same as for a tool-side decision.
     """
-    trajectory.metadata[GUARDRAIL_STOP_KEY] = (
-        planner.guardrail_decision_payload(decision)
-    )
+    if pauses_run(planner, decision):
+        trajectory.metadata[GUARDRAIL_PAUSE_KEY] = (
+            planner.guardrail_decision_payload(decision)
+        )
+    else:
+        trajectory.metadata[GUARDRAIL_STOP_KEY] = stop_payload(
+            planner, decision
+        )
     stop_message = decision.stop.user_message if decision.stop else None
+    action = decision.action.value.lower()
     return PlannerAction(
         next_node="final_response",
         args={"answer": stop_message or "Unable to complete the request."},
-        thought=f"{thought}:{decision.rule_id}",
+        thought=f"{thought}_{action}:{decision.rule_id}",
     )
 
 
-def stream_stop_decision(planner: ReactPlanner) -> GuardrailDecision | None:
-    """Return the enforced STOP a streamed chunk triggered, if any."""
+def stream_block_decision(planner: ReactPlanner) -> GuardrailDecision | None:
+    """Return the enforced STOP or PAUSE a streamed chunk triggered."""
     decision = planner.guardrail_stream_decision
     if (
         decision is not None
         and planner.guardrails_enforced()
-        and decision.action.value == "STOP"
+        and decision.action.value in BLOCKING_ACTIONS
     ):
         return decision
     return None
@@ -309,7 +320,9 @@ async def guardrail_before_llm(
 ) -> PlannerAction | None:
     """Evaluate the ``llm_before`` guardrail; return an action to stop.
 
-    A RETRY rewrites ``state.messages`` with its corrective message.
+    A STOP or PAUSE returns the action that ends or pauses the run (see
+    :func:`guardrail_block_action`). A RETRY rewrites ``state.messages``
+    with its corrective message.
     """
     latest_user = next(
         (
@@ -328,9 +341,9 @@ async def guardrail_before_llm(
     )
     if decision is None or not planner.guardrails_enforced():
         return None
-    if decision.action.value == "STOP":
-        return guardrail_stop_action(
-            planner, trajectory, decision, "guardrail_stop"
+    if decision.action.value in BLOCKING_ACTIONS:
+        return guardrail_block_action(
+            planner, trajectory, decision, "guardrail"
         )
     if decision.action.value == "RETRY" and decision.retry is not None:
         _apply_guardrail_retry(
@@ -404,7 +417,8 @@ async def _attempt_step(
             prompts.render_repair_message(state.last_error),
         )
     if planner.guardrails_enabled():
-        # Before the stream opens, so a STOP leaves no stream handler open.
+        # Before the stream opens, so a STOP or PAUSE leaves no stream
+        # handler open.
         stop = await guardrail_before_llm(planner, trajectory, state)
         if stop is not None:
             return stop
@@ -418,10 +432,10 @@ async def _attempt_step(
         stream=stream,
     )
     raw, cost = _coerce_llm_response(llm_result)
-    stream_stop = stream_stop_decision(planner)
-    if stream_stop is not None:
-        return guardrail_stop_action(
-            planner, trajectory, stream_stop, "guardrail_stream_stop"
+    stream_block = stream_block_decision(planner)
+    if stream_block is not None:
+        return guardrail_block_action(
+            planner, trajectory, stream_block, "guardrail_stream"
         )
     state.last_raw = raw
     planner.cost_tracker.record_main_call(cost)

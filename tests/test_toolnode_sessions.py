@@ -16,13 +16,19 @@ from penguiflow.tools.auth import (
     OAuthProviderConfig,
 )
 from penguiflow.tools.config import AuthType, ExternalToolConfig
-from penguiflow.tools.errors import ToolAuthError, ToolNodeError
+from penguiflow.tools.errors import (
+    ToolAuthError,
+    ToolConnectionError,
+    ToolNodeError,
+)
 from penguiflow.tools.node import McpMessageRouter, ToolNode
 
 from .tool_context_doubles import FakeToolContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from penguiflow.tools.mcp_pool import Principal
 
 pytest.importorskip("tenacity")
 
@@ -78,6 +84,7 @@ class FakeMcpClient:
         self.exit_info: tuple[object, ...] = ()
         self.fail_next_call: Exception | None = None
         self.release: asyncio.Event | None = None
+        self.waiting = asyncio.Event()
 
     @property
     def token(self) -> str:
@@ -106,6 +113,7 @@ class FakeMcpClient:
         """Return the token the call was made with."""
         self.calls.append((name, args))
         if self.release is not None:
+            self.waiting.set()
             await self.release.wait()
         if self.fail_next_call is not None:
             error, self.fail_next_call = self.fail_next_call, None
@@ -194,6 +202,7 @@ class Harness:
         )
         self.clients: list[FakeMcpClient] = []
         self.open_delay = 0.0
+        self.open_error: Exception | None = None
         monkeypatch.setattr(self.node, "open_mcp_client", self._open)
 
     async def _open(
@@ -201,6 +210,10 @@ class Harness:
     ) -> FakeMcpClient:
         if self.open_delay:
             await asyncio.sleep(self.open_delay)
+        if self.open_error is not None:
+            # Like the real opener, wrap the server's rejection.
+            msg = f"Failed to connect: {self.open_error}"
+            raise ToolConnectionError(msg) from self.open_error
         client = FakeMcpClient(auth_headers, router)
         self.clients.append(client)
         return client
@@ -305,10 +318,10 @@ async def test_token_change_replaces_session_and_clears_cache(
 
 
 @pytest.mark.asyncio
-async def test_401_discards_session_and_next_call_reopens(
+async def test_401_discards_session_and_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An auth failure closes the session; the next call opens another."""
+    """A 401 closes the session and deletes the token, so consent runs."""
     harness = Harness(monkeypatch)
     await harness.login("u1")
     await harness.node.connect(harness.ctx("u1"))
@@ -318,11 +331,89 @@ async def test_401_discards_session_and_next_call_reopens(
     with pytest.raises(ToolAuthError):
         await _call(harness, "u1")
     await asyncio.sleep(0)
-    result = await _call(harness, "u1")
+    ctx = harness.ctx("u1")
+    with pytest.raises(ToolAuthError, match="was not completed"):
+        await harness.node.call("docs.whoami", {}, ctx)
 
     assert first_client.exited is True
+    assert await harness.store.get("u1", "docs") is None
+    assert ctx.paused_payload is not None
+    pause_payload = ctx.paused_payload["payload"]
+    assert isinstance(pause_payload, dict)
+    assert pause_payload["pause_type"] == "oauth"
+
+
+@pytest.mark.asyncio
+async def test_after_401_new_token_opens_new_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the user consents again, the next call uses the new token."""
+    harness = Harness(monkeypatch)
+    await harness.login("u1")
+    await harness.node.connect(harness.ctx("u1"))
+    harness.client_for("tok-u1").fail_next_call = _UnauthorizedError(
+        "token revoked"
+    )
+    with pytest.raises(ToolAuthError):
+        await _call(harness, "u1")
+
+    await harness.login("u1", "tok-u1-new")
+    result = await _call(harness, "u1")
+
+    assert result == {"result": {"token": "tok-u1-new"}}
     assert len(harness.clients) == 2
-    assert result == {"result": {"token": "tok-u1"}}
+
+
+@pytest.mark.asyncio
+async def test_401_keeps_a_token_stored_since(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 never deletes a token newer than the rejected one."""
+    harness = Harness(monkeypatch)
+    await harness.login("u1")
+    await harness.node.connect(harness.ctx("u1"))
+    client = harness.client_for("tok-u1")
+    client.release = asyncio.Event()
+    client.fail_next_call = _UnauthorizedError("token revoked")
+
+    call = asyncio.create_task(_call(harness, "u1"))
+    await client.waiting.wait()  # the call is now inside the server
+    await harness.login("u1", "tok-u1-new")
+    client.release.set()
+    with pytest.raises(ToolAuthError):
+        await call
+
+    assert await harness.store.get("u1", "docs") == "tok-u1-new"
+
+
+@pytest.mark.asyncio
+async def test_401_while_opening_deletes_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token the server rejects at connect time is not reused either."""
+    harness = Harness(monkeypatch)
+    await harness.login("u1")
+    harness.open_error = _UnauthorizedError("token revoked")
+
+    with pytest.raises(ToolConnectionError):
+        await _call(harness, "u1")
+
+    assert await harness.store.get("u1", "docs") is None
+
+
+@pytest.mark.asyncio
+async def test_other_open_failure_keeps_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure that is not a 401 leaves the token stored."""
+    harness = Harness(monkeypatch)
+    await harness.login("u1")
+    harness.open_error = RuntimeError("server down")
+
+    with pytest.raises(ToolConnectionError):
+        await _call(harness, "u1")
+
+    assert await harness.store.get("u1", "docs") == "tok-u1"
 
 
 @pytest.mark.asyncio
@@ -493,8 +584,10 @@ async def test_update_notification_invalidates_only_that_users_cache(
     uri = "file:///doc.txt"
     await harness.node.read_resource(uri, harness.ctx("u1"))
     await harness.node.read_resource(uri, harness.ctx("u2"))
-    updated: list[str] = []
-    harness.node.set_resource_updated_callback(updated.append)
+    updated: list[tuple[str, Principal | None]] = []
+    harness.node.set_resource_updated_callback(
+        lambda uri, principal: updated.append((uri, principal))
+    )
 
     await harness.client_for("tok-u1").router(
         mcp_types.ServerNotification(
@@ -508,7 +601,7 @@ async def test_update_notification_invalidates_only_that_users_cache(
     await harness.node.read_resource(uri, harness.ctx("u1"))
     await harness.node.read_resource(uri, harness.ctx("u2"))
 
-    assert updated == [uri]
+    assert updated == [(uri, ("acme", "u1"))]
     assert harness.client_for("tok-u1").reads == [uri, uri]
     assert harness.client_for("tok-u2").reads == [uri]
 

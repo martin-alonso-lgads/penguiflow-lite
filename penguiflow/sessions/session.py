@@ -31,6 +31,7 @@ from penguiflow.planner.trajectory import (
     BackgroundTaskResult,
     extract_background_results,
 )
+from penguiflow.state.protocol import require_capabilities
 from penguiflow.steering import (
     MAX_STEERING_PAYLOAD_BYTES,
     SteeringCancelled,
@@ -64,6 +65,7 @@ from .models import (
     parse_merge_strategy,
 )
 from .persistence import (
+    SESSION_STORE_METHODS,
     InMemorySessionStateStore,
     SessionStateStore,
     StateStoreSessionAdapter,
@@ -430,13 +432,29 @@ class StreamingSession:
         state_store: SessionStateStore | StateStore | None = None,
         telemetry_sink: TaskTelemetrySink | None = None,
     ) -> None:
-        """Create a session with its policy, limits and state store."""
+        """Create a session with its policy, limits and state store.
+
+        A ``state_store`` with ``save_task`` is used directly, so it must
+        implement all six ``SessionStateStore`` methods; one without it
+        records session data as events through ``StateStoreSessionAdapter``.
+
+        Raises:
+            TypeError: If ``state_store`` has ``save_task`` but lacks another
+                session method, or is neither kind of store.
+        """
         self.session_id = session_id
         self._limits = limits or SessionLimits()
         self._state_store: SessionStateStore
         if state_store is None:
             self._state_store = InMemorySessionStateStore()
         elif hasattr(state_store, "save_task"):
+            # Used directly, so it must have every session method; a
+            # partial store fails here instead of on first use.
+            require_capabilities(
+                state_store,
+                feature="sessions",
+                methods=SESSION_STORE_METHODS,
+            )
             self._state_store = cast("SessionStateStore", state_store)
         elif hasattr(state_store, "save_event") and hasattr(
             state_store, "load_history"

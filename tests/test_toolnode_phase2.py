@@ -37,6 +37,8 @@ from .tool_context_doubles import FakeToolContext
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from penguiflow.tools.mcp_pool import Principal
+
 pytest.importorskip("tenacity")
 
 
@@ -781,7 +783,8 @@ def test_toolnode_handle_resource_updated_invokes_callback() -> None:
 
     seen: list[str] = []
 
-    def _callback(uri: str) -> None:
+    def _callback(uri: str, principal: Principal | None) -> None:
+        assert principal is None  # the update applies to every session
         seen.append(uri)
 
     node.set_resource_updated_callback(_callback)
@@ -838,8 +841,10 @@ async def test_handle_mcp_message_routes_resource_updates(
     await cache.get_or_fetch(
         "file:///data/a.txt", read_fn, DummyCtx(artifact_store)
     )
-    updated: list[str] = []
-    node.set_resource_updated_callback(updated.append)
+    updated: list[tuple[str, Principal | None]] = []
+    node.set_resource_updated_callback(
+        lambda uri, principal: updated.append((uri, principal))
+    )
     subscribed: list[str] = []
     assert await node.subscribe_resource(
         "file:///data/a.txt", subscribed.append
@@ -849,15 +854,17 @@ async def test_handle_mcp_message_routes_resource_updates(
     await asyncio.sleep(0)
 
     assert cache.size == 0
-    assert updated == ["file:///data/a.txt"]
+    assert updated == [("file:///data/a.txt", None)]
     assert subscribed == ["file:///data/a.txt"]
 
 
 def test_handle_mcp_message_ignores_other_messages() -> None:
     """Messages other than resource updates are ignored."""
     node = ToolNode(config=build_config(), registry=ModelRegistry())
-    updated: list[str] = []
-    node.set_resource_updated_callback(updated.append)
+    updated: list[tuple[str, Principal | None]] = []
+    node.set_resource_updated_callback(
+        lambda uri, principal: updated.append((uri, principal))
+    )
 
     node.handle_mcp_message(
         mcp_types.ServerNotification(

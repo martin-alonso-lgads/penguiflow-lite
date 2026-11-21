@@ -88,3 +88,43 @@ def test_google_drive_preset_removed() -> None:
     assert "google-drive" not in POPULAR_MCP_SERVERS
     with pytest.raises(ValueError, match="Unknown preset"):
         get_preset("google-drive")
+
+
+def test_model_copy_rejects_an_invalid_update() -> None:
+    """A copied preset is validated, so header auth on stdio raises."""
+    with pytest.raises(ValidationError, match="needs an MCP URL connection"):
+        get_preset("github").model_copy(
+            update={
+                "auth_type": AuthType.BEARER,
+                "auth_config": {"token": "x"},
+            }
+        )
+
+
+def test_model_copy_validates_and_coerces_fields() -> None:
+    """A valid update is coerced like a new config; the preset is kept."""
+    preset = get_preset("postgres")
+
+    copied = preset.model_copy(
+        update={"env": {"DATABASE_URL": "postgres://db"}, "auth_type": "none"}
+    )
+
+    assert copied.env == {"DATABASE_URL": "postgres://db"}
+    assert copied.auth_type is AuthType.NONE
+    assert preset.env == {"DATABASE_URL": "${DATABASE_URL}"}
+
+
+def test_model_copy_keeps_output_transformer() -> None:
+    """The excluded ``output_transformer`` survives shallow and deep copies."""
+
+    async def transformer(name: str, result: object, ctx: object) -> object:
+        return (name, result, ctx)
+
+    config = _config(connection=URL, output_transformer=transformer)
+
+    shallow = config.model_copy(update={"timeout_s": 5.0})
+    deep = config.model_copy(update={"timeout_s": 5.0}, deep=True)
+
+    assert shallow.output_transformer is transformer
+    assert deep.output_transformer is transformer
+    assert shallow.timeout_s == deep.timeout_s == 5.0

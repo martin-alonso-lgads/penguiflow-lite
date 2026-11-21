@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import textwrap
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+from examples.guardrails.huggingface.rule import HuggingFaceJailbreakRule
 from penguiflow.planner.guardrails import (
     AsyncRuleEvaluator,
     ContextSnapshotBuilder,
+    ContextSnapshotV1,
     DefaultRiskRouter,
     GatewayConfig,
+    GuardrailEvent,
     GuardrailGateway,
+    InjectionPatternRule,
     RuleRegistry,
     SecretRedactionRule,
     ToolAllowlistRule,
@@ -19,8 +23,9 @@ from penguiflow.planner.guardrails import (
 )
 from penguiflow.steering import InMemoryGuardInbox
 
-if TYPE_CHECKING:
-    from pathlib import Path
+DEFAULT_POLICY = (
+    Path(__file__).resolve().parents[1] / "docs" / "policies" / "default.yaml"
+)
 
 
 def test_load_policy_pack_env_override(tmp_path: Path) -> None:
@@ -102,3 +107,32 @@ def test_apply_policy_config_updates_rules_and_gateway(tmp_path: Path) -> None:
         if rule.rule_id == "secret-redaction"
     )
     assert secret.enabled is False
+
+
+def test_default_policy_pack_waits_for_its_llm_before_rule() -> None:
+    """The default pack applies as documented and waits for hf-jailbreak."""
+    registry = RuleRegistry()
+    for rule in (
+        ToolAllowlistRule(),
+        SecretRedactionRule(),
+        InjectionPatternRule(),
+        HuggingFaceJailbreakRule(),
+    ):
+        registry.register(rule)
+    router = DefaultRiskRouter()
+    gateway = GuardrailGateway(
+        registry=registry,
+        guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(registry)),
+        risk_router=router,
+    )
+
+    policy = load_policy_pack(DEFAULT_POLICY, env="prod")
+    apply_policy_config(
+        registry, gateway, gateway.context_builder, router, policy
+    )
+
+    routing = router.route(
+        GuardrailEvent(event_type="llm_before", run_id="r"),
+        ContextSnapshotV1(),
+    )
+    assert routing.async_wait_ms == 5000.0

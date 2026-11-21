@@ -68,14 +68,14 @@ For the artifact path, fetch the bytes with `await ctx.artifacts.download(result
 
 Each MCP session's fastmcp client gets a message handler that routes that server's messages to the session (fastmcp's default task-status handling still runs after it). `subscribe_resource(uri, callback=None, ctx=None)` sends `resources/subscribe` through the caller's MCP session and records the callback on that session. When the server sends `notifications/resources/updated` for a URI, ToolNode:
 1. invalidates that URI in that session's read cache;
-2. calls the callback set with `set_resource_updated_callback(callback)`, for every updated URI;
+2. calls the callback set with `set_resource_updated_callback(callback)` as `callback(uri, principal)`, for every updated URI. `principal` is the `(tenant_id, user_id)` of the per-user session that received it, or `None` for the shared session;
 3. calls that session's `subscribe_resource` callback of that URI, with the URI. It may be sync or async, and runs as a background task.
 
-`ToolNode.handle_resource_updated(uri)` (and `handle_mcp_message(message)` for an update notification) does steps 1 and 3 for every session and step 2 once. Callback exceptions are logged, not raised. Other server messages are ignored by ToolNode.
+`ToolNode.handle_resource_updated(uri)` (and `handle_mcp_message(message)` for an update notification) does steps 1 and 3 for every session and step 2 once, with `principal=None`. Callback exceptions are logged, not raised. Other server messages are ignored by ToolNode.
 
 Notes:
 - `subscribe_resource` returns `False` when the node isn't connected, the server has no resources, or the server rejects the request; subscribing to a URI twice keeps the first callback. `unsubscribe_resource` returns `False` for a URI you didn't subscribe to.
-- When the ToolNode's tools are in a `ReactPlanner` catalog, the planner owns `set_resource_updated_callback`: it installs its own callback, which emits a `resource_updated` planner event with `{"uri", "namespace"}`, and re-installs it when the catalog refreshes. Use `subscribe_resource` callbacks, or that event, for your own handling.
+- When the ToolNode's tools are in a `ReactPlanner` catalog, the planner owns `set_resource_updated_callback`: it installs its own callback, which emits a `resource_updated` planner event with `{"uri", "namespace"}`, and re-installs it when the catalog refreshes. An update with a principal is emitted only in a run of that user (the run's `tool_context` `tenant_id` and `user_id`) and dropped otherwise, so one user's update never reaches another user's run; an update with `principal=None` is always emitted. Use `subscribe_resource` callbacks, or that event, for your own handling.
 - A subscription belongs to its MCP session. It is dropped (and logged) when that session closes: on `close()`, on a reconnect (`force_reconnect()` or an event loop change), and when a per-user session is replaced (new token, `401`) or evicted (`session_pool`). Subscribe again afterwards; the new `subscribe_resource` call asks the server again.
 
 ## Cache behavior

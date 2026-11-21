@@ -41,7 +41,7 @@ When you need exact behavior, open the code:
    - stable ordering on reads (tie-breaker for equal timestamps),
    - cancellation-friendly async I/O and bounded timeouts.
 3. If the deployment uses `A2AAgentToolset` router-to-specialist continuity, add the optional conversation binding methods: `find_binding`, `list_bindings`, `mark_binding_terminal`.
-4. Add optional capabilities and verify cursor semantics (`since_id` is exclusive; ordering is stable). A store with `save_task` is used directly by sessions, so it also needs `save_update`, `save_steering`, `list_tasks`, `list_updates` and `list_steering`.
+4. Add optional capabilities and verify cursor semantics (`since_id` is exclusive; ordering is stable). A store with `save_task` is used directly by sessions, so it also needs `save_update`, `save_steering`, `list_tasks`, `list_updates` and `list_steering`; `StreamingSession` raises `TypeError` naming the missing ones when it is built with a partial store. A store without `save_task` goes through `StateStoreSessionAdapter`.
 5. Add an artifact store either by returning `artifact_store` or by having the store implement `ArtifactStore`. Implement all seven methods, `list(scope=...)` included: `ArtifactStore` is `@runtime_checkable`, and a store that fails `isinstance` is not discovered, so the planner silently falls back to `NoOpArtifactStore`.
 6. Run and extend tests; include negative/error-path coverage for your backend.
 

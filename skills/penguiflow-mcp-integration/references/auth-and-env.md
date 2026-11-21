@@ -6,7 +6,7 @@
 |---|---|
 | MCP over stdio (`connection` is a command) | Only through `env=`. No HTTP headers exist, so the config accepts only `auth_type=NONE`. |
 | MCP over a URL (`http(s)://`, `ws(s)://`) | Auth headers, sent when the MCP session opens (not per call). With `OAUTH2_USER`, each user gets their own session, opened with their token. |
-| UTCP / HTTP / CLI | No auth headers. `env` and `auth_config` values are passed to the utcp client as variables, named by their keys, for the UTCP manual's call templates to reference (the call template ToolNode builds in `BASE_URL` mode carries no auth). `OAUTH2_USER` is rejected. |
+| UTCP / HTTP / CLI | `env` and `auth_config` values are passed to the utcp client as variables, named by their keys, for the UTCP manual's call templates to reference. In `BASE_URL` mode, the `http` call template ToolNode builds also carries the static auth (`BEARER`, `API_KEY`, `COOKIE`) as UTCP `api_key` auth, in both `auth` (the discovery request) and `auth_tools` (tools generated from an OpenAPI spec); a `cli` template carries none. `OAUTH2_USER` is rejected. |
 
 ## Stdio servers: `env=`
 

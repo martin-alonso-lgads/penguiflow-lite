@@ -38,6 +38,11 @@ from .artifact_handling import _ArtifactCollector, _SourceCollector
 from .artifact_registry import ArtifactRegistry
 from .constraints import _ConstraintTracker, _CostTracker
 from .error_recovery import ErrorRecoveryConfig, step_with_recovery
+from .guardrail_outcomes import (
+    GUARDRAIL_PAUSE_KEY,
+    GUARDRAIL_STOP_KEY,
+    guardrail_pause,
+)
 from .llm_context_hooks import LLMContextHook, LLMContextHookInput
 from .models import (
     PlannerAction,
@@ -51,7 +56,6 @@ from .models import (
     ToolSearchConfig,
     ToolVisibilityPolicy,
 )
-from .react_step import GUARDRAIL_STOP_KEY
 from .react_utils import _serialize_validation_errors
 from .streaming import _StreamingArgsExtractor
 from .tool_aliasing import build_aliased_tool_catalog, rewrite_action_node
@@ -2501,6 +2505,30 @@ def _finish_guardrail_stop(
     )
 
 
+async def _take_guardrail_outcome(
+    planner: ReactPlanner, trajectory: Trajectory, state: _LoopState
+) -> PlannerFinish | PlannerPause | None:
+    """End or pause the run for a guardrail decision the step recorded.
+
+    LLM-side checks and parallel plans leave a STOP under
+    ``GUARDRAIL_STOP_KEY`` and a PAUSE under ``GUARDRAIL_PAUSE_KEY`` in
+    ``trajectory.metadata``; both keys are consumed here.
+    """
+    guardrail_stop = trajectory.metadata.pop(GUARDRAIL_STOP_KEY, None)
+    guardrail_paused = trajectory.metadata.pop(GUARDRAIL_PAUSE_KEY, None)
+    if isinstance(guardrail_stop, Mapping):
+        return _finish_guardrail_stop(
+            planner,
+            trajectory,
+            guardrail_stop,
+            state.tracker,
+            error=f"guardrail_stop:{guardrail_stop.get('rule_id')}",
+        )
+    if isinstance(guardrail_paused, Mapping):
+        return await guardrail_pause(planner, trajectory, guardrail_paused)
+    return None
+
+
 async def _run_step(
     planner: ReactPlanner, trajectory: Trajectory, state: _LoopState
 ) -> PlannerFinish | PlannerPause | None:
@@ -2524,15 +2552,9 @@ async def _run_step(
     step_start_ts, current_action_seq = _emit_step_start(planner, trajectory)
 
     action = await _select_action(planner, trajectory, state)
-    guardrail_stop = trajectory.metadata.pop(GUARDRAIL_STOP_KEY, None)
-    if isinstance(guardrail_stop, Mapping):
-        return _finish_guardrail_stop(
-            planner,
-            trajectory,
-            guardrail_stop,
-            state.tracker,
-            error=f"guardrail_stop:{guardrail_stop.get('rule_id')}",
-        )
+    blocked = await _take_guardrail_outcome(planner, trajectory, state)
+    if blocked is not None:
+        return blocked
 
     # Normalize aliased tool names to their real names (RFC alignment)
     tool_aliases = getattr(planner, "tool_aliases", {})
@@ -2656,7 +2678,11 @@ async def _handle_parallel_action(
     current_action_seq: int,
     state: _LoopState,
 ) -> PlannerFinish | PlannerPause | None:
-    """Run the action's parallel plan and record its results."""
+    """Run the action's parallel plan and record its results.
+
+    A guardrail STOP on a branch or the join ends the run, as it does for a
+    single tool call.
+    """
     state.last_observation, pause = await _handle_parallel_plan(
         planner,
         action,
@@ -2668,7 +2694,7 @@ async def _handle_parallel_action(
     )
     if pause is not None:
         return pause
-    return None
+    return await _take_guardrail_outcome(planner, trajectory, state)
 
 
 async def _handle_final_response_action(

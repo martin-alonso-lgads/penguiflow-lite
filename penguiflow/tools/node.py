@@ -252,6 +252,19 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
         return None
 
 
+def _bearer_headers(token: str) -> dict[str, str]:
+    """Return the headers that send an OAuth access ``token``."""
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _is_unauthorized(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is an MCP server's HTTP 401 rejection."""
+    if not isinstance(exc, Exception):
+        return False
+    adapted = adapt_exception(exc, "mcp")
+    return isinstance(adapted, ToolAuthError) and adapted.status_code == 401
+
+
 def _resource_call(
     method: Callable[..., object], *, any_url: bool
 ) -> Callable[[str], Awaitable[object]]:
@@ -557,9 +570,9 @@ class ToolNode:
         default_factory=list, repr=False
     )
     _resources_supported: bool = field(default=False, repr=False)
-    _resource_update_callback: Callable[[str], None] | None = field(
-        default=None, repr=False
-    )
+    _resource_update_callback: (
+        Callable[[str, Principal | None], None] | None
+    ) = field(default=None, repr=False)
     _background_tasks: set[asyncio.Task[None]] = field(
         default_factory=set, init=False, repr=False
     )
@@ -695,11 +708,40 @@ class ToolNode:
                 if ctx is not None and self.per_user_sessions
                 else self._get_static_auth_headers()
             )
-        return await self._pool.acquire(
-            principal,
-            auth_fingerprint(headers),
-            functools.partial(self._open_session, principal, headers),
-        )
+        fingerprint = auth_fingerprint(headers)
+        try:
+            return await self._pool.acquire(
+                principal,
+                fingerprint,
+                functools.partial(self._open_session, principal, headers),
+            )
+        except ToolConnectionError as exc:
+            if self.per_user_sessions and _is_unauthorized(exc.__cause__):
+                await self._forget_token(principal, fingerprint)
+            raise
+
+    async def _forget_token(
+        self, principal: Principal, fingerprint: str
+    ) -> None:
+        """Delete the user's stored token when the server rejected it.
+
+        Only the token the rejected session was opened with is deleted, so
+        a token stored since (after a new consent) is kept. The user's next
+        call then asks for consent again instead of reusing the token.
+
+        Args:
+            principal: The user whose session was rejected.
+            fingerprint: :func:`auth_fingerprint` of the rejected headers.
+        """
+        if self.auth_manager is None:
+            return
+        user_id = principal[1]
+        token = await self.auth_manager.get_token(user_id, self.config.name)
+        if token is None:
+            return
+        if auth_fingerprint(_bearer_headers(token)) != fingerprint:
+            return
+        await self.auth_manager.token_store.delete(user_id, self.config.name)
 
     async def _open_session(
         self, principal: Principal, headers: dict[str, str]
@@ -719,8 +761,9 @@ class ToolNode:
     ) -> AsyncGenerator[McpSession, None]:
         """Use ``ctx``'s session for the block.
 
-        With per-user auth, an auth failure (HTTP 401) closes the session,
-        so the next call opens a new one with a fresh token.
+        With per-user auth, an auth failure closes the session. An HTTP 401
+        also deletes the user's token, so the next call asks for consent
+        again and opens a new session with the new token.
         """
         session = await self._session_for(ctx, headers)
         async with self._pool.lease(session):
@@ -729,6 +772,10 @@ class ToolNode:
             except ToolAuthError as exc:
                 if self.per_user_sessions and exc.status_code in (None, 401):
                     self._pool.retire(session)
+                    if exc.status_code == 401:
+                        await self._forget_token(
+                            session.principal, session.fingerprint
+                        )
                 raise
 
     @contextlib.asynccontextmanager
@@ -755,9 +802,16 @@ class ToolNode:
             yield shared
 
     def _on_session_update(self, session: McpSession, uri: str) -> None:
-        """Handle a resource update one session's server sent."""
+        """Handle a resource update one session's server sent.
+
+        The update callback gets the session's user, or ``None`` for the
+        shared session.
+        """
         self._invalidate_session(session, uri)
-        self._fire_resource_callback(uri)
+        principal = session.principal
+        self._fire_resource_callback(
+            uri, None if principal == SHARED_PRINCIPAL else principal
+        )
 
     def _invalidate_session(self, session: McpSession, uri: str) -> None:
         """Drop ``uri`` from ``session``'s cache and notify its subscribers."""
@@ -769,11 +823,13 @@ class ToolNode:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    def _fire_resource_callback(self, uri: str) -> None:
+    def _fire_resource_callback(
+        self, uri: str, principal: Principal | None
+    ) -> None:
         if self._resource_update_callback is None:
             return
         try:
-            self._resource_update_callback(uri)
+            self._resource_update_callback(uri, principal)
         except Exception:
             logger.debug("resource_update_callback_failed", exc_info=True)
 
@@ -1559,7 +1615,7 @@ class ToolNode:
 
         token = await self.auth_manager.get_token(user_id, self.config.name)
         if token:
-            return {"Authorization": f"Bearer {token}"}
+            return _bearer_headers(token)
 
         trace_id = ctx.tool_context.get("trace_id", "")
         auth_request = self.auth_manager.get_auth_request(
@@ -1582,7 +1638,7 @@ class ToolNode:
             msg = f"OAuth for {self.config.name} was not completed"
             raise ToolAuthError(msg)
 
-        return {"Authorization": f"Bearer {token}"}
+        return _bearer_headers(token)
 
     # ─── Resilience ──────────────────────────────────────────────────────────
 
@@ -1929,16 +1985,46 @@ class ToolNode:
         call_template_type = (
             "cli" if self.config.transport == TransportType.CLI else "http"
         )
+        template: dict[str, Any] = {
+            "name": self.config.name,
+            "call_template_type": call_template_type,
+            "url": self.config.connection,
+            "http_method": "POST",
+        }
+        auth = self.build_utcp_auth() if call_template_type == "http" else None
+        if auth is not None:
+            # ``auth`` covers the discovery request, ``auth_tools`` the
+            # tools generated from an OpenAPI spec.
+            template["auth"] = auth
+            template["auth_tools"] = dict(auth)
         return {
-            "manual_call_templates": [
-                {
-                    "name": self.config.name,
-                    "call_template_type": call_template_type,
-                    "url": self.config.connection,
-                    "http_method": "POST",
-                },
-            ],
+            "manual_call_templates": [template],
             "variables": self.build_utcp_variables(),
+        }
+
+    def build_utcp_auth(self) -> dict[str, str] | None:
+        """Build the UTCP ``api_key`` auth of a base-URL call template.
+
+        Returns:
+            The auth for the configured static credentials (BEARER, API_KEY
+            or COOKIE), or ``None`` when the source has no static auth.
+        """
+        auth_type = self.config.auth_type
+        if auth_type == AuthType.COOKIE:
+            auth_config = self.config.auth_config
+            var_name = self.substitute_env(str(auth_config["cookie_name"]))
+            key = self.substitute_env(str(auth_config["cookie_value"]))
+            location = "cookie"
+        elif auth_type in (AuthType.BEARER, AuthType.API_KEY):
+            ((var_name, key),) = self._get_static_auth_headers().items()
+            location = "header"
+        else:
+            return None
+        return {
+            "auth_type": "api_key",
+            "api_key": key,
+            "var_name": var_name,
+            "location": location,
         }
 
     def build_utcp_variables(self) -> dict[str, str]:
@@ -3059,23 +3145,31 @@ class ToolNode:
         """Handle a resource updated notification from MCP server.
 
         Invalidates ``uri`` in every session's cache and notifies every
-        session's subscribers, then the node's update callback once.
+        session's subscribers, then the node's update callback once, with
+        no principal.
 
         Args:
             uri: URI of updated resource
         """
         for session in self._pool.sessions():
             self._invalidate_session(session, uri)
-        self._fire_resource_callback(uri)
+        self._fire_resource_callback(uri, None)
 
     def set_resource_updated_callback(
-        self, callback: Callable[[str], None] | None
+        self, callback: Callable[[str, Principal | None], None] | None
     ) -> None:
         """Register a callback invoked when MCP resources are updated.
 
+        The callback is called as ``callback(uri, principal)``.
+        ``principal`` is the ``(tenant_id, user_id)`` whose MCP session
+        received the update, or ``None`` when the update applies to every
+        caller (the shared session, or :meth:`handle_resource_updated`).
+        With per-user auth, deliver a per-user update only to that user.
+
         Args:
-            callback: Callable invoked with the updated resource URI, or
-                ``None`` to clear a previously registered callback.
+            callback: Callable invoked with the updated resource URI and
+                its principal, or ``None`` to clear a previously
+                registered callback.
         """
         self._resource_update_callback = callback
 

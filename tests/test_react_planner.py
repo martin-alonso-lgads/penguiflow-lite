@@ -28,13 +28,18 @@ from penguiflow.planner.guardrails import (
     GuardrailContext,
     GuardrailDecision,
     GuardrailEvent,
+    GuardrailSeverity,
+    PauseSpec,
     RetrySpec,
+    RuleCost,
+    ToolAllowlistRule,
 )
 from penguiflow.planner.guardrails.async_eval import AsyncRuleEvaluator
 from penguiflow.planner.guardrails.gateway import (
     GatewayConfig,
     GuardrailGateway,
 )
+from penguiflow.planner.guardrails.protocols import GuardrailRule
 from penguiflow.planner.guardrails.registry import RuleRegistry
 from penguiflow.planner.llm_context_hooks import LLMContextHook
 from penguiflow.planner.memory import (
@@ -2624,6 +2629,158 @@ async def test_parallel_plan_tool_call_events_with_join() -> None:
     }
 
 
+_FAN_OUT_WITH_JOIN: dict[str, object] = {
+    "thought": "fan out",
+    "plan": [
+        {"node": "fetch_primary", "args": {"topic": "topic", "shard": 0}},
+        {"node": "fetch_secondary", "args": {"topic": "topic", "shard": 1}},
+    ],
+    "join": {"node": "merge_results"},
+}
+
+
+class _PauseToolRule(GuardrailRule):
+    """FAST rule that asks for approval before one tool runs."""
+
+    rule_id = "approve-tool"
+    version = "1"
+    supports_event_types = frozenset({"tool_call_start"})
+    enabled = True
+    cost = RuleCost.FAST
+    severity = GuardrailSeverity.HIGH
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+
+    @override
+    async def evaluate(
+        self, event: GuardrailEvent, context_snapshot: object
+    ) -> GuardrailDecision | None:
+        if event.tool_name != self.tool_name:
+            return None
+        return GuardrailDecision(
+            action=GuardrailAction.PAUSE,
+            rule_id=self.rule_id,
+            reason=f"approve {event.tool_name}",
+            pause=PauseSpec(prompt="Approve?"),
+        )
+
+
+def _fan_out_planner(
+    *rules: GuardrailRule, events: list[PlannerEvent]
+) -> ReactPlanner:
+    registry = ModelRegistry()
+    registry.register("fetch_primary", ShardRequest, ShardPayload)
+    registry.register("fetch_secondary", ShardRequest, ShardPayload)
+    registry.register("merge_results", MergeArgs, Documents)
+    nodes = [
+        Node(fetch_primary, name="fetch_primary"),
+        Node(fetch_secondary, name="fetch_secondary"),
+        Node(merge_results, name="merge_results"),
+    ]
+    guard_registry = RuleRegistry()
+    for rule in rules:
+        guard_registry.register(rule)
+    return ReactPlanner(
+        llm_client=StubClient(
+            [
+                _FAN_OUT_WITH_JOIN,
+                {
+                    "thought": "finish",
+                    "next_node": None,
+                    "args": {"raw_answer": "done"},
+                },
+            ]
+        ),
+        catalog=build_catalog(nodes, registry),
+        event_callback=events.append,
+        guardrail_gateway=GuardrailGateway(
+            registry=guard_registry,
+            guard_inbox=InMemoryGuardInbox(AsyncRuleEvaluator(guard_registry)),
+        ),
+    )
+
+
+def _started_tools(events: list[PlannerEvent]) -> set[object]:
+    return {
+        event.extra.get("tool_name")
+        for event in events
+        if event.event_type == "tool_call_start"
+    }
+
+
+@pytest.mark.asyncio()
+async def test_parallel_branch_guardrail_stop_ends_the_run() -> None:
+    """A STOP on one branch ends the run, as for a single tool call."""
+    events: list[PlannerEvent] = []
+    planner = _fan_out_planner(
+        ToolAllowlistRule(denied_tools=frozenset({"fetch_secondary"})),
+        events=events,
+    )
+
+    result = await planner.run("parallel fan out")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.metadata["guardrail"]["rule_id"] == "tool-allowlist"
+    assert "merge_results" not in _started_tools(events)
+    plan_step = result.metadata["steps"][-1]
+    assert plan_step["observation"]["join"] == {
+        "status": "skipped",
+        "reason": "guardrail_stop",
+    }
+
+
+@pytest.mark.asyncio()
+async def test_parallel_join_guardrail_stop_ends_the_run() -> None:
+    """A STOP on the join tool ends the run too."""
+    events: list[PlannerEvent] = []
+    planner = _fan_out_planner(
+        ToolAllowlistRule(denied_tools=frozenset({"merge_results"})),
+        events=events,
+    )
+
+    result = await planner.run("parallel fan out")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.metadata["guardrail"]["rule_id"] == "tool-allowlist"
+    assert _started_tools(events) == {
+        "fetch_primary",
+        "fetch_secondary",
+        "merge_results",
+    }
+
+
+@pytest.mark.asyncio()
+async def test_parallel_guardrail_stop_wins_over_a_branch_pause() -> None:
+    """With one branch stopped and one paused, the STOP ends the run."""
+    events: list[PlannerEvent] = []
+    planner = _fan_out_planner(
+        ToolAllowlistRule(denied_tools=frozenset({"fetch_secondary"})),
+        _PauseToolRule("fetch_primary"),
+        events=events,
+    )
+
+    result = await planner.run("parallel fan out")
+
+    assert isinstance(result, PlannerFinish)
+    assert result.reason == "no_path"
+    assert result.metadata["guardrail"]["rule_id"] == "tool-allowlist"
+
+
+@pytest.mark.asyncio()
+async def test_parallel_branch_guardrail_pause_still_pauses() -> None:
+    """A PAUSE on a branch, with no STOP, still pauses the run."""
+    events: list[PlannerEvent] = []
+    planner = _fan_out_planner(_PauseToolRule("fetch_primary"), events=events)
+
+    result = await planner.run("parallel fan out")
+
+    assert isinstance(result, PlannerPause)
+    assert result.reason == "approval_required"
+
+
 @pytest.mark.asyncio()
 async def test_parallel_plan_tool_call_events_without_join() -> None:
     """Parallel plan without join emits tool call events for branches."""
@@ -3187,24 +3344,22 @@ async def test_react_planner_emits_tool_call_events() -> None:
     assert "result_json" in result_event.extra
 
 
-def test_react_planner_registers_resource_callbacks() -> None:
-    """ToolNode resource updates should emit resource_updated events."""
-    events: list[PlannerEvent] = []
+_ResourceCallback = Callable[[str, "tuple[str, str] | None"], None]
 
-    def callback(event: PlannerEvent) -> None:
-        events.append(event)
 
-    class FakeToolNode:
-        def __init__(self) -> None:
-            self.callback: Callable[[str], None] | None = None
+class _FakeResourceToolNode:
+    """ToolNode stand-in that records the planner's update callback."""
 
-        def set_resource_updated_callback(
-            self, cb: Callable[[str], None]
-        ) -> None:
-            self.callback = cb
+    def __init__(self) -> None:
+        self.callback: _ResourceCallback | None = None
 
-    fake_node = FakeToolNode()
+    def set_resource_updated_callback(self, cb: _ResourceCallback) -> None:
+        self.callback = cb
 
+
+def _resource_planner(
+    fake_node: _FakeResourceToolNode, events: list[PlannerEvent]
+) -> ReactPlanner:
     registry = ModelRegistry()
     registry.register("triage", Query, Intent)
     spec = build_catalog([Node(triage, name="triage")], registry)[0]
@@ -3222,8 +3377,7 @@ def test_react_planner_registers_resource_callbacks() -> None:
         safety_notes=spec.safety_notes,
         extra={"tool_node": fake_node, "namespace": "fake"},
     )
-
-    ReactPlanner(
+    return ReactPlanner(
         llm_client=StubClient(
             [
                 {
@@ -3234,13 +3388,59 @@ def test_react_planner_registers_resource_callbacks() -> None:
             ]
         ),
         catalog=[spec],
-        event_callback=callback,
+        event_callback=events.append,
     )
 
-    assert fake_node.callback is not None
-    fake_node.callback("file:///test.txt")
 
-    assert any(event.event_type == "resource_updated" for event in events)
+def _updated_uris(events: list[PlannerEvent]) -> list[object]:
+    return [
+        event.extra["uri"]
+        for event in events
+        if event.event_type == "resource_updated"
+    ]
+
+
+def test_react_planner_registers_resource_callbacks() -> None:
+    """ToolNode resource updates should emit resource_updated events."""
+    events: list[PlannerEvent] = []
+    fake_node = _FakeResourceToolNode()
+    _resource_planner(fake_node, events)
+
+    assert fake_node.callback is not None
+    fake_node.callback("file:///test.txt", None)
+
+    assert _updated_uris(events) == ["file:///test.txt"]
+    assert events[-1].extra["namespace"] == "fake"
+
+
+def test_resource_updates_reach_only_their_users_run() -> None:
+    """A per-user update is emitted only in a run of that user."""
+    events: list[PlannerEvent] = []
+    fake_node = _FakeResourceToolNode()
+    planner = _resource_planner(fake_node, events)
+    assert fake_node.callback is not None
+    planner.active_trajectory = Trajectory(
+        query="q", tool_context={"tenant_id": "acme", "user_id": "u1"}
+    )
+
+    fake_node.callback("file:///u1.txt", ("acme", "u1"))
+    fake_node.callback("file:///u2.txt", ("acme", "u2"))
+    fake_node.callback("file:///other-tenant.txt", ("beta", "u1"))
+    fake_node.callback("file:///shared.txt", None)
+
+    assert _updated_uris(events) == ["file:///u1.txt", "file:///shared.txt"]
+
+
+def test_per_user_resource_update_dropped_between_runs() -> None:
+    """With no run active, a per-user update has no run to go to."""
+    events: list[PlannerEvent] = []
+    fake_node = _FakeResourceToolNode()
+    _resource_planner(fake_node, events)
+    assert fake_node.callback is not None
+
+    fake_node.callback("file:///u1.txt", ("acme", "u1"))
+
+    assert _updated_uris(events) == []
 
 
 @pytest.mark.asyncio()

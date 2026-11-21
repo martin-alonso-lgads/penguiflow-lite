@@ -72,6 +72,17 @@ class SessionStateStore(Protocol):
         ...
 
 
+SESSION_STORE_METHODS: tuple[str, ...] = (
+    "save_task",
+    "save_update",
+    "save_steering",
+    "list_tasks",
+    "list_updates",
+    "list_steering",
+)
+"""The methods of :class:`SessionStateStore`, for capability checks."""
+
+
 def _clone_task(state: TaskState) -> TaskState:
     return TaskState(
         task_id=state.task_id,
@@ -328,6 +339,7 @@ class StateStoreSessionAdapter(SessionStateStore):
 
 
 __all__ = [
+    "SESSION_STORE_METHODS",
     "InMemorySessionStateStore",
     "SessionStateStore",
     "StateStoreSessionAdapter",

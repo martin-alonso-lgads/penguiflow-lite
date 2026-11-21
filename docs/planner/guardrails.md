@@ -34,8 +34,8 @@ Guardrails are **off by default**. Enable them by passing a gateway at construct
 
 When enabled, the planner can enforce these actions:
 
-- `STOP`: end the run with a user-safe message. Every STOP (before the LLM call, on a stream chunk or on a tool) finishes with `reason="no_path"`, the message as `raw_answer` and the decision in `metadata["guardrail"]`
-- `PAUSE`: trigger HITL approval at `tool_call_start` or `tool_call_result` (`run()` returns `PlannerPause(reason="approval_required")`). On a planner built with `pause_enabled=False` it becomes a STOP: `metadata["guardrail"]` has `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`, and `raw_answer` is the `PauseSpec` prompt (or a default message)
+- `STOP`: end the run with a user-safe message. Every STOP (before the LLM call, on a stream chunk, on a tool, or on a branch or the join of a parallel plan) finishes with `reason="no_path"`, the message as `raw_answer` and the decision in `metadata["guardrail"]`
+- `PAUSE`: trigger HITL approval at `llm_before` (before the LLM call), on a stream chunk (the chunk is dropped and the run pauses after the LLM call), or at `tool_call_start` or `tool_call_result` (`run()` returns `PlannerPause(reason="approval_required")`). On a planner built with `pause_enabled=False` it becomes a STOP: `metadata["guardrail"]` has `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`, and `raw_answer` is the `PauseSpec` prompt (or a default message)
 - `RETRY`: re-run the LLM call with corrective instructions
 - `REDACT`: redact text from streamed output and tool results. If a tool result is no longer JSON after redaction, the LLM sees `{"result": "<redacted text>"}`, never the original
 - `ALLOW`: do nothing

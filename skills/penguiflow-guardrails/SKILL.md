@@ -73,14 +73,14 @@ A rule has `rule_id`, `version`, `supports_event_types`, `cost`, `enabled` and `
 
 | Event | STOP | PAUSE | RETRY | REDACT |
 |---|---|---|---|---|
-| `llm_before` | Run finishes `no_path`; answer = `StopSpec.user_message` | — | Adds `RetrySpec.corrective_message` as a system message, up to `max_attempts` per run | — |
+| `llm_before` | Run finishes `no_path`; answer = `StopSpec.user_message` | `PlannerPause(reason="approval_required")` before the LLM call | Adds `RetrySpec.corrective_message` as a system message, up to `max_attempts` per run | — |
 | `tool_call_start` | Skips the tool; run finishes `no_path` | `PlannerPause(reason="approval_required")` | — | — |
 | `tool_call_result` | Run finishes `no_path` (tool already ran) | `PlannerPause(reason="approval_required")` | — | Redacts the result JSON by offsets |
-| `llm_stream_chunk` | Drops the chunk, then the run finishes `no_path` after the LLM call | Drops the chunk | — | Redacts the chunk by offsets |
+| `llm_stream_chunk` | Drops the chunk, then the run finishes `no_path` after the LLM call | Drops the chunk, then the run pauses after the LLM call (a STOP on any chunk wins) | — | Redacts the chunk by offsets |
 
-- Every STOP, LLM-side or tool-side, finishes with `reason="no_path"`, `payload["raw_answer"]` = `stop.user_message` and the decision in `result.metadata["guardrail"]` (in a parallel plan, a tool STOP only fails its branch).
+- Every STOP, LLM-side or tool-side, finishes with `reason="no_path"`, `payload["raw_answer"]` = `stop.user_message` and the decision in `result.metadata["guardrail"]` (in a parallel plan, a STOP on any branch or on the join ends the run once the branches finish, and a branch STOP skips the join).
 - A PAUSE payload is `payload["guardrail"] = {"action": "PAUSE", "rule_id", "reason", ..., "pause": {"scope", "approver_roles", "prompt", "timeout_s"}}`. `timeout_s` is informational only.
-- On a planner built with `pause_enabled=False`, a tool PAUSE (including the router's `on_timeout="pause"`) becomes a STOP: the run finishes `no_path`, `raw_answer` is `pause.prompt` (or a default message), and `metadata["guardrail"]` has `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
+- On a planner built with `pause_enabled=False`, a PAUSE on any event (including the router's `on_timeout="pause"`) becomes a STOP: the run finishes `no_path`, `raw_answer` is `pause.prompt` (or a default message), and `metadata["guardrail"]` has `action="STOP"`, `requested_action="PAUSE"`, `pause_disabled=True` and `stop.error_code="GUARDRAIL_PAUSE_DISABLED"`.
 - Redaction is offset-based (`RedactionSpec.start_offset`/`end_offset` into `event.text_content`); `path` is only a label.
 - `tool_call_mode="native"` follows the same table: `llm_before` runs before each LLM call, and streamed chunks are checked before the step returns.
 
@@ -122,7 +122,7 @@ Every decision carries a stable `rule_id`; count the `guardrail_decision` logs b
 
 ## Worked example
 - `examples/guardrails/scope_classifier/flow.py` and `examples/guardrails/huggingface/flow.py` wire DEEP rules (a scope classifier and a prompt-injection classifier) through `InMemoryGuardInbox`. Both rules are on `llm_before`, so both flows build the gateway with `DefaultRiskRouter(llm_before_wait_ms=...)` (500 ms for the scope classifier, 5000 ms for the injection classifier): the injection classifier's STOP ends the run before the LLM call, and the scope classifier's RETRY applies to that call. With the default wait of 0, the STOP would land at the run's next check and the RETRY would be dropped (see step 3).
-- `tests/test_guardrails_integration.py` (tool and `llm_before` STOP, redaction, PAUSE payload, PAUSE without pause support, shadow logging, late DEEP STOP per run) and `tests/test_guardrails_gateway.py` (fail-open/closed, DEEP rule errors, timeouts, late decisions, strikes per run).
+- `tests/test_guardrails_integration.py` (tool and `llm_before` STOP, `llm_before` and prompted-mode stream PAUSE and STOP, redaction, PAUSE payload, PAUSE without pause support, shadow logging, late DEEP STOP per run) and `tests/test_guardrails_gateway.py` (fail-open/closed, DEEP rule errors, timeouts, late decisions, strikes per run).
 
 ## References (load only as needed)
 - `references/gateway-and-decisions.md` — wiring, `GatewayConfig`, `GuardrailEvent`, `GuardrailDecision` and its specs, the per-event action table, decision resolution, built-in rules, rule examples, observability.

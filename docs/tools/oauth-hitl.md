@@ -27,7 +27,7 @@ It works only for an MCP server reached over a URL: a stdio command or a UTCP/HT
 
 - it keeps one MCP session per user, keyed by `(tool_context["tenant_id"], tool_context["user_id"])` and opened with that user's token, each with its own resource cache and subscriptions;
 - `connect(ctx)` opens the first session and discovers tools, prompts and resource templates on it (`connect()` without a context raises `ToolAuthError`); other users' sessions open on their first call;
-- a new token opens a new session for that user, and a `401` from the server closes it so the next call reopens it;
+- a new token opens a new session for that user, and a `401` from the server closes it and deletes the stored token it was opened with, so the next call pauses for OAuth consent again;
 - `ExternalToolConfig.session_pool` (`SessionPoolConfig(max_sessions=64, idle_timeout_s=900.0)`) closes the least recently used idle sessions past `max_sessions` and sessions idle for `idle_timeout_s`; `max_concurrency` is shared by all users.
 
 Because tools are discovered once, a server that filters tools per user exposes the first user's tool list. Connect as a user who has every tool, and hide tools per user with a `ToolVisibilityPolicy`.

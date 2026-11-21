@@ -23,6 +23,12 @@ from ..rich_output.tools import (
 )
 from ..steering import SteeringCancelled, SteeringInbox
 from . import prompts
+from .guardrail_outcomes import (
+    BLOCKING_ACTIONS,
+    guardrail_pause,
+    pauses_run,
+    stop_payload,
+)
 from .llm import _redact_artifacts
 from .models import PlannerEvent, PlannerPause
 from .pause import _PlannerPauseError
@@ -103,30 +109,6 @@ class _CheckedResult:
     llm_observation: dict[str, Any]
 
 
-_PAUSE_DISABLED_MESSAGE = (
-    "This request needs approval, and this agent cannot pause for it."
-)
-
-
-def _pause_disabled_payload(
-    planner: ReactPlanner, decision: GuardrailDecision
-) -> dict[str, Any]:
-    """Turn a PAUSE into a STOP payload, for planners that cannot pause."""
-    payload = planner.guardrail_decision_payload(decision)
-    prompt = decision.pause.prompt if decision.pause is not None else ""
-    payload.update(
-        action="STOP",
-        requested_action="PAUSE",
-        pause_disabled=True,
-        stop={
-            "error_code": "GUARDRAIL_PAUSE_DISABLED",
-            "user_message": prompt or _PAUSE_DISABLED_MESSAGE,
-            "internal_reason": decision.reason,
-        },
-    )
-    return payload
-
-
 async def _guardrail_block(
     planner: ReactPlanner,
     trajectory: Trajectory,
@@ -144,19 +126,14 @@ async def _guardrail_block(
     whose payload has ``requested_action="PAUSE"`` and
     ``pause_disabled=True``.
     """
-    action = decision.action.value
-    if action == "PAUSE" and planner.pause_enabled:
-        return ToolCallOutcome(
-            pause=await _guardrail_pause(planner, trajectory, decision),
-            streams=streams,
-        )
-    if action == "PAUSE":
-        guardrail = _pause_disabled_payload(planner, decision)
-    elif action == "STOP":
-        guardrail = planner.guardrail_decision_payload(decision)
-    else:
+    if decision.action.value not in BLOCKING_ACTIONS:
         return None
-    failure_payload = {"guardrail": guardrail}
+    if pauses_run(planner, decision):
+        pause = await guardrail_pause(
+            planner, trajectory, planner.guardrail_decision_payload(decision)
+        )
+        return ToolCallOutcome(pause=pause, streams=streams)
+    failure_payload = {"guardrail": stop_payload(planner, decision)}
     error = f"guardrail_stop:{decision.rule_id}"
     _emit_tool_result(
         planner,
@@ -171,26 +148,6 @@ async def _guardrail_block(
     return ToolCallOutcome(
         error=error, failure=failure_payload, streams=streams
     )
-
-
-async def _guardrail_pause(
-    planner: ReactPlanner,
-    trajectory: Trajectory,
-    decision: GuardrailDecision,
-) -> PlannerPause:
-    """Record a guardrail PAUSE and return it for the tool outcome.
-
-    ``pause_from_context`` raises to unwind tool code; guardrail checks
-    run outside the tool, so the signal is caught here and the recorded
-    pause is returned instead.
-    """
-    payload = {"guardrail": planner.guardrail_decision_payload(decision)}
-    try:
-        return await planner.pause_from_context(
-            "approval_required", payload, trajectory
-        )
-    except _PlannerPauseError as signal:
-        return signal.pause
 
 
 async def _guardrail_after_tool(
@@ -222,7 +179,7 @@ async def _guardrail_after_tool(
     )
     if not decision or not planner.guardrails_enforced():
         return checked
-    if decision.action.value in {"STOP", "PAUSE"}:
+    if decision.action.value in BLOCKING_ACTIONS:
         blocked = await _guardrail_block(
             planner,
             trajectory,

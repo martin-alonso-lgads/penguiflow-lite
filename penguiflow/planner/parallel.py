@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ValidationError
 
 from . import prompts
+from .guardrail_outcomes import GUARDRAIL_STOP_KEY
 from .models import ParallelCall, ParallelJoin, PlannerAction, PlannerPause
 from .react_utils import _serialize_validation_errors
 from .tool_calls import ToolCallOutcome, execute_tool_call
@@ -39,6 +40,29 @@ class _BranchExecutionResult:
 _Branch = tuple[ParallelCall, "NodeSpec", BaseModel]
 
 
+def _guardrail_stop_of(
+    failure: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the guardrail STOP payload a tool call failed with, if any."""
+    guardrail = failure.get("guardrail") if failure is not None else None
+    if isinstance(guardrail, Mapping) and guardrail.get("action") == "STOP":
+        return dict(guardrail)
+    return None
+
+
+def _record_guardrail_stop(
+    trajectory: Trajectory, failure: Mapping[str, Any] | None
+) -> None:
+    """Mark the run to end when ``failure`` is a guardrail STOP.
+
+    The run loop consumes ``GUARDRAIL_STOP_KEY`` and finishes the run with
+    ``reason="no_path"``, as for a STOP on a single tool call.
+    """
+    stop = _guardrail_stop_of(failure)
+    if stop is not None:
+        trajectory.metadata[GUARDRAIL_STOP_KEY] = stop
+
+
 @dataclass(slots=True)
 class _BranchResults:
     """Outcomes of a parallel plan's branches, shaped for the observation."""
@@ -48,11 +72,16 @@ class _BranchResults:
     success_payloads: list[dict[str, Any]] = field(default_factory=list)
     failure_entries: list[dict[str, Any]] = field(default_factory=list)
     pause: PlannerPause | None = None
+    guardrail_failure: dict[str, Any] | None = None
 
     def add(
         self, spec: NodeSpec, parsed_args: BaseModel, outcome: ToolCallOutcome
     ) -> None:
-        """Record one branch's pause, observation or error."""
+        """Record one branch's pause, observation or error.
+
+        The first branch a guardrail STOP failed is kept in
+        ``guardrail_failure``; it ends the run once the branches are done.
+        """
         payload: dict[str, Any] = {
             "node": spec.name,
             "args": parsed_args.model_dump(mode="json"),
@@ -85,6 +114,10 @@ class _BranchResults:
             if outcome.failure is not None:
                 payload["failure"] = dict(outcome.failure)
                 failure_entry["failure"] = dict(outcome.failure)
+                if self.guardrail_failure is None and _guardrail_stop_of(
+                    outcome.failure
+                ):
+                    self.guardrail_failure = dict(outcome.failure)
             self.failure_entries.append(failure_entry)
         self.branch_payloads.append(payload)
         self.llm_branch_payloads.append(llm_payload)
@@ -378,6 +411,42 @@ def _attach_join(
         llm_observation["join"] = join_entry
 
 
+async def _skip_join(
+    planner: ReactPlanner,
+    trajectory: Trajectory,
+    tracker: _ConstraintTracker,
+    *,
+    action: PlannerAction,
+    branches: _BranchResults,
+    observation: dict[str, Any],
+    llm_observation: dict[str, Any],
+) -> tuple[dict[str, Any], PlannerPause | None]:
+    """Record a plan whose branches paused it or a guardrail stopped it.
+
+    The join is skipped. A guardrail STOP is left under
+    ``GUARDRAIL_STOP_KEY`` for the run loop, which ends the run as for a
+    STOP on a single tool call; it wins over a pause, as STOP outranks
+    PAUSE. Otherwise the pause is recorded and returned.
+    """
+    stopped = branches.guardrail_failure is not None
+    reason = "guardrail_stop" if stopped else "pause"
+    observation["join"] = {"status": "skipped", "reason": reason}
+    llm_observation["join"] = observation["join"]
+    trajectory.steps.append(
+        TrajectoryStep(
+            action=action,
+            observation=observation,
+            llm_observation=llm_observation,
+        )
+    )
+    trajectory.summary = None
+    if stopped or branches.pause is None:
+        _record_guardrail_stop(trajectory, branches.guardrail_failure)
+        return observation, None
+    await planner.record_pause(branches.pause, trajectory, tracker)
+    return observation, branches.pause
+
+
 async def execute_parallel_plan(
     planner: ReactPlanner,
     action: PlannerAction,
@@ -389,6 +458,11 @@ async def execute_parallel_plan(
     source_collector: _SourceCollector | None = None,
 ) -> tuple[dict[str, Any] | None, PlannerPause | None]:
     """Run a parallel plan's branches concurrently, then its join step.
+
+    A guardrail STOP on a branch skips the join, and one on the join is
+    recorded after it; either way the plan leaves the STOP under
+    ``GUARDRAIL_STOP_KEY`` in ``trajectory.metadata`` and the run loop ends
+    the run with ``reason="no_path"``.
 
     Returns:
         The step's observation (``None`` when the plan could not run) and
@@ -445,19 +519,16 @@ async def execute_parallel_plan(
         branches.add(spec, parsed_args, outcome)
     observation, llm_observation = branches.observations()
 
-    if branches.pause is not None:
-        observation["join"] = {"status": "skipped", "reason": "pause"}
-        llm_observation["join"] = observation["join"]
-        trajectory.steps.append(
-            TrajectoryStep(
-                action=action,
-                observation=observation,
-                llm_observation=llm_observation,
-            )
+    if branches.pause is not None or branches.guardrail_failure is not None:
+        return await _skip_join(
+            planner,
+            trajectory,
+            tracker,
+            action=action,
+            branches=branches,
+            observation=observation,
+            llm_observation=llm_observation,
         )
-        trajectory.summary = None
-        await planner.record_pause(branches.pause, trajectory, tracker)
-        return observation, branches.pause
 
     if join_model is not None:
         join = await _run_join(
@@ -482,6 +553,7 @@ async def execute_parallel_plan(
             await planner.record_pause(join.pause, trajectory, tracker)
             return observation, join.pause
         _attach_join(observation, llm_observation, join)
+        _record_guardrail_stop(trajectory, join.failure)
 
     trajectory.steps.append(
         TrajectoryStep(

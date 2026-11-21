@@ -426,6 +426,102 @@ def test_build_utcp_config_base_url_mode() -> None:
     assert result["manual_call_templates"][0]["call_template_type"] == "http"
 
 
+def _base_url_template(
+    monkeypatch: pytest.MonkeyPatch, **overrides: object
+) -> dict[str, Any]:
+    monkeypatch.setenv("REST_SECRET", "s3cret")
+    config = build_config(
+        transport=TransportType.UTCP,
+        connection="https://api.example.com",
+        utcp_mode=UtcpMode.BASE_URL,
+        **overrides,
+    )
+    node = ToolNode(config=config, registry=ModelRegistry())
+    template: dict[str, Any] = node.build_utcp_config()[
+        "manual_call_templates"
+    ][0]
+    return template
+
+
+@pytest.mark.parametrize(
+    ("auth_type", "auth_config", "expected"),
+    [
+        (
+            AuthType.BEARER,
+            {"token": "${REST_SECRET}"},
+            {
+                "api_key": "Bearer s3cret",
+                "var_name": "Authorization",
+                "location": "header",
+            },
+        ),
+        (
+            AuthType.API_KEY,
+            {"api_key": "${REST_SECRET}", "header": "X-Token"},
+            {
+                "api_key": "s3cret",
+                "var_name": "X-Token",
+                "location": "header",
+            },
+        ),
+        (
+            AuthType.API_KEY,
+            {"api_key": "plain"},
+            {
+                "api_key": "plain",
+                "var_name": "X-API-Key",
+                "location": "header",
+            },
+        ),
+        (
+            AuthType.COOKIE,
+            {"cookie_name": "sid", "cookie_value": "${REST_SECRET}"},
+            {"api_key": "s3cret", "var_name": "sid", "location": "cookie"},
+        ),
+    ],
+)
+def test_build_utcp_config_base_url_sends_static_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_type: AuthType,
+    auth_config: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    """Base-URL mode puts the static credentials in the call template."""
+    template = _base_url_template(
+        monkeypatch, auth_type=auth_type, auth_config=auth_config
+    )
+
+    auth = {"auth_type": "api_key", **expected}
+    assert template["auth"] == auth
+    assert template["auth_tools"] == auth
+
+
+def test_build_utcp_config_base_url_without_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source without static auth gets no auth in its template."""
+    template = _base_url_template(monkeypatch)
+
+    assert "auth" not in template
+    assert "auth_tools" not in template
+
+
+def test_build_utcp_config_cli_template_has_no_auth() -> None:
+    """CLI call templates take no HTTP auth."""
+    config = build_config(
+        transport=TransportType.CLI,
+        connection="/path/to/cli",
+        utcp_mode=UtcpMode.BASE_URL,
+        auth_type=AuthType.BEARER,
+        auth_config={"token": "t"},
+    )
+    node = ToolNode(config=config, registry=ModelRegistry())
+
+    template = node.build_utcp_config()["manual_call_templates"][0]
+
+    assert "auth" not in template
+
+
 def test_build_utcp_config_cli_transport() -> None:
     """CLI transport should set call_template_type to cli."""
     registry = ModelRegistry()
